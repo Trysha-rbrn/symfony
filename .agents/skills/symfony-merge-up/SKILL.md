@@ -205,3 +205,6 @@ All merges complete:
 - **Never** use `--no-verify` on commits.
 - **Never** auto-recover from a failed `git push` or `git pull`. Stop and hand
   control back to the user.
+- **Never** parallelize the cascade or run branches concurrently (e.g. via subagents): each
+  merge depends on the previous one and shares the git working tree. Run strictly oldest to
+  newest, one at a time.
