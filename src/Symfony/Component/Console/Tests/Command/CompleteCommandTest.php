@@ -19,7 +19,9 @@ use Symfony\Component\Console\Command\CompleteCommand;
 use Symfony\Component\Console\Completion\CompletionInput;
 use Symfony\Component\Console\Completion\CompletionSuggestions;
 use Symfony\Component\Console\Completion\Output\BashCompletionOutput;
+use Symfony\Component\Console\Completion\Suggestion;
 use Symfony\Component\Console\Input\InputArgument;
+use Symfony\Component\Console\Input\InputDefinition;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Tester\CommandTester;
@@ -128,6 +130,108 @@ class CompleteCommandTest extends TestCase
         yield 'global-option-with-command-values' => [['bin/console', 'ahoy', '--global-option'], ['foo', 'bar', 'baz']];
     }
 
+    #[DataProvider('provideCompletePathsInputs')]
+    public function testCompletePaths(string $shell, array $input, string $display)
+    {
+        $this->application->addCommand(new CompleteCommandTest_FileCommand());
+
+        $this->execute(['--shell' => $shell, '--current' => (string) \count($input), '--input' => $input]);
+        $this->assertSame($display, $this->tester->getDisplay(true));
+    }
+
+    public static function provideCompletePathsInputs()
+    {
+        yield 'bash-paths' => ['bash', ['bin/console', 'file'], ":paths\ndefault\n"];
+        yield 'bash-directories' => ['bash', ['bin/console', 'file', '--dir'], ":directories\n\n"];
+        yield 'zsh-paths' => ['zsh', ['bin/console', 'file'], ":paths\ndefault\tThe default file\n"];
+        yield 'fish-paths' => ['fish', ['bin/console', 'file'], ":paths\ndefault\tThe default file"];
+    }
+
+    #[DataProvider('provideOldScriptVersions')]
+    public function testOldScriptsGetNoPathSuggestion(array $version)
+    {
+        $this->application->addCommand(new CompleteCommandTest_FileCommand());
+
+        $this->tester->execute(['--shell' => 'bash', '--current' => '2', '--input' => ['bin/console', 'file']] + $version);
+
+        $this->tester->assertCommandIsSuccessful();
+        $this->assertSame("default\n", $this->tester->getDisplay(true));
+    }
+
+    public static function provideOldScriptVersions()
+    {
+        yield 'api-version-1' => [['--api-version' => '1']];
+        yield 'symfony-5.4-to-6.1' => [['--symfony' => '6.1']];
+        yield 'no-version' => [[]];
+    }
+
+    public function testUnsupportedApiVersion()
+    {
+        $this->tester->execute(['--shell' => 'bash', '--current' => '1', '--input' => ['bin/console'], '--api-version' => '0.9']);
+
+        $this->assertSame(126, $this->tester->getStatusCode());
+        $this->assertStringContainsString('Completion script version is not supported ("0.9" given, ">=1" required).', $this->tester->getDisplay());
+    }
+
+    public function testMergeApplicationDefinitionKeepsNativeArguments()
+    {
+        $this->command->addArgument('native');
+
+        foreach ([false, true, false, true] as $mergeArgs) {
+            $this->command->mergeApplicationDefinition($mergeArgs);
+
+            $this->assertSame($mergeArgs ? ['command', 'native'] : ['native'], array_keys($this->command->getDefinition()->getArguments()));
+        }
+    }
+
+    public function testSetDefinitionClearsMergedDefinition()
+    {
+        foreach ([new InputDefinition([new InputOption('replacement')]), [new InputOption('replacement')]] as $definition) {
+            $this->command->mergeApplicationDefinition();
+            $this->command->setDefinition($definition);
+
+            $this->assertSame($this->command->getNativeDefinition(), $this->command->getDefinition());
+            $this->assertTrue($this->command->getDefinition()->hasOption('replacement'));
+        }
+    }
+
+    public function testSetApplicationClearsMergedDefinition()
+    {
+        $this->command->mergeApplicationDefinition();
+        $this->command->setApplication(null);
+
+        $this->assertSame($this->command->getNativeDefinition(), $this->command->getDefinition());
+
+        $application = new Application();
+        $application->getDefinition()->addOption(new InputOption('other-global'));
+        $this->command->setApplication($application);
+
+        $this->assertSame($this->command->getNativeDefinition(), $this->command->getDefinition());
+
+        $this->command->mergeApplicationDefinition();
+
+        $this->assertTrue($this->command->getDefinition()->hasOption('other-global'));
+        $this->assertFalse($this->command->getDefinition()->hasOption('global-option'));
+    }
+
+    public function testApplicationOptionConflictingWithOwnOption()
+    {
+        $options = $this->application->getDefinition()->getOptions();
+
+        foreach ([
+            [new InputOption('config', 'c', InputOption::VALUE_REQUIRED, '', null, ['foo', 'bar']), '-c'],
+            [new InputOption('config', 'C|s', InputOption::VALUE_REQUIRED, '', null, ['foo', 'bar']), '-s'],
+            [new InputOption('shell', null, InputOption::VALUE_REQUIRED, '', null, ['foo', 'bar']), '--shell'],
+        ] as [$option, $optionToken]) {
+            $this->application->getDefinition()->setOptions($options);
+            $this->application->getDefinition()->addOption($option);
+
+            $this->tester->execute(['-s' => 'bash', '-a' => '1', '-c' => '2', '-i' => ['bin/console', 'hello', $optionToken]], ['verbosity' => OutputInterface::VERBOSITY_DEBUG]);
+
+            $this->assertEquals("foo\nbar".\PHP_EOL, $this->tester->getDisplay());
+        }
+    }
+
     private function execute(array $input)
     {
         // run in verbose mode to assert exceptions
@@ -155,5 +259,25 @@ class CompleteCommandTest_HelloCommand extends Command
         }
 
         parent::complete($input, $suggestions);
+    }
+}
+
+class CompleteCommandTest_FileCommand extends Command
+{
+    public function configure(): void
+    {
+        $this->setName('file')
+             ->addArgument('file')
+             ->addOption('dir', null, InputOption::VALUE_REQUIRED)
+        ;
+    }
+
+    public function complete(CompletionInput $input, CompletionSuggestions $suggestions): void
+    {
+        if ($input->mustSuggestArgumentValuesFor('file')) {
+            $suggestions->suggestPaths()->suggestValue(new Suggestion('default', 'The default file'));
+        } elseif ($input->mustSuggestOptionValuesFor('dir')) {
+            $suggestions->suggestDirectories();
+        }
     }
 }

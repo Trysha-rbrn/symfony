@@ -11,9 +11,15 @@
 
 namespace Symfony\Component\KeyManagement\Tests\DependencyInjection;
 
+use Doctrine\DBAL\Connection;
+use Doctrine\DBAL\Types\Type;
+use Doctrine\ORM\Mapping\Entity;
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\PreserveGlobalState;
+use PHPUnit\Framework\Attributes\RunInSeparateProcess;
 use PHPUnit\Framework\TestCase;
 use Symfony\Bridge\Doctrine\SchemaListener\AbstractSchemaListener;
+use Symfony\Component\DependencyInjection\Argument\LazyProxyArgument;
 use Symfony\Component\DependencyInjection\Argument\ServiceLocatorArgument;
 use Symfony\Component\DependencyInjection\Argument\TaggedIteratorArgument;
 use Symfony\Component\DependencyInjection\ChildDefinition;
@@ -22,17 +28,25 @@ use Symfony\Component\DependencyInjection\ContainerInterface;
 use Symfony\Component\DependencyInjection\Exception\InvalidArgumentException;
 use Symfony\Component\DependencyInjection\Exception\LogicException;
 use Symfony\Component\DependencyInjection\Loader\ClosureLoader;
+use Symfony\Component\DependencyInjection\Parameter;
 use Symfony\Component\DependencyInjection\ParameterBag\EnvPlaceholderParameterBag;
 use Symfony\Component\DependencyInjection\Reference;
+use Symfony\Component\KeyManagement\Base64UrlSafe;
 use Symfony\Component\KeyManagement\BlindIndex;
+use Symfony\Component\KeyManagement\BlindIndexInterface;
 use Symfony\Component\KeyManagement\Bridge\AwsKms\AwsKmsFactory;
 use Symfony\Component\KeyManagement\Bridge\AzureKeyVault\AzureKeyVaultFactory;
 use Symfony\Component\KeyManagement\Bridge\DoctrineDbal\DataKeyStore;
+use Symfony\Component\KeyManagement\Bridge\DoctrineDbal\EncryptedTypes;
 use Symfony\Component\KeyManagement\Bridge\DoctrineOrm\EventListener\BlindIndexListener;
+use Symfony\Component\KeyManagement\Bridge\DoctrineOrm\EventListener\EncryptedColumnListener;
 use Symfony\Component\KeyManagement\Bridge\DoctrineOrm\SchemaListener\DataKeyStoreSchemaListener;
 use Symfony\Component\KeyManagement\Bridge\Flysystem\FlysystemKmsFactory;
 use Symfony\Component\KeyManagement\Bridge\GoogleCloudKms\GoogleCloudKmsFactory;
 use Symfony\Component\KeyManagement\Bridge\HashiCorpVault\TransitKmsFactory;
+use Symfony\Component\KeyManagement\Bridge\Kmip\KmipKms;
+use Symfony\Component\KeyManagement\Bridge\Kmip\KmipKmsFactory;
+use Symfony\Component\KeyManagement\Bridge\Scaleway\ScalewayKmsFactory;
 use Symfony\Component\KeyManagement\CompositeKms;
 use Symfony\Component\KeyManagement\DataKeyGeneratorInterface;
 use Symfony\Component\KeyManagement\DataKeyStoreInterface;
@@ -46,6 +60,7 @@ use Symfony\Component\KeyManagement\EnvelopeEncrypterInterface;
 use Symfony\Component\KeyManagement\Factory\KmsFactoryInterface;
 use Symfony\Component\KeyManagement\KeyManagementBundle;
 use Symfony\Component\KeyManagement\RewrappableDataKeyStoreInterface;
+use Symfony\Component\KeyManagement\Tests\Fixtures\Entity\Speaker;
 use Symfony\Component\Serializer\Normalizer\DenormalizerInterface;
 
 class KeyManagementBundleExtensionTest extends TestCase
@@ -98,6 +113,7 @@ class KeyManagementBundleExtensionTest extends TestCase
         yield 'azure' => ['key_management.factory.azure_key_vault'];
         yield 'google cloud' => ['key_management.factory.google_cloud_kms'];
         yield 'aws' => ['key_management.factory.aws_kms'];
+        yield 'scaleway' => ['key_management.factory.scaleway'];
     }
 
     #[DataProvider('provideOptionalServices')]
@@ -105,7 +121,7 @@ class KeyManagementBundleExtensionTest extends TestCase
     {
         $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
             // the blind index listener is dropped when the application registers no index at all
-            $container->register('app.email_index', BlindIndex::class)->addTag('key_management.blind_index');
+            $container->register('app.email_index', BlindIndex::class)->setAutoconfigured(true)->addTag('key_management.blind_index', ['index' => 'email']);
             $container->loadFromExtension('key_management', []);
         });
 
@@ -125,7 +141,10 @@ class KeyManagementBundleExtensionTest extends TestCase
         yield 'aws' => ['key_management.factory.aws_kms', ['class' => AwsKmsFactory::class, 'package' => 'symfony/aws-key-management', 'parent_packages' => $parents]];
         yield 'azure' => ['key_management.factory.azure_key_vault', ['class' => AzureKeyVaultFactory::class, 'package' => 'symfony/azure-keyvault-key-management', 'parent_packages' => $parents]];
         yield 'google cloud' => ['key_management.factory.google_cloud_kms', ['class' => GoogleCloudKmsFactory::class, 'package' => 'symfony/google-cloud-key-management', 'parent_packages' => $parents]];
+        yield 'scaleway' => ['key_management.factory.scaleway', ['class' => ScalewayKmsFactory::class, 'package' => 'symfony/scaleway-key-management', 'parent_packages' => $parents]];
+        yield 'kmip' => ['key_management.factory.kmip', ['class' => KmipKmsFactory::class, 'package' => 'symfony/kmip-key-management', 'parent_packages' => $parents]];
         yield 'blind index listener' => ['key_management.blind_index_listener', ['class' => BlindIndexListener::class, 'package' => 'symfony/doctrine-orm-key-management', 'parent_packages' => $parents]];
+        yield 'encrypted column listener' => ['key_management.encrypted_column_listener', ['class' => EncryptedColumnListener::class, 'package' => 'symfony/doctrine-orm-key-management', 'parent_packages' => $parents]];
         yield 'envelope normalizer' => ['serializer.normalizer.key_management_envelope', ['class' => DenormalizerInterface::class]];
     }
 
@@ -137,7 +156,7 @@ class KeyManagementBundleExtensionTest extends TestCase
 
         $arguments = $container->getDefinition('console.command.key_management_rewrap_data_keys')->getArguments();
         $this->assertSame('key_management.store', (string) $arguments[0]);
-        $this->assertInstanceOf(ServiceLocatorArgument::class, $arguments[1]);
+        $this->assertSame('.key_management.store.clients', (string) $arguments[1]);
     }
 
     public function testFlysystemFactoryIsWiredWithTaggedLocator()
@@ -231,18 +250,153 @@ class KeyManagementBundleExtensionTest extends TestCase
         $this->assertTrue($container->hasDefinition('key_management.store'));
         $arguments = $container->getDefinition('key_management.store')->getArguments();
         $this->assertSame('app.dbal', (string) $arguments[0]);
-        $this->assertInstanceOf(ServiceLocatorArgument::class, $arguments[1]);
-        $this->assertSame('key_management.client', $arguments[1]->getTaggedIteratorArgument()->getTag(), 'a data key can be rewrapped under any tagged client, not only under a configured one.');
-        $this->assertSame('key', $arguments[1]->getTaggedIteratorArgument()->getIndexAttribute());
+        $this->assertSame('.key_management.store.clients', (string) $arguments[1]);
         $this->assertSame('app', $arguments[2]);
         $this->assertSame('alias/app-key', $arguments[3]);
-        $this->assertSame('deks', $arguments[4]);
-        $this->assertSame(3600, $arguments[6]);
+        $this->assertEquals(new Parameter('kernel.secret'), $arguments[4]);
+        $this->assertSame('deks', $arguments[5]);
+        $this->assertSame(3600, $arguments[7]);
+        $this->assertSame('clock', (string) $arguments[8]);
+        $this->assertSame(ContainerInterface::NULL_ON_INVALID_REFERENCE, $arguments[8]->getInvalidBehavior());
+        $this->assertFalse($arguments[9], 'a store wraps under no authenticated data unless the deployment states that its backend enforces some.');
         $this->assertSame([['method' => 'forget']], $container->getDefinition('key_management.store')->getTag('kernel.reset'), 'the retained plaintexts must not survive a unit of work in a long-running process.');
 
         $encrypter = $container->getDefinition('key_management.stored_envelope_encrypter')->getArguments();
         $this->assertSame('key_management.store', (string) $encrypter[0]);
-        $this->assertSame('key_management.envelope_encrypter.app', (string) $encrypter[1], 'the default client provides the fallback that reads self-contained envelopes.');
+        $this->assertNull($encrypter[1], 'a payload carrying its own data key bypasses the store, so reading one is asked for rather than inherited from having a default client.');
+
+        $rewrap = $container->getDefinition('console.command.key_management_rewrap_data_keys')->getArguments();
+        $this->assertSame('app', $rewrap[2]);
+        $this->assertSame('alias/app-key', $rewrap[3]);
+    }
+
+    public function testAStoreWithoutASecretIsReportedWhenTheContainerIsCompiled()
+    {
+        if (!class_exists(DataKeyStore::class)) {
+            $this->markTestSkipped('symfony/doctrine-dbal-key-management is not installed.');
+        }
+
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage('The "key_management.store" needs a secret to authenticate its data keys: set "key_management.store.secret", or define the "kernel.secret" parameter, for example with "framework.secret".');
+
+        $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->getParameterBag()->remove('kernel.secret');
+            $container->register('app.dbal', \stdClass::class);
+            $container->loadFromExtension('key_management', [
+                'clients' => ['app' => 'sodium://?keys[app]=Q0VkRUNVTk5VTkRJVUVDU1U='],
+                'store' => ['connection' => 'app.dbal', 'client' => 'app', 'key_id' => 'app'],
+            ]);
+        });
+    }
+
+    public function testAStoreSecretMakesTheKernelSecretUnnecessary()
+    {
+        if (!class_exists(DataKeyStore::class)) {
+            $this->markTestSkipped('symfony/doctrine-dbal-key-management is not installed.');
+        }
+
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->getParameterBag()->remove('kernel.secret');
+            $container->register('app.dbal', \stdClass::class);
+            $container->loadFromExtension('key_management', [
+                'clients' => ['app' => 'sodium://?keys[app]=Q0VkRUNVTk5VTkRJVUVDU1U='],
+                'store' => ['connection' => 'app.dbal', 'client' => 'app', 'key_id' => 'app', 'secret' => 'store-secret'],
+            ]);
+        });
+
+        $this->assertSame(['store-secret'], $container->getDefinition('key_management.store')->getArgument(4));
+    }
+
+    public function testTheStoreSecretCanBeRotated()
+    {
+        if (!class_exists(DataKeyStore::class)) {
+            $this->markTestSkipped('symfony/doctrine-dbal-key-management is not installed.');
+        }
+
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->register('app.dbal', \stdClass::class);
+            $container->loadFromExtension('key_management', [
+                'clients' => ['app' => 'sodium://?keys[app]=Q0VkRUNVTk5VTkRJVUVDU1U='],
+                'store' => ['connection' => 'app.dbal', 'client' => 'app', 'key_id' => 'app', 'secret' => ['new', 'old']],
+            ]);
+        });
+
+        $this->assertSame(['new', 'old'], $container->getDefinition('key_management.store')->getArgument(4));
+    }
+
+    public function testASingleStoreSecretIsAccepted()
+    {
+        if (!class_exists(DataKeyStore::class)) {
+            $this->markTestSkipped('symfony/doctrine-dbal-key-management is not installed.');
+        }
+
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->register('app.dbal', \stdClass::class);
+            $container->loadFromExtension('key_management', [
+                'clients' => ['app' => 'sodium://?keys[app]=Q0VkRUNVTk5VTkRJVUVDU1U='],
+                'store' => ['connection' => 'app.dbal', 'client' => 'app', 'key_id' => 'app', 'secret' => 'store-secret'],
+            ]);
+        });
+
+        $this->assertSame(['store-secret'], $container->getDefinition('key_management.store')->getArgument(4));
+    }
+
+    public function testAnUnknownAllowedStoreClientIsRejected()
+    {
+        if (!class_exists(DataKeyStore::class)) {
+            $this->markTestSkipped('symfony/doctrine-dbal-key-management is not installed.');
+        }
+
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage('The KMS client "missing" set in "key_management.store.allowed_clients" is not registered');
+
+        $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->register('app.dbal', \stdClass::class);
+            $container->loadFromExtension('key_management', [
+                'clients' => ['app' => 'sodium://?keys[app]=Q0VkRUNVTk5VTkRJVUVDU1U='],
+                'store' => ['client' => 'app', 'key_id' => 'app', 'allowed_clients' => ['missing']],
+            ]);
+        });
+    }
+
+    public function testReadingSelfContainedPayloadsNeedsAClientToReadThemWith()
+    {
+        if (!class_exists(DataKeyStore::class)) {
+            $this->markTestSkipped('symfony/doctrine-dbal-key-management is not installed.');
+        }
+
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage('The "key_management.store.read_self_contained" option needs a client to read those payloads with');
+
+        $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->register('app.dbal', \stdClass::class);
+            $container->loadFromExtension('key_management', [
+                'clients' => ['app' => 'sodium://?keys[app]=AAAA', 'other' => 'sodium://?keys[other]=AAAA'],
+                'store' => ['connection' => 'app.dbal', 'client' => 'app', 'key_id' => 'alias/app-key', 'read_self_contained' => true],
+            ]);
+        });
+    }
+
+    public function testTheStoreIsToldToBindItsWrappingContextWhenAsked()
+    {
+        if (!class_exists(DataKeyStore::class)) {
+            $this->markTestSkipped('symfony/doctrine-dbal-key-management is not installed.');
+        }
+
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->register('app.dbal', \stdClass::class);
+            $container->loadFromExtension('key_management', [
+                'clients' => ['app' => 'sodium://?keys[app]=AAAA'],
+                'store' => [
+                    'connection' => 'app.dbal',
+                    'client' => 'app',
+                    'key_id' => 'alias/app-key',
+                    'bind_wrapping_context' => true,
+                ],
+            ]);
+        });
+
+        $this->assertTrue($container->getDefinition('key_management.store')->getArgument(9));
     }
 
     public function testStoreBringsTheListenerThatPutsItsTableInTheSchema()
@@ -280,7 +434,7 @@ class KeyManagementBundleExtensionTest extends TestCase
             ]);
         });
 
-        $this->assertSame(DataKeyStore::DEFAULT_MAX_AGE_SECONDS, $container->getDefinition('key_management.store')->getArgument(6));
+        $this->assertSame(DataKeyStore::DEFAULT_MAX_AGE_SECONDS, $container->getDefinition('key_management.store')->getArgument(7));
     }
 
     public function testStoreNeverRotatesWhenTheMaxAgeIsNull()
@@ -297,7 +451,7 @@ class KeyManagementBundleExtensionTest extends TestCase
             ]);
         });
 
-        $this->assertNull($container->getDefinition('key_management.store')->getArgument(6));
+        $this->assertNull($container->getDefinition('key_management.store')->getArgument(7));
     }
 
     public function testWithoutAStoreRegistersNoSchemaListener()
@@ -316,7 +470,7 @@ class KeyManagementBundleExtensionTest extends TestCase
         }
 
         $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
-            $container->register('app.email_index', BlindIndex::class)->addTag('key_management.blind_index');
+            $container->register('app.email_index', BlindIndex::class)->setAutoconfigured(true)->addTag('key_management.blind_index', ['index' => 'email']);
             $container->loadFromExtension('key_management', ['clients' => ['app' => 'sodium://?keys[app]=Q0VkRUNVTk5VTkRJVUVDU1U=']]);
         });
 
@@ -325,10 +479,11 @@ class KeyManagementBundleExtensionTest extends TestCase
         $this->assertSame(BlindIndexListener::class, $definition->getClass());
         $this->assertSame([['event' => 'onFlush']], $definition->getTag('doctrine.event_listener'));
         $this->assertInstanceOf(Reference::class, $definition->getArgument(0), 'the pass hands the listener the blind indexes of the application.');
+        $this->assertSame(['email'], array_keys($container->getDefinition((string) $definition->getArgument(0))->getArgument(0)), 'the listener reaches an index by the name its tag states.');
         $this->assertSame([['key_management.blind_index' => [[]]]], array_map(
             static fn (ChildDefinition $child): array => $child->getTags(),
-            array_values(array_intersect_key($container->getAutoconfiguredInstanceof(), [BlindIndex::class => true])),
-        ), 'a blind index the application registers is found by the listener without being tagged by hand.');
+            array_values(array_intersect_key($container->getAutoconfiguredInstanceof(), [BlindIndexInterface::class => true])),
+        ), 'an index the application registers is tagged without being tagged by hand, so the pass asks it for its name rather than dropping the listener.');
     }
 
     public function testTheBlindIndexListenerGoesWhenNoIndexIsRegistered()
@@ -464,7 +619,7 @@ class KeyManagementBundleExtensionTest extends TestCase
             $container->register('app.dbal', \stdClass::class);
             $container->loadFromExtension('key_management', [
                 'clients' => ['app' => 'sodium://?keys[app]=Q0VkRUNVTk5VTkRJVUVDU1U='],
-                'store' => ['connection' => 'app.dbal', 'client' => 'app', 'key_id' => 'alias/app-key'],
+                'store' => ['connection' => 'app.dbal', 'client' => 'app', 'key_id' => 'alias/app-key', 'read_self_contained' => true],
             ]);
         }, true);
 
@@ -513,7 +668,7 @@ class KeyManagementBundleExtensionTest extends TestCase
                     'main' => ['members' => ['aws' => null, 'azure' => 'backup']],
                 ],
                 'default_client' => 'main',
-                'store' => ['connection' => 'app.dbal', 'key_id' => 'alias/app-key'],
+                'store' => ['connection' => 'app.dbal', 'key_id' => 'alias/app-key', 'read_self_contained' => true],
             ]);
         });
 
@@ -670,8 +825,9 @@ class KeyManagementBundleExtensionTest extends TestCase
         $this->assertSame('key_management.client', $definition->getArgument(0)->getTaggedIteratorArgument()->getTag(), 'the members are resolved lazily through the locator of the tagged clients.');
         $this->assertSame('key', $definition->getArgument(0)->getTaggedIteratorArgument()->getIndexAttribute());
         $this->assertSame(['aws' => null, 'azure' => 'backup'], $definition->getArgument(1));
-        $this->assertSame('logger', (string) $definition->getArgument(2), 'a member passed over is only ever reported to the logger.');
-        $this->assertSame(ContainerInterface::NULL_ON_INVALID_REFERENCE, $definition->getArgument(2)->getInvalidBehavior());
+        $this->assertSame([], $definition->getArgument(2), 'nothing is retired until a member is replaced.');
+        $this->assertSame('logger', (string) $definition->getArgument(3), 'a member passed over is only ever reported to the logger.');
+        $this->assertSame(ContainerInterface::NULL_ON_INVALID_REFERENCE, $definition->getArgument(3)->getInvalidBehavior());
         $this->assertSame([['channel' => 'key_management']], $definition->getTag('monolog.logger'));
         $this->assertSame([['key' => 'main']], $definition->getTag('key_management.client'), 'a composite client is a client like any other for the commands and the profiler.');
 
@@ -695,6 +851,52 @@ class KeyManagementBundleExtensionTest extends TestCase
                 'clients' => [
                     'aws' => 'sodium://?keys[main]=Q0VkRUNVTk5VTkRJVUVDU1U=',
                     'main' => ['members' => ['aws' => null, 'gcp' => 'backup']],
+                ],
+            ]);
+        });
+    }
+
+    public function testARetiredMemberIsPassedToTheCompositeClient()
+    {
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('key_management', [
+                'clients' => [
+                    'old' => 'sodium://?keys[main]=Q0VkRUNVTk5VTkRJVUVDU1U=',
+                    'new' => 'sodium://?keys[main]=Q0VkRUNVTk5VTkRJVUVDU1U=',
+                    'main' => ['members' => ['new' => null], 'retired' => ['old']],
+                ],
+            ]);
+        });
+
+        $this->assertSame(['old'], $container->getDefinition('key_management.main')->getArgument(2));
+    }
+
+    public function testARetiredMemberMustBeRegistered()
+    {
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage('The member "old" of the composite KMS client "main" is not registered');
+
+        $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('key_management', [
+                'clients' => [
+                    'new' => 'sodium://?keys[main]=Q0VkRUNVTk5VTkRJVUVDU1U=',
+                    'main' => ['members' => ['new' => null], 'retired' => ['old']],
+                ],
+            ]);
+        });
+    }
+
+    public function testARetiredMemberCannotBeACompositeClientItself()
+    {
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage('The member "inner" of the composite KMS client "outer" is a composite client itself');
+
+        $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('key_management', [
+                'clients' => [
+                    'aws' => 'sodium://?keys[main]=Q0VkRUNVTk5VTkRJVUVDU1U=',
+                    'inner' => ['members' => ['aws' => null]],
+                    'outer' => ['members' => ['aws' => null], 'retired' => ['inner']],
                 ],
             ]);
         });
@@ -740,16 +942,264 @@ class KeyManagementBundleExtensionTest extends TestCase
         $this->assertTrue($container->hasDefinition('key_management.factory.aws_kms'));
     }
 
-    private function createContainerFromClosure(\Closure $closure, bool $debug = false): ContainerBuilder
+    public function testKmipClientsAreBuiltFromTheirDsn()
     {
-        $container = new ContainerBuilder(new EnvPlaceholderParameterBag(['kernel.debug' => $debug, 'kernel.project_dir' => __DIR__]));
+        if (!class_exists(KmipKmsFactory::class)) {
+            $this->markTestSkipped('symfony/kmip-key-management is not installed.');
+        }
+
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('key_management', ['clients' => [
+                'default' => 'kmip://default.example?cert=/missing/cert&key=/missing/key&version=2.0',
+                'long' => 'kmip://long.example?cert=/missing/cert&key=/missing/key&version=1.4&iv_length=16',
+            ]]);
+            $container->setAlias('test.kmip.default', 'key_management.default')->setPublic(true);
+            $container->setAlias('test.kmip.long', 'key_management.long')->setPublic(true);
+        }, optimize: true);
+
+        foreach (['default' => 12, 'long' => 16] as $client => $ivLength) {
+            $kms = $container->get('test.kmip.'.$client);
+            $this->assertInstanceOf(KmipKms::class, $kms);
+            $cipher = (new \ReflectionProperty($kms, 'cipher'))->getValue($kms);
+            $this->assertSame($ivLength, (new \ReflectionProperty($cipher, 'ivLength'))->getValue($cipher));
+        }
+    }
+
+    public function testDoctrineDbalTypesEncryptWithTheDefaultClientWithoutAStore()
+    {
+        if (!class_exists(Type::class) || !class_exists(EncryptedTypes::class)) {
+            $this->markTestSkipped('doctrine/dbal or symfony/doctrine-dbal-key-management is not installed.');
+        }
+
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('key_management', [
+                'clients' => ['app' => 'sodium://?keys[app]=AAAA'],
+                'doctrine_dbal' => ['types' => ['encrypted_phone' => ['type' => 'string', 'key' => 'app']]],
+            ]);
+        });
+
+        $definition = $container->getDefinition('key_management.doctrine_dbal.encrypted_types');
+        $this->assertSame(EncryptedTypes::class, $definition->getClass());
+        $this->assertTrue($definition->isPublic(), 'the bundle fetches it when the kernel boots.');
+        $this->assertEquals(new LazyProxyArgument(new Reference('key_management.envelope_encrypter.app')), $definition->getArgument(0));
+        $this->assertSame(['encrypted_phone' => ['type' => 'string', 'key' => 'app']], $definition->getArgument(1));
+    }
+
+    public function testDoctrineDbalTypesAreRegisteredWhenDoctrineBundleCreatesAConnection()
+    {
+        if (!class_exists(Type::class) || !class_exists(EncryptedTypes::class)) {
+            $this->markTestSkipped('doctrine/dbal or symfony/doctrine-dbal-key-management is not installed.');
+        }
+
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->setParameter('doctrine.connections', ['default' => 'doctrine.dbal.default_connection', 'replica' => 'doctrine.dbal.replica_connection']);
+            $container->register('doctrine.dbal.default_connection', Connection::class);
+            $container->register('doctrine.dbal.replica_connection', Connection::class);
+            $container->loadFromExtension('key_management', [
+                'clients' => ['app' => 'sodium://?keys[app]=AAAA'],
+                'doctrine_dbal' => ['types' => ['encrypted_phone' => ['type' => 'string', 'key' => 'app']]],
+            ]);
+        });
+
+        $this->assertFalse($container->getDefinition('key_management.doctrine_dbal.encrypted_types')->isPublic(), 'the kernel does not register them when it boots.');
+        $this->assertEquals([new Reference('key_management.doctrine_dbal.encrypted_types'), 'register'], $container->getDefinition('doctrine.dbal.default_connection')->getConfigurator());
+        $this->assertEquals([new Reference('key_management.doctrine_dbal.encrypted_types'), 'register'], $container->getDefinition('doctrine.dbal.replica_connection')->getConfigurator());
+    }
+
+    public function testWithoutDoctrineDbalTypesNothingIsRegisteredForThem()
+    {
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('key_management', ['clients' => ['app' => 'sodium://?keys[app]=AAAA']]);
+        });
+
+        $this->assertFalse($container->has('key_management.doctrine_dbal.encrypted_types'));
+    }
+
+    public function testDoctrineDbalTypesWithoutAStoreNorADefaultClientAreRefused()
+    {
+        if (!class_exists(Type::class) || !class_exists(EncryptedTypes::class)) {
+            $this->markTestSkipped('doctrine/dbal or symfony/doctrine-dbal-key-management is not installed.');
+        }
+
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage('The "key_management.doctrine_dbal.types" need an envelope encrypter: configure "key_management.store", or set "key_management.default_client".');
+
+        $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('key_management', [
+                'clients' => [
+                    'aws' => 'sodium://?keys[main]=Q0VkRUNVTk5VTkRJVUVDU1U=',
+                    'azure' => 'sodium://?keys[backup]=Q0VkRUNVTk5VTkRJVUVDU1U=',
+                ],
+                'doctrine_dbal' => ['types' => ['encrypted_phone' => ['type' => 'string', 'key' => 'main']]],
+            ]);
+        });
+    }
+
+    #[RunInSeparateProcess]
+    #[PreserveGlobalState(false)]
+    #[DataProvider('provideMissingDoctrineDbalTypesPackages')]
+    public function testDoctrineDbalTypesNameThePackageTheyNeed(string $namespace, string $package)
+    {
+        $loaders = spl_autoload_functions();
+        foreach ($loaders as $loader) {
+            spl_autoload_unregister($loader);
+        }
+        foreach ($loaders as $loader) {
+            spl_autoload_register(static function (string $class) use ($loader, $namespace): void {
+                if (!str_starts_with($class, $namespace)) {
+                    $loader($class);
+                }
+            });
+        }
+
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage(\sprintf('Configuring "key_management.doctrine_dbal.types" requires the "%1$s" package. Try running "composer require %1$s".', $package));
+
+        $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('key_management', [
+                'clients' => ['app' => 'sodium://?keys[app]=AAAA'],
+                'doctrine_dbal' => ['types' => ['encrypted_phone' => ['type' => 'string', 'key' => 'app']]],
+            ]);
+        });
+    }
+
+    public static function provideMissingDoctrineDbalTypesPackages(): iterable
+    {
+        yield 'the bridge' => ['Symfony\\Component\\KeyManagement\\Bridge\\DoctrineDbal\\', 'symfony/doctrine-dbal-key-management'];
+        yield 'DBAL' => ['Doctrine\\DBAL\\', 'doctrine/dbal'];
+    }
+
+    public function testTheEncryptedColumnsOfTheScannedEntitiesGetTheirTypes()
+    {
+        if (!class_exists(Entity::class) || !class_exists(EncryptedColumnListener::class)) {
+            $this->markTestSkipped('doctrine/orm or symfony/doctrine-orm-key-management is not installed.');
+        }
+
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->register(Speaker::class, Speaker::class)->setAutoconfigured(true);
+            $container->loadFromExtension('key_management', ['clients' => ['app' => 'sodium://?keys[app]=AAAA']]);
+        });
+
+        $types = $container->getDefinition('key_management.doctrine_dbal.encrypted_types');
+        $this->assertEquals(new LazyProxyArgument(new Reference('key_management.envelope_encrypter.app')), $types->getArgument(0));
+        $this->assertSame(['encrypted_string@speaker.contact' => ['type' => 'string', 'key' => 'speaker.contact']], $types->getArgument(1));
+
+        $listener = $container->getDefinition('key_management.encrypted_column_listener');
+        $this->assertSame(EncryptedColumnListener::class, $listener->getClass());
+        $this->assertSame([['event' => 'loadClassMetadata', 'priority' => -1024]], $listener->getTag('doctrine.event_listener'));
+        $this->assertSame(['speaker.contact' => ['string' => 'encrypted_string@speaker.contact']], $listener->getArgument(0));
+    }
+
+    public function testTheEncryptedColumnListenerStaysWithoutEncryptedColumns()
+    {
+        if (!class_exists(EncryptedColumnListener::class)) {
+            $this->markTestSkipped('symfony/doctrine-orm-key-management is not installed.');
+        }
+
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('key_management', ['clients' => ['app' => 'sodium://?keys[app]=AAAA']]);
+        });
+
+        $this->assertSame([], $container->getDefinition('key_management.encrypted_column_listener')->getArgument(0), 'the listener reports an entity the container did not scan.');
+    }
+
+    public function testTheTypesOfAutomaticColumnsAreCachedInASystemPool()
+    {
+        if (!class_exists(EncryptedColumnListener::class)) {
+            $this->markTestSkipped('symfony/doctrine-orm-key-management is not installed.');
+        }
+
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->register('cache.system', \stdClass::class)->setAbstract(true);
+            $container->loadFromExtension('key_management', ['clients' => ['app' => 'sodium://?keys[app]=AAAA']]);
+        });
+
+        $pool = $container->getDefinition('cache.key_management.encrypted_columns');
+        $this->assertInstanceOf(ChildDefinition::class, $pool);
+        $this->assertSame('cache.system', $pool->getParent());
+        $this->assertTrue($pool->hasTag('cache.pool'));
+
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('key_management', ['clients' => ['app' => 'sodium://?keys[app]=AAAA']]);
+        });
+
+        $this->assertFalse($container->hasDefinition('cache.key_management.encrypted_columns'));
+    }
+
+    public function testTheTypesOfAutomaticColumnsAreNotCachedInDebugMode()
+    {
+        if (!class_exists(EncryptedColumnListener::class)) {
+            $this->markTestSkipped('symfony/doctrine-orm-key-management is not installed.');
+        }
+
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->register('cache.system', \stdClass::class)->setAbstract(true);
+            $container->loadFromExtension('key_management', ['clients' => ['app' => 'sodium://?keys[app]=AAAA']]);
+        }, true);
+
+        $this->assertFalse($container->hasDefinition('cache.key_management.encrypted_columns'));
+    }
+
+    public function testEncryptedColumnsWithoutAStoreNorADefaultClientAreRefused()
+    {
+        if (!class_exists(Entity::class) || !class_exists(EncryptedColumnListener::class)) {
+            $this->markTestSkipped('doctrine/orm or symfony/doctrine-orm-key-management is not installed.');
+        }
+
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage(\sprintf('The encrypted columns of "%s" need an envelope encrypter: configure "key_management.store", or set "key_management.default_client".', Speaker::class));
+
+        $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->register(Speaker::class, Speaker::class)->setAutoconfigured(true);
+            $container->loadFromExtension('key_management', [
+                'clients' => [
+                    'aws' => 'sodium://?keys[main]=Q0VkRUNVTk5VTkRJVUVDU1U=',
+                    'azure' => 'sodium://?keys[backup]=Q0VkRUNVTk5VTkRJVUVDU1U=',
+                ],
+            ]);
+        });
+    }
+
+    #[RunInSeparateProcess]
+    #[PreserveGlobalState(false)]
+    public function testBundleLoadsWithoutTheKmipBridge()
+    {
+        $loaders = spl_autoload_functions();
+        foreach ($loaders as $loader) {
+            spl_autoload_unregister($loader);
+        }
+        foreach ($loaders as $loader) {
+            spl_autoload_register(static function (string $class) use ($loader): void {
+                if (!str_starts_with($class, 'Symfony\\Component\\KeyManagement\\Bridge\\Kmip\\')) {
+                    $loader($class);
+                }
+            });
+        }
+
+        $this->assertFalse(class_exists(KmipKmsFactory::class));
+
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->setExtensionConfig('key_management', ['openssl://?keys[app]='.Base64UrlSafe::encode(random_bytes(32))]);
+            $container->setAlias('test.kms', 'key_management.default')->setPublic(true);
+        }, optimize: true);
+
+        $this->assertFalse($container->hasDefinition('key_management.factory.kmip'));
+        $kms = $container->get('test.kms');
+        $this->assertSame('working', $kms->decrypt($kms->encrypt('app', 'working')));
+    }
+
+    private function createContainerFromClosure(\Closure $closure, bool $debug = false, bool $optimize = false): ContainerBuilder
+    {
+        $container = new ContainerBuilder(new EnvPlaceholderParameterBag(['kernel.debug' => $debug, 'kernel.project_dir' => __DIR__, 'kernel.secret' => 'kernel-secret']));
         $bundle = new KeyManagementBundle();
         $bundle->build($container);
         $container->registerExtension($bundle->getContainerExtension());
         new ClosureLoader($container)->load($closure);
-        $container->getCompilerPassConfig()->setOptimizationPasses([]);
-        $container->getCompilerPassConfig()->setRemovingPasses([]);
-        $container->getCompilerPassConfig()->setAfterRemovingPasses([]);
+        if (!$optimize) {
+            $container->getCompilerPassConfig()->setOptimizationPasses([]);
+            $container->getCompilerPassConfig()->setRemovingPasses([]);
+            $container->getCompilerPassConfig()->setAfterRemovingPasses([]);
+        }
         $container->compile();
 
         return $container;

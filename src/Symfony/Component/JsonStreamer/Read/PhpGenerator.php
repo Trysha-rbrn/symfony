@@ -18,6 +18,7 @@ use Symfony\Component\JsonStreamer\DataModel\Read\CompositeNode;
 use Symfony\Component\JsonStreamer\DataModel\Read\DataModelNodeInterface;
 use Symfony\Component\JsonStreamer\DataModel\Read\ObjectNode;
 use Symfony\Component\JsonStreamer\DataModel\Read\ScalarNode;
+use Symfony\Component\JsonStreamer\Exception\InvalidStreamException;
 use Symfony\Component\JsonStreamer\Exception\LogicException;
 use Symfony\Component\JsonStreamer\Exception\UnexpectedValueException;
 use Symfony\Component\JsonStreamer\PhpGeneratorTrait;
@@ -51,6 +52,7 @@ final class PhpGenerator
     public function generate(DataModelNodeInterface $dataModel, bool $decodeFromStream, array $options = [], array $context = []): string
     {
         $context['indentation_level'] = 1;
+        $context['object_nodes'] = $decodeFromStream ? $this->collectObjectNodes($dataModel) : [];
 
         $providers = $this->generateProviders($dataModel, $decodeFromStream, $context);
 
@@ -60,26 +62,30 @@ final class PhpGenerator
         if ($decodeFromStream) {
             return $this->line('<?php', $context)
                 .$this->line('', $context)
+                .$this->line('declare(strict_types=1);', $context)
+                .$this->line('', $context)
                 .$this->line('/**', $context)
                 .$this->line(' * @return '.$docType, $context)
                 .$this->line(' */', $context)
                 .$this->line('return static function (mixed $stream, \\'.ContainerInterface::class.' $transformers, \\'.LazyInstantiator::class.' $instantiator, array $options): mixed {', $context)
                 .$providers
-                .($this->canBeDecodedWithJsonDecode($dataModel, $decodeFromStream)
-                    ? $this->line('    return \\'.Decoder::class.'::decodeStream($stream, 0, null);', $context)
+                .($this->canBeDecodedWithJsonDecode($dataModel, false)
+                    ? $this->line('    return '.$this->generateNullGuard($dataModel, '\\'.Decoder::class.'::decodeStream($stream, 0, null)').';', $context)
                     : $this->line('    return $providers['.var_export($dataModel->getIdentifier(), true).']($stream, 0, null);', $context))
                 .$this->line('};', $context);
         }
 
         return $this->line('<?php', $context)
             .$this->line('', $context)
+            .$this->line('declare(strict_types=1);', $context)
+            .$this->line('', $context)
             .$this->line('/**', $context)
             .$this->line(' * @return '.$docType, $context)
             .$this->line(' */', $context)
-            .$this->line('return static function (string|\\Stringable $string, \\'.ContainerInterface::class.' $transformers, \\'.Instantiator::class.' $instantiator, array $options): mixed {', $context)
+            .$this->line('return static function (string|\\Stringable $string, \\'.ContainerInterface::class.' $transformers, array $options): mixed {', $context)
             .$providers
-            .($this->canBeDecodedWithJsonDecode($dataModel, $decodeFromStream)
-                ? $this->line('    return \\'.Decoder::class.'::decodeString((string) $string);', $context)
+            .($this->canBeDecodedWithJsonDecode($dataModel, true)
+                ? $this->line('    return '.$this->generateNullGuard($dataModel, '\\'.Decoder::class.'::decodeString((string) $string)').';', $context)
                 : $this->line('    return $providers['.var_export($dataModel->getIdentifier(), true).'](\\'.Decoder::class.'::decodeString((string) $string));', $context))
             .$this->line('};', $context);
     }
@@ -89,13 +95,31 @@ final class PhpGenerator
      */
     private function generateProviders(DataModelNodeInterface $node, bool $decodeFromStream, array &$context): string
     {
-        if ($context['providers'][$node->getIdentifier()] ?? false) {
+        if ($node instanceof ObjectNode && $node->isMock()) {
+            if (!isset($context['object_nodes'][$node->getIdentifier()])) {
+                return '';
+            }
+
+            $node = $context['object_nodes'][$node->getIdentifier()];
+        }
+
+        $providerAccessor = $this->providerAccessor($node, $context);
+
+        if ($context['providers'][$providerAccessor] ?? false) {
             return '';
         }
 
-        $context['providers'][$node->getIdentifier()] = true;
+        $context['providers'][$providerAccessor] = true;
 
-        if ($this->canBeDecodedWithJsonDecode($node, $decodeFromStream)) {
+        $denormalize = $context['denormalize'] ?? false;
+        $keepDecodedCollections = !$decodeFromStream && !$denormalize;
+        $uses = match (true) {
+            $decodeFromStream => '$options, $transformers, $instantiator, &$providers',
+            $denormalize => '$options, $transformers, &$denormalizers',
+            default => '$options, $transformers, &$providers',
+        };
+
+        if ($this->canBeDecodedWithJsonDecode($node, $keepDecodedCollections)) {
             return '';
         }
 
@@ -103,35 +127,35 @@ final class PhpGenerator
             $accessor = $decodeFromStream ? '\\'.Decoder::class.'::decodeStream($stream, $offset, $length)' : '$data';
             $arguments = $decodeFromStream ? '$stream, $offset, $length' : '$data';
 
-            return $this->line('$providers['.var_export($node->getIdentifier(), true)."] = static function ($arguments) {", $context)
-                .$this->line('    return '.$this->generateValueFormat($node, $accessor).';', $context)
+            return $this->line("$providerAccessor = static function ($arguments) {", $context)
+                .$this->line('    return '.$this->generateValueFormat($node, $this->generateNullGuard($node, $accessor)).';', $context)
                 .$this->line('};', $context);
         }
 
         if ($node instanceof CompositeNode) {
             $php = '';
             foreach ($node->getNodes() as $n) {
-                if (!$this->canBeDecodedWithJsonDecode($n, $decodeFromStream)) {
+                if (!$this->canBeDecodedWithJsonDecode($n, $keepDecodedCollections)) {
                     $php .= $this->generateProviders($n, $decodeFromStream, $context);
                 }
             }
 
             $arguments = $decodeFromStream ? '$stream, $offset, $length' : '$data';
 
-            $php .= $this->line('$providers['.var_export($node->getIdentifier(), true)."] = static function ($arguments) use (\$options, \$transformers, \$instantiator, &\$providers) {", $context);
+            $php .= $this->line("$providerAccessor = static function ($arguments) use ($uses) {", $context);
 
             ++$context['indentation_level'];
 
             $php .= $decodeFromStream ? $this->line('$data = \\'.Decoder::class.'::decodeStream($stream, $offset, $length);', $context) : '';
 
             foreach ($node->getNodes() as $n) {
-                $value = $this->canBeDecodedWithJsonDecode($n, $decodeFromStream) ? $this->generateValueFormat($n, '$data') : '$providers['.var_export($n->getIdentifier(), true)."]($arguments)";
-                $php .= $this->line('if ('.$this->generateCompositeNodeItemCondition($n, '$data').') {', $context)
+                $value = $this->canBeDecodedWithJsonDecode($n, $keepDecodedCollections) ? $this->generateValueFormat($n, '$data') : $this->providerAccessor($n, $context)."($arguments)";
+                $php .= $this->line('if ('.$this->generateCompositeNodeItemCondition($n, '$data', $denormalize).') {', $context)
                     .$this->line("    return $value;", $context)
                     .$this->line('}', $context);
             }
 
-            $php .= $this->line('throw new \\'.UnexpectedValueException::class.'(\\sprintf(\'Unexpected "%s" value for "%s".\', \\get_debug_type($data), '.var_export($node->getIdentifier(), true).'));', $context);
+            $php .= $this->line($this->generateUnexpectedValueThrow($node, '$data').';', $context);
 
             --$context['indentation_level'];
 
@@ -139,57 +163,100 @@ final class PhpGenerator
         }
 
         if ($node instanceof CollectionNode) {
+            $itemNode = $node->getItemNode();
+            $itemContext = $context;
+            $itemDecodeFromStream = $decodeFromStream;
+
+            if ($decodeFromStream && $this->isStructured($itemNode) && $this->canBeReadAtOnce($itemNode, $context['object_nodes'])) {
+                $itemContext['denormalize'] = true;
+                $itemDecodeFromStream = false;
+                $uses .= ', &$readers';
+            }
+
             $arguments = $decodeFromStream ? '$stream, $offset, $length' : '$data';
 
-            $php = $this->line('$providers['.var_export($node->getIdentifier(), true)."] = static function ($arguments) use (\$options, \$transformers, \$instantiator, &\$providers) {", $context);
+            $php = $this->line("$providerAccessor = static function ($arguments) use ($uses) {", $context);
 
             ++$context['indentation_level'];
 
             $collectionKeyType = $node->getType()->getCollectionKeyType();
-
-            $arguments = $decodeFromStream ? '$stream, $data' : '$data';
-            $php .= ($decodeFromStream ? $this->line('$data = \\'.Splitter::class.'::'.($collectionKeyType instanceof BuiltinType && TypeIdentifier::INT === $collectionKeyType->getTypeIdentifier() ? 'splitList' : 'splitDict').'($stream, $offset, $length);', $context) : '')
-                .$this->line("\$iterable = static function ($arguments) use (\$options, \$transformers, \$instantiator, &\$providers) {", $context)
-                .$this->line('    foreach ($data as $k => $v) {', $context);
+            $hasIntKeys = $this->hasIntKeys($node->getType());
+            $splitMethod = match (true) {
+                $hasIntKeys => 'splitList',
+                $collectionKeyType instanceof BuiltinType && TypeIdentifier::STRING === $collectionKeyType->getTypeIdentifier() => 'splitDict',
+                default => 'splitCollection',
+            };
 
             if ($decodeFromStream) {
-                $php .= $this->canBeDecodedWithJsonDecode($node->getItemNode(), $decodeFromStream)
-                    ? $this->line('        yield $k => '.$this->generateValueFormat($node->getItemNode(), '\\'.Decoder::class.'::decodeStream($stream, $v[0], $v[1]);'), $context)
-                    : $this->line('        yield $k => $providers['.var_export($node->getItemNode()->getIdentifier(), true).']($stream, $v[0], $v[1]);', $context);
+                $php .= $this->line('$data = \\'.Splitter::class.'::'.$splitMethod.'($stream, $offset, $length);', $context)
+                    .$this->generateTypeGuard($node, true, $context);
+            } elseif ($denormalize) {
+                $php .= $this->line('if (!('.$this->generateCollectionCondition($node->getType(), '$data').')) {', $context)
+                    .$this->line('    '.$this->generateUnexpectedValueThrow($node, '$data').';', $context)
+                    .$this->line('}', $context);
             } else {
-                $php .= $this->canBeDecodedWithJsonDecode($node->getItemNode(), $decodeFromStream)
-                    ? $this->line('        yield $k => $v;', $context)
-                    : $this->line('        yield $k => $providers['.var_export($node->getItemNode()->getIdentifier(), true).']($v);', $context);
+                $php .= $this->generateTypeGuard($node, false, $context);
             }
 
-            $php .= $this->line('    }', $context)
-                .$this->line('};', $context)
-                .$this->line('return '.($node->getType()->isIdentifiedBy(TypeIdentifier::ARRAY) ? "\\iterator_to_array(\$iterable($arguments))" : "\$iterable($arguments)").';', $context);
+            if ($this->canBeDecodedWithJsonDecode($itemNode, $keepDecodedCollections)) {
+                $itemPhp = match (true) {
+                    $decodeFromStream => $this->generateValueFormat($itemNode, '\\'.Decoder::class.'::decodeStream($stream, $v[0], $v[1])'),
+                    $denormalize => $this->generateCheckedScalarValue($itemNode, '$v'),
+                    default => $this->generateValueFormat($itemNode, '$v'),
+                };
+            } elseif ($itemDecodeFromStream) {
+                $itemPhp = $this->providerAccessor($itemNode, $itemContext).'($stream, $v[0], $v[1])';
+            } else {
+                $itemPhp = $decodeFromStream
+                    ? '$readers['.var_export($itemNode->getIdentifier(), true).']($stream, $v[0], $v[1])'
+                    : $this->providerAccessor($itemNode, $itemContext).'($v)';
+            }
+
+            if ($node->getType()->isIdentifiedBy(TypeIdentifier::ARRAY)) {
+                $php .= $this->line('$collection = [];', $context)
+                    .$this->line('foreach ($data as $k => $v) {', $context)
+                    .$this->line("    \$collection[\$k] = $itemPhp;", $context)
+                    .$this->line('}', $context)
+                    .$this->line('return $collection;', $context);
+            } else {
+                $arguments = $decodeFromStream ? '$stream, $data' : '$data';
+                $php .= $this->line("\$iterable = static function ($arguments) use ($uses) {", $context)
+                    .$this->line('    foreach ($data as $k => $v) {', $context)
+                    .$this->line("        yield \$k => $itemPhp;", $context)
+                    .$this->line('    }', $context)
+                    .$this->line('};', $context)
+                    .$this->line("return \$iterable($arguments);", $context);
+            }
 
             --$context['indentation_level'];
 
             $php .= $this->line('};', $context);
 
-            if (!$this->canBeDecodedWithJsonDecode($node->getItemNode(), $decodeFromStream)) {
-                $php .= $this->generateProviders($node->getItemNode(), $decodeFromStream, $context);
+            if (!$this->canBeDecodedWithJsonDecode($itemNode, $keepDecodedCollections)) {
+                $php .= $this->generateProviders($itemNode, $itemDecodeFromStream, $itemContext);
+                $context['providers'] = $itemContext['providers'];
+            }
+
+            if ($decodeFromStream && !$itemDecodeFromStream) {
+                $php .= $this->generateValidators($itemNode, $context).$this->generateEagerReader($itemNode, $context);
             }
 
             return $php;
         }
 
         if ($node instanceof ObjectNode) {
-            if ($node->isMock()) {
-                return '';
-            }
-
             $arguments = $decodeFromStream ? '$stream, $offset, $length' : '$data';
 
-            $php = $this->line('$providers['.var_export($node->getIdentifier(), true)."] = static function ($arguments) use (\$options, \$transformers, \$instantiator, &\$providers) {", $context);
+            $php = $this->line("$providerAccessor = static function ($arguments) use ($uses) {", $context);
 
             ++$context['indentation_level'];
 
             if ($valueObjectTransformerId = $this->getValueObjectTransformerId($node->getType()->getClassName())) {
-                $data = $decodeFromStream ? '\\'.Decoder::class.'::decodeStream($stream, $offset, $length)' : '$data';
+                $data = match (true) {
+                    $decodeFromStream => $this->generateNullGuard($node, '\\'.Decoder::class.'::decodeStream($stream, $offset, $length)'),
+                    $denormalize => $this->generateCheckedScalarValue($node, $this->generateNullGuard($node, '$data')),
+                    default => $this->generateNullGuard($node, '$data'),
+                };
                 $php .= $this->line('return $transformers->get('.var_export($valueObjectTransformerId, true).")->reverseTransform($data, \$options);", $context);
 
                 --$context['indentation_level'];
@@ -197,41 +264,72 @@ final class PhpGenerator
                 return $php.$this->line('};', $context);
             }
 
-            $php .= $decodeFromStream ? $this->line('$data = \\'.Splitter::class.'::splitDict($stream, $offset, $length);', $context) : '';
+            $php .= match (true) {
+                $decodeFromStream => $this->line('$data = \\'.Splitter::class.'::splitDict($stream, $offset, $length);', $context).$this->generateTypeGuard($node, true, $context),
+                $denormalize => '',
+                default => $this->generateTypeGuard($node, false, $context),
+            };
 
             if ($decodeFromStream) {
                 $php .= $this->line('return $instantiator->instantiate(\\'.$node->getType()->getClassName().'::class, static function ($object) use ($stream, $data, $options, $transformers, $instantiator, &$providers) {', $context)
+                    .$this->line('    $properties = [];', $context)
                     .$this->line('    foreach ($data as $k => $v) {', $context)
                     .$this->line('        match ($k) {', $context);
 
                 foreach ($node->getProperties() as $streamedName => $property) {
-                    $propertyValuePhp = $this->canBeDecodedWithJsonDecode($property['value'], $decodeFromStream)
-                        ? $this->generateValueFormat($property['value'], '\\'.Decoder::class.'::decodeStream($stream, $v[0], $v[1])')
-                        : '$providers['.var_export($property['value']->getIdentifier(), true).']($stream, $v[0], $v[1])';
+                    $subject = $node->getType()->getClassName().'::$'.$property['name'];
+                    $providerPhp = $this->providerAccessor($property['value'], $context).'($stream, $v[0], $v[1])';
+                    $propertyValuePhp = match (true) {
+                        $this->canBeDecodedWithJsonDecode($property['value'], $keepDecodedCollections) => $this->generateValueFormat($property['value'], $this->generateNullGuard($property['value'], '\\'.Decoder::class.'::decodeStream($stream, $v[0], $v[1])', $subject)),
+                        $property['value']->getType()->isNullable() => $providerPhp,
+                        default => '(\\'.Decoder::class.'::isNull($stream, $v[0]) ? '.$this->generateUnexpectedNullThrow($subject).' : '.$providerPhp.')',
+                    };
 
-                    $php .= $this->line('            '.var_export($streamedName, true).' => $object->'.$property['name'].' = '.$property['accessor']($propertyValuePhp).',', $context);
+                    // numeric streamed names are int array keys, while split dict keys are strings
+                    $php .= $this->line('            '.var_export((string) $streamedName, true).' => $properties['.var_export($property['name'], true).'] = '.$property['accessor']($propertyValuePhp).',', $context);
                 }
 
-                $php .= $this->line('            default => null,', $context)
+                $php .= $this->line('            default => \\'.Decoder::class.'::validateStream($stream, $v[0], $v[1]),', $context)
                     .$this->line('        };', $context)
+                    .$this->line('    }', $context)
+                    .$this->line('    foreach ($properties as $name => $value) {', $context)
+                    .$this->line('        try {', $context)
+                    .$this->line('            $object->{$name} = $value;', $context)
+                    .$this->line('        } catch (\\TypeError $e) {', $context)
+                    .$this->line('            throw new \\'.UnexpectedValueException::class.'($e->getMessage(), 0, $e);', $context)
+                    .$this->line('        }', $context)
                     .$this->line('    }', $context)
                     .$this->line('});', $context);
             } else {
-                $propertiesValuePhp = '[';
-                $separator = '';
+                if ($denormalize) {
+                    $php .= $this->line('if (!$data instanceof \\stdClass) {', $context)
+                        .$this->line('    '.$this->generateUnexpectedValueThrow($node, '$data').';', $context)
+                        .$this->line('}', $context)
+                        .$this->line('$data = (array) $data;', $context);
+                }
+
+                $php .= $this->line($denormalize ? '$object = (new \\ReflectionClass(\\'.$node->getType()->getClassName().'::class))->newInstanceWithoutConstructor();' : '$object = new \\'.$node->getType()->getClassName().'();', $context);
+
                 foreach ($node->getProperties() as $streamedName => $property) {
                     $quotedStreamedName = var_export($streamedName, true);
-                    $propertyValuePhp = $this->canBeDecodedWithJsonDecode($property['value'], $decodeFromStream)
-                        ? "\$data[$quotedStreamedName] ?? '_symfony_missing_value'"
-                        : "\\array_key_exists($quotedStreamedName, \$data) ? \$providers[".var_export($property['value']->getIdentifier(), true)."](\$data[$quotedStreamedName]) : '_symfony_missing_value'";
-                    $propertiesValuePhp .= $separator.var_export($property['name'], true).' => '.$property['accessor']($propertyValuePhp);
-                    $separator = ', ';
-                }
-                $propertiesValuePhp .= ']';
+                    $valuePhp = $this->generateNullGuard($property['value'], "\$data[$quotedStreamedName]", $node->getType()->getClassName().'::$'.$property['name']);
+                    $propertyValuePhp = match (true) {
+                        !$this->canBeDecodedWithJsonDecode($property['value'], $keepDecodedCollections) => $this->providerAccessor($property['value'], $context)."($valuePhp)",
+                        $denormalize => $this->generateCheckedScalarValue($property['value'], $valuePhp),
+                        default => $valuePhp,
+                    };
 
-                $php .= $this->line('return $instantiator->instantiate(\\'.$node->getType()->getClassName()."::class, \\array_filter($propertiesValuePhp, static function (\$v) {", $context)
-                    .$this->line('    return \'_symfony_missing_value\' !== $v;', $context)
-                    .$this->line('}));', $context);
+                    $php .= $this->line("if (\\array_key_exists($quotedStreamedName, \$data)) {", $context)
+                        .$this->line('    $value = '.$property['accessor']($propertyValuePhp).';', $context)
+                        .$this->line('    try {', $context)
+                        .$this->line('        $object->{'.var_export($property['name'], true).'} = $value;', $context)
+                        .$this->line('    } catch (\\TypeError $e) {', $context)
+                        .$this->line('        throw new \\'.UnexpectedValueException::class.'($e->getMessage(), 0, $e);', $context)
+                        .$this->line('    }', $context)
+                        .$this->line('}', $context);
+                }
+
+                $php .= $this->line('return $object;', $context);
             }
 
             --$context['indentation_level'];
@@ -239,7 +337,7 @@ final class PhpGenerator
             $php .= $this->line('};', $context);
 
             foreach ($node->getProperties() as $streamedName => $property) {
-                if (!$this->canBeDecodedWithJsonDecode($property['value'], $decodeFromStream)) {
+                if (!$this->canBeDecodedWithJsonDecode($property['value'], $keepDecodedCollections)) {
                     $php .= $this->generateProviders($property['value'], $decodeFromStream, $context);
                 }
             }
@@ -273,7 +371,47 @@ final class PhpGenerator
         return $accessor;
     }
 
-    private function generateCompositeNodeItemCondition(DataModelNodeInterface $node, string $accessor): string
+    private function generateCheckedScalarValue(DataModelNodeInterface $node, string $accessor): string
+    {
+        return "(null === $accessor || \\is_scalar($accessor) ? ".$this->generateValueFormat($node, $accessor).' : '.$this->generateUnexpectedValueThrow($node, $accessor).')';
+    }
+
+    private function generateUnexpectedValueThrow(DataModelNodeInterface $node, string $accessor): string
+    {
+        return 'throw new \\'.UnexpectedValueException::class."(\\sprintf('Unexpected \"%s\" value for \"%s\".', \\get_debug_type($accessor), ".var_export($node->getIdentifier(), true).'))';
+    }
+
+    /**
+     * @param string|null $subject what the value is read for, the node identifier when null
+     */
+    private function generateNullGuard(DataModelNodeInterface $node, string $accessor, ?string $subject = null): string
+    {
+        if ($node->getType()->isNullable()) {
+            return $accessor;
+        }
+
+        return "($accessor ?? ".$this->generateUnexpectedNullThrow($subject ?? $node->getIdentifier()).')';
+    }
+
+    private function generateUnexpectedNullThrow(string $subject): string
+    {
+        return 'throw new \\'.UnexpectedValueException::class.'('.var_export(\sprintf('Unexpected "null" value for "%s".', $subject), true).')';
+    }
+
+    /**
+     * Ensures that the data of an object or a collection node can be split or iterated.
+     *
+     * @param array<string, mixed> $context
+     */
+    private function generateTypeGuard(DataModelNodeInterface $node, bool $decodeFromStream, array $context): string
+    {
+        // "Splitter" returns null for a JSON null, and throws for any other non splittable value
+        return $this->line('if ('.($decodeFromStream ? 'null === $data' : '!\\is_array($data)').') {', $context)
+            .$this->line('    '.$this->generateUnexpectedValueThrow($node, '$data').';', $context)
+            .$this->line('}', $context);
+    }
+
+    private function generateCompositeNodeItemCondition(DataModelNodeInterface $node, string $accessor, bool $denormalize): string
     {
         $type = $node->getType();
 
@@ -294,6 +432,10 @@ final class PhpGenerator
         }
 
         if ($type instanceof CollectionType) {
+            if ($denormalize) {
+                return $this->generateCollectionCondition($type, $accessor);
+            }
+
             return $type->isList() ? "\\is_array($accessor) && \\array_is_list($accessor)" : "\\is_array($accessor)";
         }
 
@@ -322,7 +464,7 @@ final class PhpGenerator
         }
 
         if ($type instanceof ObjectType) {
-            return "\\is_array($accessor)";
+            return $denormalize ? "$accessor instanceof \\stdClass" : "\\is_array($accessor)";
         }
 
         if ($type instanceof BuiltinType) {
@@ -333,13 +475,228 @@ final class PhpGenerator
     }
 
     /**
-     * Determines if the $node can be decoded using a simple "json_decode".
+     * @param array<string, mixed> $context
      */
-    private function canBeDecodedWithJsonDecode(DataModelNodeInterface $node, bool $decodeFromStream): bool
+    private function providerAccessor(DataModelNodeInterface $node, array $context): string
+    {
+        return (($context['denormalize'] ?? false) ? '$denormalizers' : '$providers').'['.var_export($node->getIdentifier(), true).']';
+    }
+
+    private function generateCollectionCondition(CollectionType $type, string $accessor): string
+    {
+        $keyType = $type->getCollectionKeyType();
+
+        return match (true) {
+            $this->hasIntKeys($type) => "\\is_array($accessor)",
+            $keyType instanceof BuiltinType && TypeIdentifier::STRING === $keyType->getTypeIdentifier() => "$accessor instanceof \\stdClass",
+            default => "\\is_array($accessor) || $accessor instanceof \\stdClass",
+        };
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private function generateEagerReader(DataModelNodeInterface $node, array &$context): string
+    {
+        $identifier = var_export($node->getIdentifier(), true);
+        if (isset($context['readers'][$node->getIdentifier()])) {
+            return '';
+        }
+        $context['readers'][$node->getIdentifier()] = true;
+        $php = $this->line('$readers['.$identifier.'] = static function ($stream, $offset, $length) use (&$providers, &$denormalizers, &$validators) {', $context)
+            .$this->line('    try {', $context)
+            .$this->line('        $data = \\'.Decoder::class.'::decodeStream($stream, $offset, $length, false);', $context)
+            .$this->line('    } catch (\\'.InvalidStreamException::class.' $e) {', $context)
+            .$this->line('        if (\\JSON_ERROR_INVALID_PROPERTY_NAME !== $e->getPrevious()?->getCode()) {', $context)
+            .$this->line('            throw $e;', $context)
+            .$this->line('        }', $context)
+            .$this->line('        return $providers['.$identifier.']($stream, $offset, $length);', $context)
+            .$this->line('    }', $context)
+            // duplicated keys are tolerated inside the values of unmapped keys, so the validators decide
+            .$this->line('    if (\\'.Decoder::class.'::hasDuplicateKeys($stream, $offset, $length, $data)) {', $context)
+            .$this->line('        $validators['.$identifier.']($stream, $offset, $length, $data);', $context)
+            .$this->line('    }', $context)
+            .$this->line('    return $denormalizers['.$identifier.']($data);', $context)
+            .$this->line('};', $context);
+
+        return $php.$this->generateProviders($node, true, $context);
+    }
+
+    /**
+     * @param array<string, mixed> $context
+     */
+    private function generateValidators(DataModelNodeInterface $node, array &$context): string
+    {
+        if ($node instanceof ObjectNode && $node->isMock()) {
+            $node = $context['object_nodes'][$node->getIdentifier()];
+        }
+
+        if (!$this->isStructured($node) || isset($context['validators'][$node->getIdentifier()])) {
+            return '';
+        }
+        $context['validators'][$node->getIdentifier()] = true;
+        $accessor = '$validators['.var_export($node->getIdentifier(), true).']';
+        $php = $this->line("$accessor = static function (\$stream, \$offset, \$length, \$data) use (&\$validators) {", $context);
+        ++$context['indentation_level'];
+        $children = [];
+
+        if ($node instanceof CompositeNode) {
+            // unstructured nodes hold no keys, and as structured nodes conditions may overlap, the first match wins
+            foreach ($node->getNodes() as $child) {
+                if (!$this->isStructured($child)) {
+                    continue;
+                }
+
+                $php .= $this->line('if ('.$this->generateCompositeNodeItemCondition($child, '$data', true).') {', $context)
+                    .$this->line('    $validators['.var_export($child->getIdentifier(), true).']($stream, $offset, $length, $data);', $context)
+                    .$this->line('    return;', $context)
+                    .$this->line('}', $context);
+                $children[] = $child;
+            }
+        } elseif ($node instanceof CollectionNode) {
+            $keyType = $node->getType()->getCollectionKeyType();
+            $splitMethod = match (true) {
+                $this->hasIntKeys($node->getType()) => 'splitList',
+                $keyType instanceof BuiltinType && TypeIdentifier::STRING === $keyType->getTypeIdentifier() => 'splitDict',
+                default => 'splitCollection',
+            };
+            $php .= $this->line('if ('.$this->generateCollectionCondition($node->getType(), '$data').') {', $context)
+                .$this->line('    foreach (\\'.Splitter::class.'::'.$splitMethod.'($stream, $offset, $length) as $k => $v) {', $context);
+            $child = $node->getItemNode();
+            if ($this->isStructured($child)) {
+                // json_decode() keeps the last value of a duplicated key, so the keys of the first value can be missing
+                $php .= $this->line('        $validators['.var_export($child->getIdentifier(), true).']($stream, $v[0], $v[1], \\is_array($data) ? ($data[$k] ?? null) : ($data->{$k} ?? null));', $context);
+            }
+            $php .= $this->line('    }', $context).$this->line('}', $context);
+            $children[] = $child;
+        } elseif ($node instanceof ObjectNode) {
+            $php .= $this->line('if ($data instanceof \\stdClass) {', $context)
+                .$this->line('    foreach (\\'.Splitter::class.'::splitDict($stream, $offset, $length) as $k => $v) {', $context);
+            $structured = [];
+            foreach ($node->getProperties() as $name => $property) {
+                if ($this->isStructured($property['value'])) {
+                    $structured[$name] = $property['value'];
+                }
+            }
+            if ($structured) {
+                $php .= $this->line('        match ($k) {', $context);
+                foreach ($structured as $name => $child) {
+                    $php .= $this->line('            '.var_export((string) $name, true).' => $validators['.var_export($child->getIdentifier(), true).']($stream, $v[0], $v[1], $data->{$k} ?? null),', $context);
+                    $children[] = $child;
+                }
+                $php .= $this->line('            default => null,', $context).$this->line('        };', $context);
+            }
+            $php .= $this->line('    }', $context).$this->line('}', $context);
+        }
+
+        --$context['indentation_level'];
+        $php .= $this->line('};', $context);
+        foreach ($children as $child) {
+            $php .= $this->generateValidators($child, $context);
+        }
+
+        return $php;
+    }
+
+    private function hasIntKeys(CollectionType $type): bool
+    {
+        $keyType = $type->getCollectionKeyType();
+
+        return $keyType instanceof BuiltinType && TypeIdentifier::INT === $keyType->getTypeIdentifier();
+    }
+
+    /**
+     * @param array<string, ObjectNode> $nodes
+     *
+     * @return array<string, ObjectNode>
+     */
+    private function collectObjectNodes(DataModelNodeInterface $node, array &$nodes = []): array
+    {
+        if ($node instanceof CollectionNode) {
+            return $this->collectObjectNodes($node->getItemNode(), $nodes);
+        }
+
+        if ($node instanceof CompositeNode) {
+            foreach ($node->getNodes() as $n) {
+                $this->collectObjectNodes($n, $nodes);
+            }
+
+            return $nodes;
+        }
+
+        if (!$node instanceof ObjectNode || $node->isMock() || isset($nodes[$node->getIdentifier()])) {
+            return $nodes;
+        }
+
+        $nodes[$node->getIdentifier()] = $node;
+        foreach ($node->getProperties() as $property) {
+            $this->collectObjectNodes($property['value'], $nodes);
+        }
+
+        return $nodes;
+    }
+
+    private function isStructured(DataModelNodeInterface $node): bool
     {
         if ($node instanceof CompositeNode) {
             foreach ($node->getNodes() as $n) {
-                if (!$this->canBeDecodedWithJsonDecode($n, $decodeFromStream)) {
+                if ($this->isStructured($n)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        return $node instanceof CollectionNode || ($node instanceof ObjectNode && !$this->getValueObjectTransformerId($node->getType()->getClassName()));
+    }
+
+    /**
+     * @param array<string, ObjectNode> $objectNodes
+     * @param array<string, true>       $visited
+     */
+    private function canBeReadAtOnce(DataModelNodeInterface $node, array $objectNodes, array &$visited = []): bool
+    {
+        if ($node instanceof CollectionNode) {
+            return $node->getType()->isIdentifiedBy(TypeIdentifier::ARRAY) && $this->canBeReadAtOnce($node->getItemNode(), $objectNodes, $visited);
+        }
+
+        if ($node instanceof CompositeNode) {
+            foreach ($node->getNodes() as $n) {
+                if (!$this->canBeReadAtOnce($n, $objectNodes, $visited)) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        if ($node instanceof ScalarNode) {
+            return !$node->getType()->isIdentifiedBy(TypeIdentifier::MIXED, TypeIdentifier::ARRAY, TypeIdentifier::ITERABLE, TypeIdentifier::OBJECT);
+        }
+
+        if (!$node instanceof ObjectNode || isset($visited[$node->getIdentifier()]) || $this->getValueObjectTransformerId($node->getType()->getClassName())) {
+            return true;
+        }
+
+        $visited[$node->getIdentifier()] = true;
+        foreach (($objectNodes[$node->getIdentifier()] ?? $node)->getProperties() as $property) {
+            if (!$this->canBeReadAtOnce($property['value'], $objectNodes, $visited)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Determines if the $node can be decoded using a simple "json_decode".
+     */
+    private function canBeDecodedWithJsonDecode(DataModelNodeInterface $node, bool $keepDecodedCollections): bool
+    {
+        if ($node instanceof CompositeNode) {
+            foreach ($node->getNodes() as $n) {
+                if (!$this->canBeDecodedWithJsonDecode($n, $keepDecodedCollections)) {
                     return false;
                 }
             }
@@ -348,11 +705,7 @@ final class PhpGenerator
         }
 
         if ($node instanceof CollectionNode) {
-            if ($decodeFromStream) {
-                return false;
-            }
-
-            return $this->canBeDecodedWithJsonDecode($node->getItemNode(), $decodeFromStream);
+            return $keepDecodedCollections && $this->canBeDecodedWithJsonDecode($node->getItemNode(), $keepDecodedCollections);
         }
 
         if ($node instanceof ObjectNode) {

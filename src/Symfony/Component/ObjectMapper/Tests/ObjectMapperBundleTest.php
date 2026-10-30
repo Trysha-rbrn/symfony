@@ -13,15 +13,21 @@ namespace Symfony\Component\ObjectMapper\Tests;
 
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
+use Symfony\Component\DependencyInjection\Compiler\DecoratorServicePass;
 use Symfony\Component\DependencyInjection\Compiler\MergeExtensionConfigurationPass;
 use Symfony\Component\DependencyInjection\Compiler\RemoveMissingDependenciesPass;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Kernel\AbstractKernel;
 use Symfony\Component\DependencyInjection\Kernel\KernelTrait;
 use Symfony\Component\DependencyInjection\Loader\Configurator\ContainerConfigurator;
+use Symfony\Component\DependencyInjection\Parameter;
 use Symfony\Component\DependencyInjection\ParameterBag\EnvPlaceholderParameterBag;
 use Symfony\Component\Filesystem\Filesystem;
 use Symfony\Component\ObjectMapper\Metadata\CachePropertyMetadataFactory;
+use Symfony\Component\ObjectMapper\Metadata\PropertyReadability;
+use Symfony\Component\ObjectMapper\Metadata\SharedClassMetadataFactory;
+use Symfony\Component\ObjectMapper\Metadata\SharedPropertyMetadataFactory;
+use Symfony\Component\ObjectMapper\Metadata\SharedPropertyNameCollectionFactory;
 use Symfony\Component\ObjectMapper\ObjectMapper;
 use Symfony\Component\ObjectMapper\ObjectMapperBundle;
 use Symfony\Component\ObjectMapper\ObjectMapperInterface;
@@ -37,6 +43,11 @@ use Symfony\Component\ObjectMapper\Tests\Fixtures\Bundle\ParentEntityResource;
 use Symfony\Component\ObjectMapper\Tests\Fixtures\Bundle\TransformCallable;
 use Symfony\Component\ObjectMapper\Transform\MapCollection;
 use Symfony\Component\PropertyAccess\PropertyAccessor;
+use Symfony\Component\PropertyInfo\Extractor\ReflectionExtractor;
+use Symfony\Component\PropertyInfo\PropertyReadInfoExtractorInterface;
+use Symfony\Component\PropertyInfo\PropertyWriteInfoExtractorInterface;
+
+use function Symfony\Component\DependencyInjection\Loader\Configurator\service;
 
 class ObjectMapperBundleTest extends TestCase
 {
@@ -61,6 +72,15 @@ class ObjectMapperBundleTest extends TestCase
         $objectMapper = $container->get('test.object_mapper');
         $this->assertInstanceOf(ObjectMapper::class, $objectMapper);
         $this->assertSame($objectMapper, $container->get('test.object_mapper_interface'));
+    }
+
+    public function testPublicPropertiesAreReadWithoutThePropertyAccessorWhenItUsesThePropertyInfoExtractors()
+    {
+        $kernel = new TestObjectMapperKernel('test', true, $this->varDir);
+        $kernel->boot();
+        $propertyMetadataFactory = (new \ReflectionProperty(ObjectMapper::class, 'propertyMetadataFactory'))->getValue($kernel->getContainer()->get('test.object_mapper'));
+
+        $this->assertSame(PropertyReadability::INITIALIZED, $propertyMetadataFactory->create(new ObjectToBeMapped(), new ObjectMapped(), 'a')['readability']);
     }
 
     public function testTransformCallableIsAutoconfigured()
@@ -142,7 +162,8 @@ class ObjectMapperBundleTest extends TestCase
 
         $this->assertInstanceOf(ObjectMapped::class, $mapped);
         $this->assertSame('transformed', $mapped->a);
-        $this->assertInstanceOf(CachePropertyMetadataFactory::class, (new \ReflectionProperty(ObjectMapper::class, 'propertyMetadataFactory'))->getValue($objectMapper));
+        $this->assertInstanceOf(SharedPropertyMetadataFactory::class, $factory = (new \ReflectionProperty(ObjectMapper::class, 'propertyMetadataFactory'))->getValue($objectMapper));
+        $this->assertInstanceOf(CachePropertyMetadataFactory::class, (new \ReflectionProperty(SharedPropertyMetadataFactory::class, 'decorated'))->getValue($factory));
     }
 
     public function testTheMetadataCacheAndItsWarmerAreRegisteredWhenNotInDebug()
@@ -154,6 +175,27 @@ class ObjectMapperBundleTest extends TestCase
         $this->assertTrue($container->hasDefinition('object_mapper.metadata.cache_property_metadata_factory'));
         $this->assertTrue($container->hasDefinition('object_mapper.metadata.cache_warmer'));
         $this->assertTrue($container->hasDefinition('cache.object_mapper'));
+    }
+
+    public function testTheMetadataIsSharedByTheContainersOfTheSameBuildOutsideDebugMode()
+    {
+        $container = $this->load(debug: false);
+        new DecoratorServicePass()->process($container);
+
+        foreach ([
+            'object_mapper.class_metadata_factory' => SharedClassMetadataFactory::class,
+            'object_mapper.property_name_collection_factory' => SharedPropertyNameCollectionFactory::class,
+            'object_mapper.property_metadata_factory' => SharedPropertyMetadataFactory::class,
+        ] as $id => $class) {
+            $definition = $container->findDefinition($id);
+            $this->assertSame($class, $definition->getClass());
+            $this->assertEquals(new Parameter('container.build_id'), $definition->getArgument(1));
+        }
+
+        $container = $this->load(debug: true);
+        $this->assertFalse($container->hasDefinition('object_mapper.metadata.shared_class_metadata_factory'));
+        $this->assertFalse($container->hasDefinition('object_mapper.metadata.shared_property_name_collection_factory'));
+        $this->assertFalse($container->hasDefinition('object_mapper.metadata.shared_property_metadata_factory'));
     }
 
     public function testTheMetadataCacheAndItsWarmerAreRemovedInDebug()
@@ -223,7 +265,10 @@ class TestObjectMapperKernel extends AbstractKernel
     private function configureContainer(ContainerConfigurator $container): void
     {
         $services = $container->services();
-        $services->set('property_accessor', PropertyAccessor::class);
+        $services->set('property_info.reflection_extractor', ReflectionExtractor::class);
+        $services->alias(PropertyReadInfoExtractorInterface::class, 'property_info.reflection_extractor');
+        $services->alias(PropertyWriteInfoExtractorInterface::class, 'property_info.reflection_extractor');
+        $services->set('property_accessor', PropertyAccessor::class)->args([PropertyAccessor::MAGIC_GET | PropertyAccessor::MAGIC_SET, PropertyAccessor::THROW_ON_INVALID_PROPERTY_PATH, null, service(PropertyReadInfoExtractorInterface::class), service(PropertyWriteInfoExtractorInterface::class)]);
         $services->set(TransformCallable::class)->autoconfigure();
         $services->set(MapCollection::class)->autoconfigure();
         $services->set(ParentEntityResource::class)->autoconfigure();

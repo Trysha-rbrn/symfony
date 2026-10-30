@@ -12,12 +12,15 @@
 namespace Symfony\Component\Messenger\Tests\Middleware;
 
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\Group;
+use PHPUnit\Framework\Attributes\IgnoreDeprecations;
 use Psr\EventDispatcher\EventDispatcherInterface;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Event\HandlerFailureEvent;
 use Symfony\Component\Messenger\Event\HandlerStartingEvent;
 use Symfony\Component\Messenger\Event\HandlerSuccessEvent;
 use Symfony\Component\Messenger\Exception\HandlerFailedException;
+use Symfony\Component\Messenger\Exception\InvalidMessageSignatureException;
 use Symfony\Component\Messenger\Exception\LogicException;
 use Symfony\Component\Messenger\Exception\NoHandlerForMessageException;
 use Symfony\Component\Messenger\Handler\Acknowledger;
@@ -25,14 +28,23 @@ use Symfony\Component\Messenger\Handler\BatchHandlerInterface;
 use Symfony\Component\Messenger\Handler\BatchHandlerTrait;
 use Symfony\Component\Messenger\Handler\HandlerDescriptor;
 use Symfony\Component\Messenger\Handler\HandlersLocator;
+use Symfony\Component\Messenger\MessageBus;
+use Symfony\Component\Messenger\Middleware\DispatchAfterCurrentBusMiddleware;
 use Symfony\Component\Messenger\Middleware\HandleMessageMiddleware;
 use Symfony\Component\Messenger\Middleware\StackMiddleware;
+use Symfony\Component\Messenger\Retry\RetryDecider;
 use Symfony\Component\Messenger\Stamp\AckStamp;
+use Symfony\Component\Messenger\Stamp\DispatchAfterCurrentBusStamp;
+use Symfony\Component\Messenger\Stamp\FlushBatchHandlersStamp;
 use Symfony\Component\Messenger\Stamp\HandledStamp;
 use Symfony\Component\Messenger\Stamp\HandlerArgumentsStamp;
 use Symfony\Component\Messenger\Stamp\NoAutoAckStamp;
+use Symfony\Component\Messenger\Stamp\ReceivedStamp;
+use Symfony\Component\Messenger\Stamp\TrustStamp;
 use Symfony\Component\Messenger\Test\Middleware\MiddlewareTestCase;
+use Symfony\Component\Messenger\Tests\Fixtures\AnEnvelopeStamp;
 use Symfony\Component\Messenger\Tests\Fixtures\DummyMessage;
+use Symfony\Component\Messenger\Tests\Fixtures\SecondMessage;
 
 class HandleMessageMiddlewareTest extends MiddlewareTestCase
 {
@@ -254,6 +266,69 @@ class HandleMessageMiddlewareTest extends MiddlewareTestCase
         $this->assertNull($envelopes[1]->last(NoAutoAckStamp::class));
     }
 
+    public function testBatchHandlerNackOnFlushKeepsTheHandledStampsOfTheOtherHandlers()
+    {
+        $batchHandler = $this->createBatchHandlerNackingTheFirstBatch(2);
+        $middleware = new HandleMessageMiddleware(new HandlersLocator([
+            DummyMessage::class => [
+                new HandlerDescriptor(static fn () => 'handled', ['alias' => 'before']),
+                new HandlerDescriptor($batchHandler, ['alias' => 'batch']),
+                new HandlerDescriptor(static fn () => 'handled', ['alias' => 'after']),
+                new HandlerDescriptor(static fn () => 'handled', ['alias' => 'last']),
+            ],
+        ]));
+
+        $acks = [];
+        $middleware->handle(new Envelope(new DummyMessage('Hey'), [new AckStamp(static function (Envelope $envelope, ?\Throwable $e = null) use (&$acks) {
+            $acks[] = [$envelope, $e];
+        })]), new StackMiddleware());
+
+        $this->assertSame([], $acks);
+
+        $batchHandler->flush(true);
+
+        $this->assertCount(1, $acks);
+        [$envelope, $e] = $acks[0];
+        $this->assertInstanceOf(HandlerFailedException::class, $e);
+        $this->assertSame($envelope, $e->getEnvelope());
+        $this->assertSame(['Closure@before', 'Closure@after', 'Closure@last'], array_map(static fn (HandledStamp $stamp) => $stamp->getHandlerName(), $envelope->all(HandledStamp::class)));
+    }
+
+    public function testBatchHandlerNackWhileHandlingTheMessageRunsTheNextHandlersAgainOnRetry()
+    {
+        $dispatched = [];
+        $bus = new MessageBus([
+            new DispatchAfterCurrentBusMiddleware(),
+            new HandleMessageMiddleware(new HandlersLocator([
+                DummyMessage::class => [
+                    new HandlerDescriptor($this->createBatchHandlerNackingTheFirstBatch(1), ['alias' => 'batch']),
+                    new HandlerDescriptor(static function () use (&$bus) {
+                        $bus->dispatch(new SecondMessage(), [new DispatchAfterCurrentBusStamp()]);
+                    }, ['alias' => 'after']),
+                ],
+                SecondMessage::class => [static function (SecondMessage $message) use (&$dispatched) {
+                    $dispatched[] = $message;
+                }],
+            ])),
+        ]);
+
+        $acks = [];
+        try {
+            $bus->dispatch(new DummyMessage('Hey'), [new AckStamp(static function (Envelope $envelope) use (&$acks) {
+                $acks[] = $envelope;
+            })]);
+            $this->fail('The batch handler should fail.');
+        } catch (HandlerFailedException) {
+        }
+
+        $this->assertSame([], $dispatched);
+        $this->assertCount(1, $acks);
+
+        $bus->dispatch($acks[0]->withoutAll(AckStamp::class));
+
+        $this->assertCount(1, $dispatched);
+    }
+
     public function testBatchHandlerNoAck()
     {
         $handler = new class implements BatchHandlerInterface {
@@ -324,6 +399,60 @@ class HandleMessageMiddlewareTest extends MiddlewareTestCase
 
         $this->assertNull($envelope->last(NoAutoAckStamp::class));
         $this->assertCount(1, $handler->processedMessages);
+    }
+
+    public function testBatchHandlerLeavesAFullBatchToTheWorkerWhenTheAckStampAllowsIt()
+    {
+        $handler = new class implements BatchHandlerInterface {
+            use BatchHandlerTrait;
+
+            public array $processedMessages = [];
+
+            public function __invoke(DummyMessage $message, ?Acknowledger $ack = null)
+            {
+                return $this->handle($message, $ack);
+            }
+
+            private function getBatchSize(): int
+            {
+                return 2;
+            }
+
+            private function process(array $jobs): void
+            {
+                $this->processedMessages = array_column($jobs, 0);
+
+                foreach ($jobs as [$job, $ack]) {
+                    $ack->ack($job);
+                }
+            }
+        };
+
+        $handlerDescriptor = new HandlerDescriptor($handler);
+        $middleware = new HandleMessageMiddleware(new HandlersLocator([
+            DummyMessage::class => [$handlerDescriptor],
+        ]));
+
+        $ackedMessages = [];
+        $deferredFlushes = [];
+        $ackStamp = new AckStamp(static function (Envelope $envelope) use (&$ackedMessages) {
+            $ackedMessages[] = $envelope->last(HandledStamp::class)->getResult();
+        }, static function (HandlerDescriptor $handlerDescriptor) use (&$deferredFlushes) {
+            $deferredFlushes[] = $handlerDescriptor;
+        });
+
+        $messages = [new DummyMessage('Hey'), new DummyMessage('Bob')];
+        $middleware->handle(new Envelope($messages[0], [$ackStamp]), new StackMiddleware());
+        $envelope = $middleware->handle(new Envelope($messages[1], [$ackStamp]), new StackMiddleware());
+
+        $this->assertSame([], $handler->processedMessages);
+        $this->assertSame([$handlerDescriptor], $deferredFlushes);
+        $this->assertSame($handlerDescriptor, $envelope->last(NoAutoAckStamp::class)?->getHandlerDescriptor());
+
+        $middleware->handle($envelope->with(new FlushBatchHandlersStamp(true)), new StackMiddleware());
+
+        $this->assertSame($messages, $handler->processedMessages);
+        $this->assertSame($messages, $ackedMessages);
     }
 
     public function testBatchHandlerNoBatch()
@@ -441,6 +570,253 @@ class HandleMessageMiddlewareTest extends MiddlewareTestCase
         $handler->expects($this->once())->method('__invoke')->with($message, 'additional named argument');
 
         $middleware->handle($envelope, $this->getStackMock());
+    }
+
+    public function testEnvelopeArgument()
+    {
+        $envelope = new Envelope(new DummyMessage('Hey'));
+        $received = null;
+
+        $middleware = new HandleMessageMiddleware(new HandlersLocator([
+            DummyMessage::class => [static function (DummyMessage $message, Envelope $envelope) use (&$received) {
+                $received = $envelope;
+            }],
+        ]));
+
+        $middleware->handle($envelope, $this->getStackMock());
+
+        $this->assertSame($envelope, $received);
+    }
+
+    public function testStampArgument()
+    {
+        $stamp = new AnEnvelopeStamp();
+        $received = null;
+
+        $middleware = new HandleMessageMiddleware(new HandlersLocator([
+            DummyMessage::class => [static function (DummyMessage $message, AnEnvelopeStamp $stamp) use (&$received) {
+                $received = $stamp;
+            }],
+        ]));
+
+        $middleware->handle(new Envelope(new DummyMessage('Hey'), [new AnEnvelopeStamp(), $stamp]), $this->getStackMock());
+
+        $this->assertSame($stamp, $received);
+    }
+
+    public function testNullableStampArgumentIsNullWhenTheStampIsMissing()
+    {
+        $received = false;
+
+        $middleware = new HandleMessageMiddleware(new HandlersLocator([
+            DummyMessage::class => [static function (DummyMessage $message, ?AnEnvelopeStamp $stamp) use (&$received) {
+                $received = $stamp;
+            }],
+        ]));
+
+        $middleware->handle(new Envelope(new DummyMessage('Hey')), $this->getStackMock());
+
+        $this->assertNull($received);
+    }
+
+    public function testTheDefaultValueOfAStampArgumentAppliesWhenTheStampIsMissing()
+    {
+        $received = null;
+
+        $middleware = new HandleMessageMiddleware(new HandlersLocator([
+            DummyMessage::class => [static function (DummyMessage $message, AnEnvelopeStamp $stamp = new AnEnvelopeStamp()) use (&$received) {
+                $received = $stamp;
+            }],
+        ]));
+
+        $middleware->handle(new Envelope(new DummyMessage('Hey')), $this->getStackMock());
+
+        $this->assertInstanceOf(AnEnvelopeStamp::class, $received);
+    }
+
+    public function testAMissingRequiredStampArgumentThrows()
+    {
+        $middleware = new HandleMessageMiddleware(new HandlersLocator([
+            DummyMessage::class => [static function (DummyMessage $message, AnEnvelopeStamp $stamp) {}],
+        ]));
+
+        try {
+            $middleware->handle(new Envelope(new DummyMessage('Hey')), $this->getStackMock(false));
+        } catch (HandlerFailedException $e) {
+            $this->assertCount(1, $e->getWrappedExceptions());
+            $this->assertInstanceOf(LogicException::class, $e->getWrappedExceptions()['Closure']);
+            $this->assertSame('Handler "Closure" requires a "Symfony\Component\Messenger\Tests\Fixtures\AnEnvelopeStamp" stamp for argument "$stamp", but the envelope carries none.', $e->getWrappedExceptions()['Closure']->getMessage());
+
+            return;
+        }
+
+        $this->fail('Exception not thrown.');
+    }
+
+    public function testBatchHandlerStampArgument()
+    {
+        $handler = new class implements BatchHandlerInterface {
+            use BatchHandlerTrait;
+
+            public array $stamps = [];
+
+            public function __invoke(DummyMessage $message, ?Acknowledger $ack = null, ?AnEnvelopeStamp $stamp = null)
+            {
+                $this->stamps[] = $stamp;
+
+                return $this->handle($message, $ack);
+            }
+
+            private function shouldFlush()
+            {
+                return true;
+            }
+
+            private function process(array $jobs): void
+            {
+                foreach ($jobs as [$job, $ack]) {
+                    $ack->ack($job);
+                }
+            }
+        };
+
+        $middleware = new HandleMessageMiddleware(new HandlersLocator([
+            DummyMessage::class => [new HandlerDescriptor($handler)],
+        ]));
+
+        $stamp = new AnEnvelopeStamp();
+        $middleware->handle(new Envelope(new DummyMessage('Hey'), [new AckStamp(static function () {}), $stamp]), new StackMiddleware());
+        $middleware->handle(new Envelope(new DummyMessage('Bob')), new StackMiddleware());
+
+        $this->assertSame([$stamp, null], $handler->stamps);
+    }
+
+    public function testHandlerArgumentsStampCombinesWithStampArguments()
+    {
+        $stamp = new AnEnvelopeStamp();
+        $received = null;
+
+        $middleware = new HandleMessageMiddleware(new HandlersLocator([
+            DummyMessage::class => [static function (DummyMessage $message, string $additional, AnEnvelopeStamp $stamp) use (&$received) {
+                $received = [$additional, $stamp];
+            }],
+        ]));
+
+        $middleware->handle(new Envelope(new DummyMessage('Hey'), [new HandlerArgumentsStamp(['additional argument']), $stamp]), $this->getStackMock());
+
+        $this->assertSame(['additional argument', $stamp], $received);
+    }
+
+    #[DataProvider('provideStampArgumentsPassedByAHandlerArgumentsStamp')]
+    public function testHandlerArgumentsStampTakesPrecedenceOverStampArguments(\Closure $handler, array $stamps, array $expected)
+    {
+        $middleware = new HandleMessageMiddleware(new HandlersLocator([
+            DummyMessage::class => [$handler],
+        ]));
+
+        $envelope = $middleware->handle(new Envelope(new DummyMessage('Hey'), $stamps), $this->getStackMock());
+
+        $this->assertSame($expected, $envelope->last(HandledStamp::class)->getResult());
+    }
+
+    public static function provideStampArgumentsPassedByAHandlerArgumentsStamp(): iterable
+    {
+        $fromEnvelope = new AnEnvelopeStamp();
+        $fromArguments = new AnEnvelopeStamp();
+        $envelope = new Envelope(new DummyMessage('Bob'));
+
+        yield 'positional' => [
+            static fn (DummyMessage $message, ?AnEnvelopeStamp $stamp = null) => [$stamp],
+            [$fromEnvelope, new HandlerArgumentsStamp([$fromArguments])],
+            [$fromArguments],
+        ];
+        yield 'positional, nullable' => [
+            static fn (DummyMessage $message, ?AnEnvelopeStamp $stamp) => [$stamp],
+            [new HandlerArgumentsStamp([$fromArguments])],
+            [$fromArguments],
+        ];
+        yield 'positional, required' => [
+            static fn (DummyMessage $message, AnEnvelopeStamp $stamp) => [$stamp],
+            [new HandlerArgumentsStamp([$fromArguments])],
+            [$fromArguments],
+        ];
+        yield 'positional, envelope' => [
+            static fn (DummyMessage $message, Envelope $envelope) => [$envelope],
+            [new HandlerArgumentsStamp([$envelope])],
+            [$envelope],
+        ];
+        yield 'named' => [
+            static fn (DummyMessage $message, ?AnEnvelopeStamp $stamp = null) => [$stamp],
+            [$fromEnvelope, new HandlerArgumentsStamp(['stamp' => $fromArguments])],
+            [$fromArguments],
+        ];
+        yield 'named, nullable' => [
+            static fn (DummyMessage $message, ?AnEnvelopeStamp $stamp) => [$stamp],
+            [new HandlerArgumentsStamp(['stamp' => $fromArguments])],
+            [$fromArguments],
+        ];
+        yield 'fewer arguments than stamp parameters' => [
+            static fn (DummyMessage $message, ?AnEnvelopeStamp $first = null, ?AnEnvelopeStamp $second = null) => [$first, $second],
+            [$fromEnvelope, new HandlerArgumentsStamp([$fromArguments])],
+            [$fromArguments, $fromEnvelope],
+        ];
+        yield 'more arguments than stamp parameters' => [
+            static fn (DummyMessage $message, ?AnEnvelopeStamp $stamp = null, string ...$rest) => [$stamp, ...$rest],
+            [$fromEnvelope, new HandlerArgumentsStamp([$fromArguments, 'extra'])],
+            [$fromArguments, 'extra'],
+        ];
+        yield 'variadic' => [
+            static fn (DummyMessage $message, AnEnvelopeStamp ...$stamps) => $stamps,
+            [$fromEnvelope],
+            [],
+        ];
+        yield 'variadic, missing from the envelope' => [
+            static fn (DummyMessage $message, AnEnvelopeStamp ...$stamps) => $stamps,
+            [],
+            [],
+        ];
+        yield 'variadic, positional' => [
+            static fn (DummyMessage $message, AnEnvelopeStamp ...$stamps) => $stamps,
+            [$fromEnvelope, new HandlerArgumentsStamp([$fromArguments])],
+            [$fromArguments],
+        ];
+    }
+
+    public function testHandlerArgumentsStampTakesPrecedenceOverStampArgumentsOfABatchHandler()
+    {
+        $handler = new class implements BatchHandlerInterface {
+            use BatchHandlerTrait;
+
+            public array $stamps = [];
+
+            public function __invoke(DummyMessage $message, ?Acknowledger $ack = null, ?AnEnvelopeStamp $stamp = null)
+            {
+                $this->stamps[] = $stamp;
+
+                return $this->handle($message, $ack);
+            }
+
+            private function shouldFlush()
+            {
+                return true;
+            }
+
+            private function process(array $jobs): void
+            {
+                foreach ($jobs as [$job, $ack]) {
+                    $ack->ack($job);
+                }
+            }
+        };
+
+        $middleware = new HandleMessageMiddleware(new HandlersLocator([
+            DummyMessage::class => [new HandlerDescriptor($handler)],
+        ]));
+
+        $stamp = new AnEnvelopeStamp();
+        $middleware->handle(new Envelope(new DummyMessage('Hey'), [new AckStamp(static function () {}), new AnEnvelopeStamp(), new HandlerArgumentsStamp([$stamp])]), new StackMiddleware());
+
+        $this->assertSame([$stamp], $handler->stamps);
     }
 
     public function testDispatchHandlerEvents()
@@ -683,6 +1059,162 @@ class HandleMessageMiddlewareTest extends MiddlewareTestCase
 
         $this->assertInstanceOf(HandlerSuccessEvent::class, $events[3]);
         $this->assertSame($flushingDescriptor, $events[3]->handlerDescriptor);
+    }
+
+    public function testAHandlerThatRequiresASignatureRefusesAnEnvelopeMarkedUntrusted()
+    {
+        $called = false;
+        $middleware = new HandleMessageMiddleware(new HandlersLocator([
+            DummyMessage::class => [new HandlerDescriptor(static function () use (&$called) { $called = true; }, ['sign' => true])],
+        ]));
+
+        foreach ([[TrustStamp::untrusted()], [new ReceivedStamp('async'), TrustStamp::untrusted()], [TrustStamp::trusted(), TrustStamp::untrusted()]] as $stamps) {
+            try {
+                $middleware->handle(new Envelope(new DummyMessage('Hey'), $stamps), $this->getStackMock(false));
+                $this->fail('Exception not thrown.');
+            } catch (HandlerFailedException $e) {
+                $this->assertCount(1, $e->getWrappedExceptions());
+                $this->assertInstanceOf(InvalidMessageSignatureException::class, $e->getWrappedExceptions()['Closure']);
+                $this->assertSame('Handler "Closure" requires a verified signature, but message "Symfony\Component\Messenger\Tests\Fixtures\DummyMessage" comes from data that was not verified.', $e->getWrappedExceptions()['Closure']->getMessage());
+                $this->assertFalse(RetryDecider::decideFromException($e));
+            }
+        }
+
+        $this->assertFalse($called);
+    }
+
+    public function testOtherHandlersRunWhenAHandlerThatRequiresASignatureRefusesAnEnvelope()
+    {
+        $middleware = new HandleMessageMiddleware(new HandlersLocator([
+            DummyMessage::class => [
+                new HandlerDescriptor(static fn () => 'signed', ['sign' => true, 'alias' => 'signed']),
+                new HandlerDescriptor(static fn () => 'other', ['alias' => 'other']),
+            ],
+        ]));
+
+        try {
+            $middleware->handle(new Envelope(new DummyMessage('Hey'), [TrustStamp::untrusted()]), $this->getStackMock(false));
+            $this->fail('Exception not thrown.');
+        } catch (HandlerFailedException $e) {
+            $this->assertSame(['Closure@signed'], array_keys($e->getWrappedExceptions()));
+            $this->assertInstanceOf(InvalidMessageSignatureException::class, $e->getWrappedExceptions()['Closure@signed']);
+            $this->assertEquals([new HandledStamp('other', 'Closure@other')], $e->getEnvelope()->all(HandledStamp::class));
+        }
+    }
+
+    public function testAHandlerThatRequiresASignatureHandlesEnvelopesNotMarkedUntrusted()
+    {
+        $calls = 0;
+        $middleware = new HandleMessageMiddleware(new HandlersLocator([
+            DummyMessage::class => [new HandlerDescriptor(static function () use (&$calls) { ++$calls; }, ['sign' => true])],
+        ]));
+
+        $middleware->handle(new Envelope(new DummyMessage('Hey')), new StackMiddleware());
+        $middleware->handle(new Envelope(new DummyMessage('Hey'), [new ReceivedStamp('async'), TrustStamp::trusted()]), new StackMiddleware());
+        $middleware->handle(new Envelope(new DummyMessage('Hey'), [TrustStamp::trusted()]), new StackMiddleware());
+        $middleware->handle(new Envelope(new DummyMessage('Hey'), [TrustStamp::untrusted(), TrustStamp::trusted()]), new StackMiddleware());
+
+        $this->assertSame(4, $calls);
+    }
+
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
+    public function testAHandlerThatRequiresASignatureHandlingAnEnvelopeReceivedWithoutTrustStampIsDeprecated()
+    {
+        $calls = 0;
+        $middleware = new HandleMessageMiddleware(new HandlersLocator([
+            DummyMessage::class => [new HandlerDescriptor(static function () use (&$calls) { ++$calls; }, ['sign' => true])],
+        ]));
+
+        $this->expectUserDeprecationMessage(\sprintf('Since symfony/messenger 8.2: Handler "Closure" requires a signature, but message "%s" comes from a transport that did not verify it. Handling such a message is deprecated, and the handler will refuse it in 9.0. Set the "sign" option of the transport to sign every message, or make the transport add "%s::trusted()" to the messages it creates in this process.', DummyMessage::class, TrustStamp::class));
+
+        $middleware->handle(new Envelope(new DummyMessage('Hey'), [new ReceivedStamp('async')]), new StackMiddleware());
+
+        $this->assertSame(1, $calls);
+    }
+
+    public function testABatchHandlerThatRequiresASignatureRefusesAnEnvelopeMarkedUntrusted()
+    {
+        $handler = new class implements BatchHandlerInterface {
+            use BatchHandlerTrait;
+
+            public array $processedMessages = [];
+
+            public function __invoke(DummyMessage $message, ?Acknowledger $ack = null)
+            {
+                return $this->handle($message, $ack);
+            }
+
+            private function shouldFlush()
+            {
+                return true;
+            }
+
+            private function process(array $jobs): void
+            {
+                $this->processedMessages = array_column($jobs, 0);
+
+                foreach ($jobs as [$job, $ack]) {
+                    $ack->ack($job);
+                }
+            }
+        };
+
+        $descriptor = new HandlerDescriptor($handler, ['sign' => true]);
+        $middleware = new HandleMessageMiddleware(new HandlersLocator([DummyMessage::class => [$descriptor]]), false, null, $dispatcher = new RecordingHandlerEventDispatcher());
+        $acked = false;
+
+        try {
+            $middleware->handle(new Envelope(new DummyMessage('Hey'), [new AckStamp(static function () use (&$acked) { $acked = true; }), TrustStamp::untrusted()]), new StackMiddleware());
+            $this->fail('Exception not thrown.');
+        } catch (HandlerFailedException $e) {
+            $this->assertInstanceOf(InvalidMessageSignatureException::class, $e->getWrappedExceptions()[$descriptor->getName()]);
+            $this->assertNull($e->getEnvelope()->last(NoAutoAckStamp::class));
+        }
+
+        $this->assertSame([], $handler->processedMessages);
+        $this->assertFalse($acked);
+        $this->assertCount(2, $dispatcher->events);
+        $this->assertInstanceOf(HandlerStartingEvent::class, $dispatcher->events[0]);
+        $this->assertInstanceOf(HandlerFailureEvent::class, $dispatcher->events[1]);
+        $this->assertInstanceOf(InvalidMessageSignatureException::class, $dispatcher->events[1]->exception);
+    }
+
+    private function createBatchHandlerNackingTheFirstBatch(int $batchSize): BatchHandlerInterface
+    {
+        return new class($batchSize) implements BatchHandlerInterface {
+            use BatchHandlerTrait;
+
+            private bool $failed = false;
+
+            public function __construct(
+                private int $batchSize,
+            ) {
+            }
+
+            public function __invoke(DummyMessage $message, ?Acknowledger $ack = null)
+            {
+                return $this->handle($message, $ack);
+            }
+
+            private function getBatchSize(): int
+            {
+                return $this->batchSize;
+            }
+
+            private function process(array $jobs): void
+            {
+                foreach ($jobs as [, $ack]) {
+                    if ($this->failed) {
+                        $ack->ack();
+                    } else {
+                        $ack->nack(new \RuntimeException('Batch failed.'));
+                    }
+                }
+
+                $this->failed = true;
+            }
+        };
     }
 }
 

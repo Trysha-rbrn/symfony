@@ -11,11 +11,15 @@
 
 namespace Symfony\Component\Messenger\Tests;
 
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\Group;
+use PHPUnit\Framework\Attributes\IgnoreDeprecations;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Clock\MockClock;
 use Symfony\Component\DependencyInjection\Container;
 use Symfony\Component\DependencyInjection\ServiceLocator;
 use Symfony\Component\EventDispatcher\EventDispatcher;
+use Symfony\Component\Messenger\BatchDispatcher;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Event\WorkerMessageFailedEvent;
 use Symfony\Component\Messenger\EventListener\AddErrorDetailsStampListener;
@@ -23,6 +27,7 @@ use Symfony\Component\Messenger\EventListener\SendFailedMessageForRetryListener;
 use Symfony\Component\Messenger\EventListener\SendFailedMessageToFailureTransportListener;
 use Symfony\Component\Messenger\EventListener\StopWorkerOnMessageLimitListener;
 use Symfony\Component\Messenger\Exception\HandlerFailedException;
+use Symfony\Component\Messenger\Exception\MessageDecodingFailedException;
 use Symfony\Component\Messenger\Exception\TransportException;
 use Symfony\Component\Messenger\Handler\HandlerDescriptor;
 use Symfony\Component\Messenger\Handler\HandlersLocator;
@@ -36,12 +41,17 @@ use Symfony\Component\Messenger\Stamp\ErrorDetailsStamp;
 use Symfony\Component\Messenger\Stamp\OutboxStamp;
 use Symfony\Component\Messenger\Stamp\RedeliveryStamp;
 use Symfony\Component\Messenger\Stamp\SentToFailureTransportStamp;
+use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
 use Symfony\Component\Messenger\Tests\Fixtures\DummyMessage;
 use Symfony\Component\Messenger\Transport\InMemory\InMemoryTransport;
 use Symfony\Component\Messenger\Transport\Receiver\ReceiverInterface;
+use Symfony\Component\Messenger\Transport\Sender\BatchSenderInterface;
 use Symfony\Component\Messenger\Transport\Sender\OutboxSender;
 use Symfony\Component\Messenger\Transport\Sender\SenderInterface;
 use Symfony\Component\Messenger\Transport\Sender\SendersLocator;
+use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
+use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
+use Symfony\Component\Messenger\Transport\Serialization\SigningSerializer;
 use Symfony\Component\Messenger\Worker;
 
 class OutboxIntegrationTest extends TestCase
@@ -50,6 +60,7 @@ class OutboxIntegrationTest extends TestCase
     private InMemoryTransport $target;
     private InMemoryTransport $outbox;
     private InMemoryTransport $failed;
+    private OutboxTestBatchSender $outboxSender;
     private OutboxTestTargetSender $targetSender;
     private OutboxTestHandler $handler;
     private MessageBus $bus;
@@ -62,10 +73,11 @@ class OutboxIntegrationTest extends TestCase
         $this->outbox = new InMemoryTransport(clock: $this->clock);
         $this->failed = new InMemoryTransport(clock: $this->clock);
         $this->targetSender = new OutboxTestTargetSender($this->target);
+        $this->outboxSender = new OutboxTestBatchSender($this->outbox);
         $this->handler = new OutboxTestHandler();
 
         $senders = new Container();
-        $senders->set('orders', new OutboxSender($this->targetSender, $this->outbox, 'orders'));
+        $senders->set('orders', new OutboxSender($this->targetSender, $this->outboxSender, 'orders', 'outbox', 'failed'));
         $senders->set('outbox', $this->outbox);
         $senders->set('failed', $this->failed);
 
@@ -109,6 +121,26 @@ class OutboxIntegrationTest extends TestCase
 
         $this->assertSame(1, $this->handler->calls);
         $this->assertSame([], $this->target->get());
+    }
+
+    public function testABatchIsStoredInTheOutboxWithOneRequestThenForwardedToTheTarget()
+    {
+        $envelopes = (new BatchDispatcher($this->bus))->dispatch([new DummyMessage('a'), new DummyMessage('b'), new DummyMessage('c')]);
+
+        $this->assertSame([3], array_map(\count(...), $this->outboxSender->batches));
+        $this->assertSame([1, 2, 3], array_map(static fn (Envelope $envelope) => $envelope->last(TransportMessageIdStamp::class)?->getId(), $envelopes));
+        $this->assertNull($envelopes[0]->last(OutboxStamp::class));
+        $this->assertCount(3, $stored = $this->outbox->all());
+        $this->assertSame('orders', $stored[2]->last(OutboxStamp::class)?->getTransportName());
+        $this->assertSame([], $this->target->all());
+
+        for ($i = 0; $i < 3; ++$i) {
+            $this->assertNull($this->runWorker('outbox', $this->outbox));
+        }
+
+        $this->assertSame([], $this->outbox->all());
+        $this->assertSame(['a', 'b', 'c'], array_map(static fn (Envelope $envelope) => $envelope->getMessage()->getMessage(), $this->target->all()));
+        $this->assertSame(0, $this->handler->calls);
     }
 
     public function testTheDelayIsAppliedByTheOutboxOnly()
@@ -184,6 +216,52 @@ class OutboxIntegrationTest extends TestCase
         $this->assertSame([], $this->target->get());
     }
 
+    #[DataProvider('provideOutboxSerializers')]
+    public function testATargetThatSignsEveryMessageAcceptsOnlyWhatItsOutboxVerified(SerializerInterface $outboxSerializer, bool $expectAccepted)
+    {
+        $this->assertTargetThatSignsEveryMessageAcceptsOnlyWhatItsOutboxVerified($outboxSerializer, $expectAccepted);
+    }
+
+    #[DataProvider('provideOutboxSerializersThatSignMessageTypes')]
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
+    public function testATargetThatSignsEveryMessageAcceptsOnlyWhatItsOutboxThatSignsMessageTypesVerified(\Closure $createOutboxSerializer, bool $expectAccepted)
+    {
+        $this->assertTargetThatSignsEveryMessageAcceptsOnlyWhatItsOutboxVerified($createOutboxSerializer(), $expectAccepted);
+    }
+
+    private function assertTargetThatSignsEveryMessageAcceptsOnlyWhatItsOutboxVerified(SerializerInterface $outboxSerializer, bool $expectAccepted): void
+    {
+        $this->target = new InMemoryTransport(new SigningSerializer(new PhpSerializer(), 'signing-key'), $this->clock);
+        $this->outbox = new InMemoryTransport($outboxSerializer, $this->clock);
+
+        $senders = new Container();
+        $senders->set('orders', new OutboxSender($this->target, $this->outbox, 'orders', 'outbox'));
+        $senders->set('outbox', $this->outbox);
+        $this->bus = new MessageBus([
+            new SendMessageMiddleware(new SendersLocator([DummyMessage::class => ['orders']], $senders)),
+            new HandleMessageMiddleware(new HandlersLocator([DummyMessage::class => [new HandlerDescriptor($this->handler, ['from_transport' => 'orders'])]])),
+        ]);
+
+        $this->bus->dispatch(new DummyMessage('Hey'));
+        $this->assertNull($this->runWorker('outbox', $this->outbox));
+
+        $this->assertCount(1, $forwarded = $this->target->get());
+        $this->assertInstanceOf($expectAccepted ? DummyMessage::class : MessageDecodingFailedException::class, $forwarded[0]->getMessage());
+    }
+
+    public static function provideOutboxSerializers(): iterable
+    {
+        yield 'outbox signing every message' => [new SigningSerializer(new PhpSerializer(), 'signing-key'), true];
+        yield 'outbox not signing' => [new PhpSerializer(), false];
+    }
+
+    public static function provideOutboxSerializersThatSignMessageTypes(): iterable
+    {
+        yield 'outbox signing the message type' => [static fn () => new SigningSerializer(new PhpSerializer(), 'signing-key', [DummyMessage::class]), true];
+        yield 'outbox signing other message types' => [static fn () => new SigningSerializer(new PhpSerializer(), 'signing-key', [\stdClass::class]), false];
+    }
+
     private function runWorker(string $transportName, ReceiverInterface $receiver): ?\Throwable
     {
         $throwable = null;
@@ -197,6 +275,28 @@ class OutboxIntegrationTest extends TestCase
         $this->dispatcher->removeListener(WorkerMessageFailedEvent::class, $listener);
 
         return $throwable;
+    }
+}
+
+class OutboxTestBatchSender implements BatchSenderInterface
+{
+    public array $batches = [];
+
+    public function __construct(
+        private SenderInterface $outbox,
+    ) {
+    }
+
+    public function send(Envelope $envelope): Envelope
+    {
+        return $this->outbox->send($envelope);
+    }
+
+    public function sendBatch(array $envelopes): array
+    {
+        $this->batches[] = $envelopes;
+
+        return array_map($this->outbox->send(...), $envelopes);
     }
 }
 

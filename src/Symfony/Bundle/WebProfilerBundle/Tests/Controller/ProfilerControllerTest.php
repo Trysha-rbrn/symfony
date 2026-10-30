@@ -28,6 +28,7 @@ use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
 use Symfony\Component\HttpKernel\Profiler\Profile;
 use Symfony\Component\HttpKernel\Profiler\Profiler;
 use Symfony\Component\Routing\Generator\UrlGeneratorInterface;
+use Symfony\Component\VarDumper\Cloner\VarCloner;
 use Twig\Environment;
 use Twig\Loader\ArrayLoader;
 use Twig\Loader\LoaderInterface;
@@ -99,6 +100,18 @@ class ProfilerControllerTest extends WebTestCase
         $this->assertSame(404, $client->getResponse()->getStatusCode());
     }
 
+    public function testProfilerPageDoesNotDisableCspOfLaterRequests()
+    {
+        $kernel = new WebProfilerBundleKernel();
+        $client = new KernelBrowser($kernel);
+        $client->disableReboot();
+
+        $client->request('GET', '/_profiler/latest');
+        $client->request('GET', '/csp');
+
+        $this->assertTrue($client->getResponse()->headers->has('Content-Security-Policy'));
+    }
+
     public function testPanelActionWithValidPanelAndToken()
     {
         $kernel = new WebProfilerBundleKernel();
@@ -108,6 +121,59 @@ class ProfilerControllerTest extends WebTestCase
         $crawler = $client->request('GET', '/_profiler/latest?panel=router');
 
         $this->assertSame('_', $crawler->filter('.metrics .metric .value')->eq(0)->text());
+    }
+
+    #[DataProvider('provideDumpNonceRendering')]
+    public function testStoredDumpsUseTheCurrentResponseNonces(bool $toolbar, bool $withCsp)
+    {
+        $collector = new DumpDataCollector();
+        $collector->setNonce('old-script', 'old-style');
+        $collector->dump((new VarCloner())->cloneVar('dumped value'));
+        $profile = new Profile('token');
+        $profile->addCollector(unserialize(serialize($collector)));
+        $profiler = $this->createStub(Profiler::class);
+        $profiler->method('loadProfile')->willReturn($profile);
+        $profiler->method('has')->willReturn(true);
+        $template = '{{ profile.getCollector("dump").dumps("html")[0].data|raw }}';
+        $twig = new Environment(new ArrayLoader([
+            '@WebProfiler/Profiler/toolbar.html.twig' => $template,
+            'dump.html.twig' => $template,
+        ]));
+        $controller = $this->createController($profiler, $twig, $withCsp, [['dump', 'dump.html.twig']]);
+        $request = new Request();
+        $request->headers->set('X-SymfonyProfiler-Script-Nonce', 'current-script');
+        $request->headers->set('X-SymfonyProfiler-Style-Nonce', 'current-style');
+
+        $response = $toolbar ? $controller->toolbarAction($request, 'token') : $controller->panelAction($request, 'token');
+
+        $this->assertStringContainsString($withCsp ? '<script nonce="current-script">' : '<script>', $response->getContent());
+        $this->assertStringContainsString($withCsp ? '<style nonce="current-style">' : '<style>', $response->getContent());
+        $this->assertStringNotContainsString('old-script', $response->getContent());
+        $this->assertStringNotContainsString('old-style', $response->getContent());
+    }
+
+    public static function provideDumpNonceRendering(): iterable
+    {
+        yield [true, true];
+        yield [false, true];
+        yield [true, false];
+        yield [false, false];
+    }
+
+    public function testToolbarIsLoadedWithTheNoncesOfThePage()
+    {
+        $kernel = new WebProfilerBundleKernel();
+        $client = new KernelBrowser($kernel);
+
+        $client->request('GET', '/');
+        $content = $client->getResponse()->getContent();
+
+        $this->assertSame(1, preg_match('/<script nonce="([^"]+)"/', $content, $scriptNonce));
+        $this->assertSame(1, preg_match('/<link rel="stylesheet" nonce="([^"]+)"/', $content, $styleNonce));
+
+        $this->assertStringContainsString("xhr.setRequestHeader('X-SymfonyProfiler-Script-Nonce', '".$scriptNonce[1]."');", $content);
+        $this->assertStringContainsString("xhr.setRequestHeader('X-SymfonyProfiler-Style-Nonce', '".$styleNonce[1]."');", $content);
+        $this->assertStringContainsString("script.nonce = '".$scriptNonce[1]."';", $content);
     }
 
     public function testToolbarActionWithProfilerDisabled()
@@ -169,6 +235,18 @@ class ProfilerControllerTest extends WebTestCase
         ];
     }
 
+    public function testOpenActionWithProfilerDisabled()
+    {
+        $this->expectException(NotFoundHttpException::class);
+        $this->expectExceptionMessage('The profiler must be enabled.');
+
+        $urlGenerator = $this->createStub(UrlGeneratorInterface::class);
+        $twig = $this->createStub(Environment::class);
+
+        $controller = new ProfilerController($urlGenerator, null, $twig, [], null, __DIR__.'/../..');
+        $controller->openAction(Request::create('/_profiler/open', Request::METHOD_GET, ['file' => 'README.md']));
+    }
+
     #[DataProvider('getOpenFileCases')]
     public function testOpeningDisallowedPaths($path, $isAllowed)
     {
@@ -197,7 +275,41 @@ class ProfilerControllerTest extends WebTestCase
             ['../TwigBundle/README.md', false],
             ['Controller/../README.md', false],
             ['Controller/./ProfilerController.php', false],
+            ['', false],
+            ['Controller', false],
         ];
+    }
+
+    public function testOpeningWithoutFile()
+    {
+        $urlGenerator = $this->createStub(UrlGeneratorInterface::class);
+        $twig = $this->createStub(Environment::class);
+        $profiler = $this->createStub(Profiler::class);
+
+        $controller = new ProfilerController($urlGenerator, $profiler, $twig, [], null, __DIR__.'/../..');
+
+        $this->expectException(NotFoundHttpException::class);
+
+        $controller->openAction(Request::create('/_profiler/open'));
+    }
+
+    public function testOpeningPassesTheLineAsAnInteger()
+    {
+        $urlGenerator = $this->createStub(UrlGeneratorInterface::class);
+        $profiler = $this->createStub(Profiler::class);
+        $lines = [];
+        $twig = $this->createStub(Environment::class);
+        $twig->method('render')->willReturnCallback(static function (string $template, array $context) use (&$lines): string {
+            $lines[] = $context['line'];
+
+            return '';
+        });
+
+        $controller = new ProfilerController($urlGenerator, $profiler, $twig, [], null, __DIR__.'/../..');
+        $controller->openAction(Request::create('/_profiler/open', Request::METHOD_GET, ['file' => 'README.md', 'line' => '12']));
+        $controller->openAction(Request::create('/_profiler/open', Request::METHOD_GET, ['file' => 'README.md']));
+
+        $this->assertSame([12, 0], $lines);
     }
 
     #[DataProvider('provideCspVariants')]
@@ -372,6 +484,7 @@ class ProfilerControllerTest extends WebTestCase
         $client->request('GET', '/_profiler/phpinfo');
 
         $this->assertStringContainsString('PHP Credits', $client->getResponse()->getContent());
+        $this->assertSame('text/plain; charset=UTF-8', $client->getResponse()->headers->get('Content-Type'));
     }
 
     public function testFontActionWithProfilerDisabled()

@@ -26,6 +26,7 @@ use Symfony\Bundle\SecurityBundle\DependencyInjection\Security\Factory\AccessTok
 use Symfony\Component\Clock\Clock;
 use Symfony\Component\Config\Definition\Builder\ArrayNodeDefinition;
 use Symfony\Component\Config\Definition\Exception\InvalidConfigurationException;
+use Symfony\Component\Config\Definition\Processor;
 use Symfony\Component\DependencyInjection\ChildDefinition;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Exception\LogicException;
@@ -420,6 +421,70 @@ class AccessTokenFactoryTest extends TestCase
         $this->assertSame(['method' => 'reset'], $tags['kernel.reset'][0]);
     }
 
+    public function testOidcTokenHandlerDiscoveryCachesInTheDiscoveryPoolByDefault()
+    {
+        $container = new ContainerBuilder();
+        $config = [
+            'token_handler' => [
+                'oidc' => [
+                    'enforce_at_jwt_type' => false,
+                    'discovery' => [
+                        'base_uri' => 'https://www.example.com/realms/demo/',
+                    ],
+                    'issuers' => ['https://www.example.com'],
+                    'audience' => 'audience',
+                ],
+            ],
+        ];
+
+        $factory = new AccessTokenFactory($this->createTokenHandlerFactories());
+        $factory->createAuthenticator($container, 'firewall1', $this->processConfig($config, $factory), 'userprovider');
+
+        [[$method, $arguments]] = $container->getDefinition('security.access_token_handler.firewall1')->getMethodCalls();
+        $this->assertSame('enableDiscovery', $method);
+        $this->assertEquals(new Reference('cache.security.discovery'), $arguments[0]);
+    }
+
+    public function testOidcTokenHandlerDiscoveryLeavesTheIssuersToTheDiscoveryDocumentsByDefault()
+    {
+        $container = new ContainerBuilder();
+        $config = [
+            'token_handler' => [
+                'oidc' => [
+                    'enforce_at_jwt_type' => false,
+                    'discovery' => [
+                        'base_uri' => 'https://www.example.com/realms/demo/',
+                        'check_issuer' => true,
+                    ],
+                    'audience' => 'audience',
+                ],
+            ],
+        ];
+
+        $factory = new AccessTokenFactory($this->createTokenHandlerFactories());
+        $factory->createAuthenticator($container, 'firewall1', $this->processConfig($config, $factory), 'userprovider');
+
+        $this->assertSame([], $container->getDefinition('security.access_token_handler.firewall1')->getArgument(3));
+    }
+
+    public function testOidcTokenHandlerRequiresIssuersWithoutDiscovery()
+    {
+        $config = [
+            'token_handler' => [
+                'oidc' => [
+                    'enforce_at_jwt_type' => false,
+                    'keyset' => 'keyset',
+                    'audience' => 'audience',
+                ],
+            ],
+        ];
+
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('Invalid configuration for path "access_token.token_handler.oidc": You must set "issuers" when "discovery" is not set.');
+
+        $this->processConfig($config, new AccessTokenFactory($this->createTokenHandlerFactories()));
+    }
+
     #[DataProvider('provideEnforceKeyUsageVerification')]
     public function testOidcTokenHandlerEnableDiscoveryArgsMatchMethodSignature(bool $enforceKeyUsageVerification)
     {
@@ -474,6 +539,140 @@ class AccessTokenFactoryTest extends TestCase
     {
         yield 'enforced' => [true];
         yield 'not enforced' => [false];
+    }
+
+    #[DataProvider('provideDiscoveryIssuerChecks')]
+    public function testOidcTokenHandlerDiscoveryKeysTheClientsByTheIssuerTheyMustAnnounce(array $discovery, array $expectedBaseUris)
+    {
+        $container = new ContainerBuilder();
+        $config = [
+            'token_handler' => [
+                'oidc' => [
+                    'enforce_at_jwt_type' => false,
+                    'discovery' => $discovery + [
+                        'base_uri' => ['https://my-idp.example.com/', 'https://login.microsoftonline.com/tenant-id/'],
+                        'cache' => ['id' => 'oidc_cache'],
+                    ],
+                    'issuers' => ['https://my-idp.example.com/', 'https://sts.windows.net/tenant-id/'],
+                    'audience' => 'audience',
+                ],
+            ],
+        ];
+
+        $factory = new AccessTokenFactory($this->createTokenHandlerFactories());
+        $factory->createAuthenticator($container, 'firewall1', $this->processConfig($config, $factory), 'userprovider');
+
+        $methodCalls = $container->getDefinition('security.access_token_handler.firewall1')->getMethodCalls();
+        $this->assertSame('enableDiscovery', $methodCalls[0][0]);
+        $this->assertSame($expectedBaseUris, array_map(static fn (ChildDefinition $client) => $client->getArgument(0)['base_uri'], $methodCalls[0][1][1]));
+    }
+
+    public static function provideDiscoveryIssuerChecks(): iterable
+    {
+        $unchecked = [0 => 'https://my-idp.example.com/', 1 => 'https://login.microsoftonline.com/tenant-id/'];
+
+        yield 'omitted' => [[], $unchecked];
+        yield 'false' => [['check_issuer' => false], $unchecked];
+        yield 'null' => [['check_issuer' => null], $unchecked];
+        yield 'true' => [['check_issuer' => true], [
+            'https://my-idp.example.com/' => 'https://my-idp.example.com/',
+            'https://login.microsoftonline.com/tenant-id/' => 'https://login.microsoftonline.com/tenant-id/',
+        ]];
+        yield 'a map' => [['check_issuer' => ['https://login.microsoftonline.com/tenant-id/' => 'https://sts.windows.net/tenant-id/']], [
+            'https://my-idp.example.com/' => 'https://my-idp.example.com/',
+            'https://sts.windows.net/tenant-id/' => 'https://login.microsoftonline.com/tenant-id/',
+        ]];
+        yield 'a map keyed by a URL with a dash' => [['check_issuer' => ['https://my-idp.example.com/' => 'https://issuer.example.com']], [
+            'https://issuer.example.com' => 'https://my-idp.example.com/',
+            'https://login.microsoftonline.com/tenant-id/' => 'https://login.microsoftonline.com/tenant-id/',
+        ]];
+        yield 'an empty map' => [['check_issuer' => []], [
+            'https://my-idp.example.com/' => 'https://my-idp.example.com/',
+            'https://login.microsoftonline.com/tenant-id/' => 'https://login.microsoftonline.com/tenant-id/',
+        ]];
+    }
+
+    public function testOidcTokenHandlerDiscoveryIssuerChecksAreMergedByBaseUri()
+    {
+        $nodeDefinition = new ArrayNodeDefinition('access_token');
+        (new AccessTokenFactory($this->createTokenHandlerFactories()))->addConfiguration($nodeDefinition);
+
+        $config = (new Processor())->process($nodeDefinition->getNode(), [
+            [
+                'token_handler' => [
+                    'oidc' => [
+                        'enforce_at_jwt_type' => false,
+                        'discovery' => [
+                            'base_uri' => ['https://my-idp.example.com/', 'https://login.microsoftonline.com/tenant-id/'],
+                            'cache' => ['id' => 'oidc_cache'],
+                            'check_issuer' => ['https://my-idp.example.com/' => 'https://issuer.example.com'],
+                        ],
+                        'issuers' => ['https://issuer.example.com', 'https://sts.windows.net/tenant-id/'],
+                        'audience' => 'audience',
+                    ],
+                ],
+            ],
+            [
+                'token_handler' => [
+                    'oidc' => [
+                        'discovery' => [
+                            'check_issuer' => ['https://login.microsoftonline.com/tenant-id/' => 'https://sts.windows.net/tenant-id/'],
+                        ],
+                    ],
+                ],
+            ],
+        ]);
+
+        $this->assertSame([
+            'https://my-idp.example.com/' => 'https://issuer.example.com',
+            'https://login.microsoftonline.com/tenant-id/' => 'https://sts.windows.net/tenant-id/',
+        ], $config['token_handler']['oidc']['discovery']['check_issuer']);
+    }
+
+    public function testOidcTokenHandlerDiscoveryRejectsAnIssuerCheckForAnotherUri()
+    {
+        $config = [
+            'token_handler' => [
+                'oidc' => [
+                    'enforce_at_jwt_type' => false,
+                    'discovery' => [
+                        'base_uri' => 'https://login.microsoftonline.com/tenant-id/',
+                        'cache' => ['id' => 'oidc_cache'],
+                        'check_issuer' => ['https://login.microsoftonline.com/other-tenant-id/' => 'https://sts.windows.net/tenant-id/'],
+                    ],
+                    'issuers' => ['https://sts.windows.net/tenant-id/'],
+                    'audience' => 'audience',
+                ],
+            ],
+        ];
+
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('Invalid configuration for path "access_token.token_handler.oidc.discovery": The "check_issuer" option lists "https://login.microsoftonline.com/other-tenant-id/", which is not a "base_uri".');
+
+        $this->processConfig($config, new AccessTokenFactory($this->createTokenHandlerFactories()));
+    }
+
+    public function testOidcTokenHandlerDiscoveryRejectsAnIssuerExpectedFromSeveralBaseUris()
+    {
+        $config = [
+            'token_handler' => [
+                'oidc' => [
+                    'enforce_at_jwt_type' => false,
+                    'discovery' => [
+                        'base_uri' => ['https://my-idp.example.com/', 'https://my-idp.example.com/v2/'],
+                        'cache' => ['id' => 'oidc_cache'],
+                        'check_issuer' => ['https://my-idp.example.com/v2/' => 'https://my-idp.example.com'],
+                    ],
+                    'issuers' => ['https://my-idp.example.com/'],
+                    'audience' => 'audience',
+                ],
+            ],
+        ];
+
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('Invalid configuration for path "access_token.token_handler.oidc.discovery": The "check_issuer" option expects the issuer "https://my-idp.example.com" from more than one "base_uri".');
+
+        $this->processConfig($config, new AccessTokenFactory($this->createTokenHandlerFactories()));
     }
 
     public function testOidcUserInfoTokenHandlerConfigurationWithExistingClient()
@@ -590,6 +789,32 @@ class AccessTokenFactoryTest extends TestCase
         $tags = $container->getDefinition('security.access_token_handler.firewall1')->getTags();
         $this->assertArrayHasKey('kernel.reset', $tags);
         $this->assertSame(['method' => 'reset'], $tags['kernel.reset'][0]);
+    }
+
+    public function testOidcUserInfoTokenHandlerDiscoveryCachesInTheDiscoveryPoolByDefault()
+    {
+        $container = new ContainerBuilder();
+        $config = [
+            'token_handler' => [
+                'oidc_user_info' => [
+                    'discovery' => [],
+                    'base_uri' => 'https://www.example.com/realms/demo/',
+                ],
+            ],
+        ];
+
+        $factory = new AccessTokenFactory($this->createTokenHandlerFactories());
+        $factory->createAuthenticator($container, 'firewall1', $this->processConfig($config, $factory), 'userprovider');
+
+        $this->assertEquals([
+            [
+                'enableDiscovery',
+                [
+                    new Reference('cache.security.discovery'),
+                    'security.access_token_handler.firewall1.oidc_configuration',
+                ],
+            ],
+        ], $container->getDefinition('security.access_token_handler.firewall1')->getMethodCalls());
     }
 
     public function testMultipleTokenHandlersSet()
@@ -717,6 +942,31 @@ class AccessTokenFactoryTest extends TestCase
                 ],
             ],
         ], $container->getDefinition('security.access_token_handler.firewall1')->getMethodCalls());
+    }
+
+    public function testOAuth2TokenHandlerConfigurationWithASignedResponseDiscovery()
+    {
+        $container = new ContainerBuilder();
+        $config = [
+            'token_handler' => [
+                'oauth2' => [
+                    'audience' => 'https://api.example.com',
+                    'issuer' => 'https://www.example.com',
+                    'response_signature' => [
+                        'discovery' => true,
+                    ],
+                ],
+            ],
+        ];
+
+        $factory = new AccessTokenFactory($this->createTokenHandlerFactories());
+        $finalizedConfig = $this->processConfig($config, $factory);
+
+        $factory->createAuthenticator($container, 'firewall1', $finalizedConfig, 'userprovider');
+
+        [, [$method, $arguments]] = $container->getDefinition('security.access_token_handler.firewall1')->getMethodCalls();
+        $this->assertSame('enableSignedResponseDiscovery', $method);
+        $this->assertEquals(new Reference('cache.security.discovery'), $arguments[0]);
     }
 
     public function testOAuth2TokenHandlerConfigurationWithASignedResponseDisabled()
@@ -849,6 +1099,137 @@ class AccessTokenFactoryTest extends TestCase
         return $node->finalize($normalizedConfig);
     }
 
+    public function testTheTokensOfAFirewallAreBearerTokensByDefault()
+    {
+        $container = $this->createContainerBuilder();
+        $factory = new AccessTokenFactory($this->createTokenHandlerFactories());
+        $config = $this->processConfig(['token_handler' => 'in_memory_token_handler_service_id'], $factory);
+
+        $factory->createAuthenticator($container, 'firewall1', $config, 'userprovider');
+
+        $this->assertNull($container->getDefinition('security.authenticator.access_token.firewall1')->getArgument(7));
+        $this->assertFalse($container->hasDefinition('security.authenticator.access_token.sender_constraint.dpop.firewall1'));
+        $this->assertSame('security.access_token_extractor.header', (string) $container->getDefinition('security.authenticator.access_token.firewall1')->getArgument(1));
+    }
+
+    public function testDpopBindsTheTokensOfTheFirewallToTheKeyOfTheirProof()
+    {
+        $container = $this->createContainerBuilder();
+        $factory = new AccessTokenFactory($this->createTokenHandlerFactories());
+        $config = $this->processConfig([
+            'token_handler' => 'in_memory_token_handler_service_id',
+            'dpop' => true,
+        ], $factory);
+
+        $factory->createAuthenticator($container, 'firewall1', $config, 'userprovider');
+
+        $senderConstraintId = 'security.authenticator.access_token.sender_constraint.dpop.firewall1';
+        $this->assertSame($senderConstraintId, (string) $container->getDefinition('security.authenticator.access_token.firewall1')->getArgument(7));
+
+        $senderConstraint = $container->getDefinition($senderConstraintId);
+        $this->assertSame(['ES256', 'PS256', 'RS256'], $senderConstraint->getArgument(0)->getArgument(0));
+        $this->assertSame('cache.security', (string) $senderConstraint->getArgument(1));
+        $this->assertSame(60, $senderConstraint->getArgument(3));
+        $this->assertSame(5, $senderConstraint->getArgument(4));
+
+        // the same constraint names the scheme of the 403 a missing scope is answered with
+        $this->assertSame($senderConstraintId, (string) $container->getDefinition('security.fallback_access_denied_handler.firewall1')->getArgument(3));
+    }
+
+    /**
+     * A token handler reading nothing of the access token never hands over a "cnf" claim, so a bound
+     * token cannot be recognized for one and every request would be refused.
+     */
+    #[DataProvider('provideTokenHandlersReadingNothingOfTheToken')]
+    public function testDpopIsRefusedWithATokenHandlerThatReadsNothingOfTheToken(array $tokenHandler, string $key)
+    {
+        $container = $this->createContainerBuilder();
+        $factory = new AccessTokenFactory($this->createTokenHandlerFactories());
+        $config = $this->processConfig(['token_handler' => $tokenHandler, 'dpop' => true], $factory);
+
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage(\sprintf('The "dpop" option of the "firewall1" firewall cannot be used with the "%s" token handler', $key));
+
+        $factory->createAuthenticator($container, 'firewall1', $config, 'userprovider');
+    }
+
+    public static function provideTokenHandlersReadingNothingOfTheToken(): iterable
+    {
+        yield 'the claims of the user the provider answers' => [['oidc_user_info' => ['base_uri' => 'https://www.example.com/userinfo', 'client' => 'oidc.client']], 'oidc_user_info'];
+        yield 'the ticket a CAS server validates' => [['cas' => ['validation_url' => 'https://www.example.com/cas/validate']], 'cas'];
+    }
+
+    /**
+     * The two handlers that read the claims of the token itself, the "cnf" of a bound one among them.
+     */
+    #[DataProvider('provideTokenHandlersReadingTheToken')]
+    public function testDpopIsAcceptedWithATokenHandlerReadingTheToken(array $tokenHandler)
+    {
+        $container = $this->createContainerBuilder();
+        $factory = new AccessTokenFactory($this->createTokenHandlerFactories());
+        $config = $this->processConfig(['token_handler' => $tokenHandler, 'dpop' => true], $factory);
+
+        $factory->createAuthenticator($container, 'firewall1', $config, 'userprovider');
+
+        $this->assertTrue($container->hasDefinition('security.authenticator.access_token.sender_constraint.dpop.firewall1'));
+    }
+
+    public static function provideTokenHandlersReadingTheToken(): iterable
+    {
+        yield 'the signed token itself' => [['oidc' => ['algorithms' => ['ES256'], 'issuers' => ['https://www.example.com'], 'audience' => 'audience', 'keyset' => 'keyset', 'enforce_at_jwt_type' => true]]];
+        yield 'the introspection response' => [['oauth2' => true]];
+    }
+
+    public function testADpopBoundTokenIsReadFromTheSchemeItIsPresentedUnder()
+    {
+        $container = $this->createContainerBuilder();
+        $factory = new AccessTokenFactory($this->createTokenHandlerFactories());
+        $config = $this->processConfig([
+            'token_handler' => 'in_memory_token_handler_service_id',
+            'dpop' => true,
+            'resource_metadata' => ['resource' => 'https://api.example.com'],
+        ], $factory);
+
+        $factory->createAuthenticator($container, 'firewall1', $config, 'userprovider');
+
+        $this->assertSame('security.access_token_extractor.dpop_header', (string) $container->getDefinition('security.authenticator.access_token.firewall1')->getArgument(1));
+        // RFC 9728, Section 2: the method is where the token travels, which the scheme does not change
+        $this->assertSame(['header'], $container->getDefinition('security.authenticator.access_token.protected_resource_metadata_controller')->getArgument(0)['firewall1']['bearer_methods_supported']);
+    }
+
+    public function testTheResourceMetadataOfADpopFirewallAnnouncesThatItRequiresBoundTokens()
+    {
+        $container = $this->createContainerBuilder();
+        $factory = new AccessTokenFactory($this->createTokenHandlerFactories());
+        $config = $this->processConfig([
+            'token_handler' => 'in_memory_token_handler_service_id',
+            'dpop' => ['algorithms' => ['ES256', 'PS256']],
+            'resource_metadata' => ['resource' => 'https://api.example.com'],
+        ], $factory);
+
+        $factory->createAuthenticator($container, 'firewall1', $config, 'userprovider');
+
+        $metadata = $container->getDefinition('security.authenticator.access_token.protected_resource_metadata_controller')->getArgument(0)['firewall1'];
+        $this->assertSame(['ES256', 'PS256'], $metadata['dpop_signing_alg_values_supported']);
+        $this->assertTrue($metadata['dpop_bound_access_tokens_required']);
+    }
+
+    public function testTheResourceMetadataOfABearerFirewallSaysNothingOfDpop()
+    {
+        $container = $this->createContainerBuilder();
+        $factory = new AccessTokenFactory($this->createTokenHandlerFactories());
+        $config = $this->processConfig([
+            'token_handler' => 'in_memory_token_handler_service_id',
+            'resource_metadata' => ['resource' => 'https://api.example.com'],
+        ], $factory);
+
+        $factory->createAuthenticator($container, 'firewall1', $config, 'userprovider');
+
+        $metadata = $container->getDefinition('security.authenticator.access_token.protected_resource_metadata_controller')->getArgument(0)['firewall1'];
+        $this->assertArrayNotHasKey('dpop_signing_alg_values_supported', $metadata);
+        $this->assertArrayNotHasKey('dpop_bound_access_tokens_required', $metadata);
+    }
+
     public function testNoResourceMetadataIsServedByDefault()
     {
         $container = $this->createContainerBuilder();
@@ -949,6 +1330,48 @@ class AccessTokenFactoryTest extends TestCase
         $this->assertSame(['header'], $metadata['bearer_methods_supported']);
     }
 
+    #[DataProvider('provideTokenHandlerIssuers')]
+    public function testAuthorizationServersDefaultToTheIssuersOfTheTokenHandler(array $tokenHandler, ?array $expected)
+    {
+        $container = $this->createContainerBuilder();
+        $factory = new AccessTokenFactory($this->createTokenHandlerFactories());
+        $config = $this->processConfig([
+            'token_handler' => $tokenHandler,
+            'resource_metadata' => [],
+        ], $factory);
+
+        $factory->createAuthenticator($container, 'firewall1', $config, 'userprovider');
+
+        $metadata = $container->getDefinition('security.authenticator.access_token.protected_resource_metadata_controller')->getArgument(0)['firewall1'];
+        $this->assertSame($expected, $metadata['authorization_servers'] ?? null);
+    }
+
+    public static function provideTokenHandlerIssuers(): iterable
+    {
+        yield 'oidc' => [['oidc' => ['enforce_at_jwt_type' => false, 'keyset' => 'keyset', 'audience' => 'audience', 'issuers' => ['https://accounts.example.com', 'https://login.example.com']]], ['https://accounts.example.com', 'https://login.example.com']];
+        yield 'oidc with discovery' => [['oidc' => ['enforce_at_jwt_type' => false, 'discovery' => ['base_uri' => 'https://accounts.example.com/'], 'audience' => 'audience', 'issuers' => ['https://accounts.example.com']]], ['https://accounts.example.com']];
+        // the issuer announced by the discovery document is only known at runtime
+        yield 'oidc with discovery and no issuers' => [['oidc' => ['enforce_at_jwt_type' => false, 'discovery' => ['base_uri' => 'https://accounts.example.com/'], 'audience' => 'audience']], null];
+        yield 'oauth2' => [['oauth2' => ['issuer' => 'https://accounts.example.com']], ['https://accounts.example.com']];
+        yield 'oauth2 without issuer' => [['oauth2' => true], null];
+        yield 'a service' => [['id' => 'in_memory_token_handler_service_id'], null];
+    }
+
+    public function testConfiguredAuthorizationServersWinOverTheIssuersOfTheTokenHandler()
+    {
+        $container = $this->createContainerBuilder();
+        $factory = new AccessTokenFactory($this->createTokenHandlerFactories());
+        $config = $this->processConfig([
+            'token_handler' => ['oauth2' => ['issuer' => 'https://accounts.example.com']],
+            'resource_metadata' => ['authorization_servers' => 'https://login.example.com'],
+        ], $factory);
+
+        $factory->createAuthenticator($container, 'firewall1', $config, 'userprovider');
+
+        $metadata = $container->getDefinition('security.authenticator.access_token.protected_resource_metadata_controller')->getArgument(0)['firewall1'];
+        $this->assertSame(['https://login.example.com'], $metadata['authorization_servers']);
+    }
+
     public function testEachFirewallGetsItsOwnMetadata()
     {
         $container = $this->createContainerBuilder();
@@ -984,13 +1407,13 @@ class AccessTokenFactoryTest extends TestCase
 
     public static function provideInvalidResourceIdentifiers(): iterable
     {
-        // the well-known path is derived from the path component of the identifier when the
-        // route is declared, so a value the container cannot parse cannot be served
-        yield 'an environment variable used as the whole value' => ['env_2b0d1a_API_RESOURCE_4f8c'];
+        yield 'a host without a scheme' => ['api.example.com/v1'];
         yield 'not HTTPS' => ['http://api.example.com'];
         yield 'a test domain over HTTP' => ['http://api.example.test'];
         yield 'with a fragment' => ['https://api.example.com/v1#api'];
         yield 'no URL at all' => ['https://api.example.com:port/v1'];
+        yield 'a path with a fragment' => ['/v1#api'];
+        yield 'a network-path reference' => ['//api.example.com/v1'];
     }
 
     #[DataProvider('provideValidResourceIdentifiers')]
@@ -1016,8 +1439,41 @@ class AccessTokenFactoryTest extends TestCase
         yield 'a localhost subdomain over HTTP' => ['http://api.localhost', '/.well-known/oauth-protected-resource', 'http://api.localhost/.well-known/oauth-protected-resource'];
         // a query is only a SHOULD NOT, and RFC 9728, Section 3.1 keeps it after the path
         yield 'with a query' => ['https://api.example.com/v1?tenant=acme', '/.well-known/oauth-protected-resource/v1', 'https://api.example.com/.well-known/oauth-protected-resource/v1?tenant=acme'];
-        // an environment variable interpolated into the URL still leaves the path readable
-        yield 'an environment variable inside a URL' => ['https://env_2b0d1a_API_HOST_4f8c/v1', '/.well-known/oauth-protected-resource/v1', 'https://env_2b0d1a_API_HOST_4f8c/.well-known/oauth-protected-resource/v1'];
+        // a path is resolved against the origin of the request, as the default identifier is
+        yield 'a path' => ['/v1/', '/.well-known/oauth-protected-resource/v1', '/.well-known/oauth-protected-resource/v1'];
+        yield 'a path with a query' => ['/v1?tenant=acme', '/.well-known/oauth-protected-resource/v1', '/.well-known/oauth-protected-resource/v1?tenant=acme'];
+    }
+
+    #[DataProvider('provideBuiltInTokenHandlers')]
+    public function testBuiltInTokenHandlersAreLazy(array $tokenHandler)
+    {
+        $container = $this->createContainerBuilder();
+        $factory = new AccessTokenFactory($this->createTokenHandlerFactories());
+        $config = $this->processConfig(['token_handler' => $tokenHandler], $factory);
+
+        $factory->createAuthenticator($container, 'firewall1', $config, 'userprovider');
+
+        $this->assertTrue($container->getDefinition('security.access_token_handler.firewall1')->isLazy());
+    }
+
+    public static function provideBuiltInTokenHandlers(): iterable
+    {
+        yield 'oidc' => [['oidc' => ['issuers' => ['https://www.example.com'], 'audience' => 'audience', 'keyset' => 'keyset', 'enforce_at_jwt_type' => true]]];
+        yield 'oidc with discovery' => [['oidc' => ['issuers' => ['https://www.example.com'], 'audience' => 'audience', 'discovery' => ['base_uri' => 'https://www.example.com/realms/demo/'], 'enforce_at_jwt_type' => true]]];
+        yield 'oidc_user_info' => [['oidc_user_info' => ['base_uri' => 'https://www.example.com/userinfo', 'client' => 'oidc.client']]];
+        yield 'oauth2' => [['oauth2' => true]];
+        yield 'cas' => [['cas' => ['validation_url' => 'https://www.example.com/cas/validate']]];
+    }
+
+    public function testATokenHandlerServiceIsLeftAsDefined()
+    {
+        $container = $this->createContainerBuilder();
+        $factory = new AccessTokenFactory($this->createTokenHandlerFactories());
+        $config = $this->processConfig(['token_handler' => 'in_memory_token_handler_service_id'], $factory);
+
+        $factory->createAuthenticator($container, 'firewall1', $config, 'userprovider');
+
+        $this->assertFalse($container->getDefinition('security.access_token_handler.firewall1')->isLazy());
     }
 
     private function createContainerBuilder(): ContainerBuilder
@@ -1068,6 +1524,7 @@ class AccessTokenFactoryTest extends TestCase
 
         $this->assertTrue($container->hasDefinition('security.access_token_handler.oidc.command.generate'));
         $this->assertTrue($container->getDefinition('security.access_token_handler.oidc.command.generate')->hasMethodCall('addGenerator'));
+        $this->assertEquals([new Reference('clock')], $container->getDefinition('security.access_token_handler.oidc.command.generate')->getArguments());
     }
 
     public function testOidcTokenGeneratorCommandWithNoTokenHandler()

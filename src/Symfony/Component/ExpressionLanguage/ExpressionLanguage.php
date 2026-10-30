@@ -13,6 +13,8 @@ namespace Symfony\Component\ExpressionLanguage;
 
 use Psr\Cache\CacheItemPoolInterface;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
+use Symfony\Component\ExpressionLanguage\Exception\LogicException;
+use Symfony\Component\ExpressionLanguage\Exception\TypeError;
 
 // Help opcache.preload discover always-needed symbols
 class_exists(ParsedExpression::class);
@@ -24,10 +26,13 @@ class_exists(ParsedExpression::class);
  */
 class ExpressionLanguage
 {
+    private const MAX_PARSED_EXPRESSIONS = 1024;
+
     private CacheItemPoolInterface $cache;
     private Lexer $lexer;
     private Parser $parser;
     private Compiler $compiler;
+    private array $parsedExpressions = [];
 
     protected array $functions = [];
 
@@ -77,7 +82,17 @@ class ExpressionLanguage
             $cacheKeyItems[] = \is_int($nameKey) ? $name : $nameKey.':'.$name;
         }
 
-        $cacheItem = $this->cache->getItem(rawurlencode($expression.'//'.implode('|', $cacheKeyItems)));
+        $key = $expression.'//'.implode('|', $cacheKeyItems).($flags ? '//'.$flags : '');
+
+        if (isset($this->parsedExpressions[$key])) {
+            // move the expression last, so that the least recently used one is evicted first
+            $parsedExpression = $this->parsedExpressions[$key];
+            unset($this->parsedExpressions[$key]);
+
+            return $this->parsedExpressions[$key] = $parsedExpression;
+        }
+
+        $cacheItem = $this->cache->getItem(rawurlencode($key));
 
         if (null === $parsedExpression = $cacheItem->get()) {
             $nodes = $this->getParser()->parse($this->getLexer()->tokenize((string) $expression), $names, $flags);
@@ -87,7 +102,11 @@ class ExpressionLanguage
             $this->cache->save($cacheItem);
         }
 
-        return $parsedExpression;
+        if (\count($this->parsedExpressions) >= self::MAX_PARSED_EXPRESSIONS) {
+            unset($this->parsedExpressions[array_key_first($this->parsedExpressions)]);
+        }
+
+        return $this->parsedExpressions[$key] = $parsedExpression;
     }
 
     /**
@@ -120,7 +139,7 @@ class ExpressionLanguage
     public function register(string $name, callable $compiler, callable $evaluator): void
     {
         if (isset($this->parser)) {
-            throw new \LogicException('Registering functions after calling evaluate(), compile() or parse() is not supported.');
+            throw new LogicException('Registering functions after calling evaluate(), compile() or parse() is not supported.');
         }
 
         $this->functions[$name] = ['compiler' => $compiler, 'evaluator' => $evaluator];
@@ -146,17 +165,21 @@ class ExpressionLanguage
         }
 
         $this->addFunction(new ExpressionFunction('enum',
-            static fn ($str): string => \sprintf("(\constant(\$v = (%s))) instanceof \UnitEnum ? \constant(\$v) : throw new \TypeError(\sprintf('The string \"%%s\" is not the name of a valid enum case.', \$v))", $str),
+            static fn ($str): string => \sprintf("(static fn (\$v) => \constant(\$v) instanceof \UnitEnum ? \constant(\$v) : throw new \%s(\sprintf('The string \"%%s\" is not the name of a valid enum case.', \$v)))(%s)", TypeError::class, $str),
             static function ($arguments, $str): \UnitEnum {
                 $value = \constant($str);
 
                 if (!$value instanceof \UnitEnum) {
-                    throw new \TypeError(\sprintf('The string "%s" is not the name of a valid enum case.', $str));
+                    throw new TypeError(\sprintf('The string "%s" is not the name of a valid enum case.', $str));
                 }
 
                 return $value;
             }
         ));
+
+        foreach (['constant', 'enum'] as $name) {
+            $this->functions[$name]['deprecation'] = ['symfony/expression-language', '8.2', \sprintf('Using the built-in "%s()" expression function is deprecated, register a "%s" listing the allowed constants instead.', $name, ConstantFunctionProvider::class)];
+        }
     }
 
     private function getLexer(): Lexer

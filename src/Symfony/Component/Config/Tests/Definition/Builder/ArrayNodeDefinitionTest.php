@@ -447,6 +447,267 @@ class ArrayNodeDefinitionTest extends TestCase
         $node->getNode()->finalize([]);
     }
 
+    #[DataProvider('provideArraysWrappedIntoAChild')]
+    public function testAcceptAndWrapArraysIntoAChild(array $config, array $expected)
+    {
+        $node = (new ArrayNodeDefinition('root'))
+            ->canBeDisabled()
+            ->acceptAndWrap(['array'], 'items')
+            ->children()
+                ->arrayNode('options', 'option')->scalarPrototype()->end()->end()
+                ->arrayNode('items', 'item')->useAttributeAsKey('name')->scalarPrototype()->end()->end()
+            ->end()
+        ;
+
+        $this->assertEquals($expected, (new Processor())->process($node->getNode(), [$config]));
+    }
+
+    public static function provideArraysWrappedIntoAChild(): iterable
+    {
+        yield 'the entries go into the child' => [['foo' => 'a', 'bar' => 'b'], ['enabled' => true, 'options' => [], 'items' => ['foo' => 'a', 'bar' => 'b']]];
+        yield 'the other children stay' => [['enabled' => false, 'options' => ['x'], 'foo' => 'a'], ['enabled' => false, 'options' => ['x'], 'items' => ['foo' => 'a']]];
+        yield 'the singular of another child stays' => [['option' => 'x', 'foo' => 'a'], ['enabled' => true, 'options' => ['x'], 'items' => ['foo' => 'a']]];
+        yield 'an array setting the child is not wrapped' => [['items' => ['foo' => 'a'], 'options' => ['x']], ['enabled' => true, 'options' => ['x'], 'items' => ['foo' => 'a']]];
+        yield 'an array setting the singular of the child is not wrapped' => [['item' => [['name' => 'foo', 'value' => 'a']]], ['enabled' => true, 'options' => [], 'items' => ['foo' => 'a']]];
+    }
+
+    public function testAcceptAndWrapArraysRequiresTheChildToWrapThemInto()
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Wrapping arrays requires the name of the child to wrap them into.');
+
+        (new ArrayNodeDefinition('root'))->acceptAndWrap(['array']);
+    }
+
+    public function testAcceptAndWrapArraysIntoAMissingChild()
+    {
+        $this->expectException(InvalidDefinitionException::class);
+        $this->expectExceptionMessage('->acceptAndWrap() cannot wrap arrays into "items" as it is not a child of the node at path "root".');
+
+        (new ArrayNodeDefinition('root'))
+            ->acceptAndWrap(['array'], 'items')
+            ->children()
+                ->scalarNode('item')->end()
+            ->end()
+            ->getNode();
+    }
+
+    #[DataProvider('provideMapsWrappedIntoTheItemsOfAList')]
+    public function testAcceptAndWrapMapsIntoTheItemsOfAList(array $config, array $expected)
+    {
+        $node = (new ArrayNodeDefinition('root'))
+            ->acceptAndWrap(['array'], 'name')
+            ->arrayPrototype()
+                ->children()
+                    ->scalarNode('name')->isRequired()->end()
+                    ->scalarNode('label')->end()
+                ->end()
+            ->end()
+        ;
+
+        $this->assertEquals($expected, (new Processor())->process($node->getNode(), [$config]));
+    }
+
+    public static function provideMapsWrappedIntoTheItemsOfAList(): iterable
+    {
+        yield 'the keys of a map go into the items' => [['foo' => ['label' => 'Foo'], 'bar' => []], ['foo' => ['name' => 'foo', 'label' => 'Foo'], 'bar' => ['name' => 'bar']]];
+        yield 'an item setting the child keeps it' => [['foo' => ['name' => 'bar']], ['foo' => ['name' => 'bar']]];
+        yield 'a list is not changed' => [[['name' => 'foo'], ['name' => 'foo', 'label' => 'Foo']], [['name' => 'foo'], ['name' => 'foo', 'label' => 'Foo']]];
+    }
+
+    public function testAcceptAndWrapArraysIntoAMissingChildOfTheItemsOfAList()
+    {
+        $this->expectException(InvalidDefinitionException::class);
+        $this->expectExceptionMessage('->acceptAndWrap() cannot wrap arrays into "name" as it is not a child of the items of the node at path "root".');
+
+        (new ArrayNodeDefinition('root'))
+            ->acceptAndWrap(['array'], 'name')
+            ->arrayPrototype()
+                ->children()
+                    ->scalarNode('label')->end()
+                ->end()
+            ->end()
+            ->getNode();
+    }
+
+    public function testAcceptAndWrapArraysIsNotApplicableToMaps()
+    {
+        $this->expectException(InvalidDefinitionException::class);
+        $this->expectExceptionMessage('->acceptAndWrap() cannot wrap arrays into a prototype node that uses ->useAttributeAsKey() at path "root".');
+
+        (new ArrayNodeDefinition('root'))
+            ->acceptAndWrap(['array'], 'items')
+            ->useAttributeAsKey('name')
+            ->scalarPrototype()->end()
+            ->getNode();
+    }
+
+    public function testAcceptAndWrapArraysKeepsTheTypesDeclaredByTheClosures()
+    {
+        $node = (new ArrayNodeDefinition('root'))
+            ->acceptAndWrap(['array'], 'name')
+            ->beforeNormalization()->ifString()->then(static fn ($v) => [['name' => $v]])->end()
+            ->arrayPrototype()
+                ->children()
+                    ->scalarNode('name')->end()
+                ->end()
+            ->end()
+        ;
+
+        $this->assertSame(['string', 'array'], $node->getNode()->getNormalizedTypes());
+    }
+
+    public function testAcceptAndWrapDoesNotHideTheClosuresThatAcceptAnyValue()
+    {
+        $node = (new ArrayNodeDefinition('root'))
+            ->acceptAndWrap(['string'])
+            ->beforeNormalization()->ifNull()->then(static fn () => ['null'])->end()
+            ->beforeNormalization()->ifTrue(static fn ($v) => \is_array($v) && isset($v['id']))->then(static fn ($v) => [$v])->end()
+            ->variablePrototype()->end()
+        ;
+
+        $this->assertSame(['string', 'any', 'array'], $node->getNode()->getNormalizedTypes());
+    }
+
+    public function testAcceptElementsAtParentLevel()
+    {
+        $node = (new ArrayNodeDefinition('root'))
+            ->beforeNormalization()->ifArray()->then(static fn ($v) => $v)->end()
+            ->children()
+                ->scalarNode('name')->end()
+            ->end()
+            ->append(self::createElementsAtParentLevelNode())
+        ;
+
+        $stores = $node->getNode()->getChildren()['stores'];
+
+        $this->assertInstanceOf(PrototypedArrayNode::class, $stores);
+        $this->assertTrue($stores->getAttribute('elements_at_parent_level'));
+    }
+
+    public function testAcceptElementsAtParentLevelRequiresANormalizationClosureOnTheParent()
+    {
+        $this->expectException(InvalidDefinitionException::class);
+        $this->expectExceptionMessage('The node "root" accepts the elements of "stores" at its level but has no beforeNormalization() closure to rewrite them.');
+
+        (new ArrayNodeDefinition('root'))
+            ->children()
+                ->scalarNode('name')->end()
+            ->end()
+            ->append(self::createElementsAtParentLevelNode())
+            ->getNode();
+    }
+
+    public function testAcceptElementsAtParentLevelRejectsAKeyDeclaredByTheParentAndTheElements()
+    {
+        $this->expectException(InvalidDefinitionException::class);
+        $this->expectExceptionMessage('The node "root" and the elements of "stores" both declare the key(s) "host", so they cannot be told apart when they are given at the level of the node.');
+
+        (new ArrayNodeDefinition('root'))
+            ->beforeNormalization()->ifArray()->then(static fn ($v) => $v)->end()
+            ->children()
+                ->scalarNode('host')->end()
+            ->end()
+            ->append(self::createElementsAtParentLevelNode())
+            ->getNode();
+    }
+
+    public function testAcceptElementsAtParentLevelRejectsAKeyDeclaredByTheParentAndTheSingularOfTheElements()
+    {
+        $this->expectException(InvalidDefinitionException::class);
+        $this->expectExceptionMessage('The node "root" and the elements of "stores" both declare the key(s) "address", so they cannot be told apart when they are given at the level of the node.');
+
+        $stores = new ArrayNodeDefinition('stores');
+        $stores
+            ->useAttributeAsKey('name')
+            ->acceptElementsAtParentLevel()
+            ->prototype('array')
+                ->fixXmlConfig('address')
+                ->children()
+                    ->scalarNode('addresses')->end()
+                ->end()
+            ->end()
+        ;
+
+        (new ArrayNodeDefinition('root'))
+            ->beforeNormalization()->ifArray()->then(static fn ($v) => $v)->end()
+            ->children()
+                ->scalarNode('address')->end()
+            ->end()
+            ->append($stores)
+            ->getNode();
+    }
+
+    public function testAcceptElementsAtParentLevelIsNotApplicableToConcreteNodes()
+    {
+        $this->expectException(InvalidDefinitionException::class);
+        $this->expectExceptionMessage('->acceptElementsAtParentLevel() is not applicable to concrete nodes at path "root".');
+
+        (new ArrayNodeDefinition('root'))
+            ->acceptElementsAtParentLevel()
+            ->children()
+                ->scalarNode('name')->end()
+            ->end()
+            ->getNode();
+    }
+
+    #[DataProvider('provideNodesWithoutAnArrayPrototypeWithChildren')]
+    public function testAcceptElementsAtParentLevelRequiresAnArrayPrototypeWithChildren(ArrayNodeDefinition $node)
+    {
+        $this->expectException(InvalidDefinitionException::class);
+        $this->expectExceptionMessage('->acceptElementsAtParentLevel() requires the prototype of the node at path "root" to be an array with children.');
+
+        $node->getNode();
+    }
+
+    public static function provideNodesWithoutAnArrayPrototypeWithChildren(): iterable
+    {
+        yield 'a scalar prototype' => [(new ArrayNodeDefinition('root'))->acceptElementsAtParentLevel()->useAttributeAsKey('name')->scalarPrototype()->end()];
+        yield 'a prototyped array prototype' => [(new ArrayNodeDefinition('root'))->acceptElementsAtParentLevel()->useAttributeAsKey('name')->arrayPrototype()->scalarPrototype()->end()->end()];
+        yield 'an array prototype without children' => [(new ArrayNodeDefinition('root'))->acceptElementsAtParentLevel()->useAttributeAsKey('name')->arrayPrototype()->end()];
+    }
+
+    public function testAcceptElementsAtParentLevelRejectsSeveralChildrenOfTheSameNode()
+    {
+        $this->expectException(InvalidDefinitionException::class);
+        $this->expectExceptionMessage('Only one child of the node "root" can declare ->acceptElementsAtParentLevel(), found "stores", "caches".');
+
+        $caches = new ArrayNodeDefinition('caches');
+        $caches
+            ->acceptElementsAtParentLevel()
+            ->arrayPrototype()
+                ->children()
+                    ->integerNode('ttl')->end()
+                ->end()
+            ->end()
+        ;
+
+        (new ArrayNodeDefinition('root'))
+            ->beforeNormalization()->ifArray()->then(static fn ($v) => $v)->end()
+            ->append(self::createElementsAtParentLevelNode())
+            ->append($caches)
+            ->getNode();
+    }
+
+    public function testAcceptElementsAtParentLevelCannotBeCombinedWithWrappingArrays()
+    {
+        $this->expectException(InvalidDefinitionException::class);
+        $this->expectExceptionMessage('The node "root" cannot both wrap arrays into "options" with ->acceptAndWrap() and accept the elements of "stores" at its level.');
+
+        (new ArrayNodeDefinition('root'))
+            ->beforeNormalization()->ifArray()->then(static fn ($v) => $v)->end()
+            ->acceptAndWrap(['array'], 'options')
+            ->children()
+                ->arrayNode('options')
+                    ->children()
+                        ->scalarNode('timeout')->end()
+                    ->end()
+                ->end()
+            ->end()
+            ->append(self::createElementsAtParentLevelNode())
+            ->getNode();
+    }
+
     public function testFindShouldThrowExceptionIfNodeDoesNotExistInRootNode()
     {
         $this->expectException(\RuntimeException::class);
@@ -531,5 +792,21 @@ class ArrayNodeDefinitionTest extends TestCase
         $reflection = new \ReflectionProperty($object, $field);
 
         return $reflection->getValue($object);
+    }
+
+    private static function createElementsAtParentLevelNode(): ArrayNodeDefinition
+    {
+        $node = new ArrayNodeDefinition('stores');
+        $node
+            ->useAttributeAsKey('name')
+            ->acceptElementsAtParentLevel()
+            ->prototype('array')
+                ->children()
+                    ->scalarNode('host')->end()
+                ->end()
+            ->end()
+        ;
+
+        return $node;
     }
 }

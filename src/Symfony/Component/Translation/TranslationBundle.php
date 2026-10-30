@@ -155,6 +155,7 @@ class TranslationBundle extends AbstractBundle
         // support for translations is included by default in the Form and Validator components, so an
         // identity translator has to answer even when translation itself is turned off
         $configurator->import('Resources/config/identity_translator.php');
+        $configurator->import('Resources/config/html_translator.php');
 
         if (!$config['enabled']) {
             return;
@@ -233,7 +234,8 @@ class TranslationBundle extends AbstractBundle
 
             $container
                 ->register('translator.pseudo', PseudoLocalizationTranslator::class)
-                ->setDecoratedService('translator', null, -1) // lower priority than "translator.data_collector"
+                ->setDecoratedService('translator', null, -1)
+                ->addTag('container.decoration_order', ['around' => 'translator.data_collector'])
                 ->setArguments([
                     new Reference('translator.pseudo.inner'),
                     $options,

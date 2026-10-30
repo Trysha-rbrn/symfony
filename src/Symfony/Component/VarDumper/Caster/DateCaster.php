@@ -51,7 +51,7 @@ class DateCaster
 
     public static function castInterval(\DateInterval $interval, array $a, Stub $stub, bool $isNested, int $filter): array
     {
-        $now = new \DateTimeImmutable('@0', new \DateTimeZone('UTC'));
+        $now = \DateTimeImmutable::createFromTimestamp(0);
         $numberOfSeconds = $now->add($interval)->getTimestamp() - $now->getTimestamp();
         $title = number_format($numberOfSeconds, 0, '.', ' ').'s';
 
@@ -65,7 +65,7 @@ class DateCaster
         $format = '%R ';
 
         if (0 === $i->y && 0 === $i->m && ($i->h >= 24 || $i->i >= 60 || $i->s >= 60)) {
-            $d = new \DateTimeImmutable('@0', new \DateTimeZone('UTC'));
+            $d = \DateTimeImmutable::createFromTimestamp(0);
             $i = $d->diff($d->add($i)); // recalculate carry over points
             $format .= 0 < $i->days ? '%ad ' : '';
         } else {
@@ -100,10 +100,10 @@ class DateCaster
                 }
 
                 $now = new \DateTimeImmutable('now', new \DateTimeZone('UTC'));
-                $numberOfSeconds = (float) $now->add($p->getDateInterval())->format('U.u') - (float) $now->format('U.u');
+                $numberOfSeconds = self::toTimestamp($now->add($p->getDateInterval())) - self::toTimestamp($now);
 
                 if (0 < $numberOfSeconds) {
-                    $dates[] = \sprintf('%s more', ceil(($end->format('U.u') - $d->format('U.u')) / $numberOfSeconds));
+                    $dates[] = \sprintf('%s more', ceil((self::toTimestamp($end) - self::toTimestamp($d)) / $numberOfSeconds));
                 }
 
                 break;
@@ -132,5 +132,10 @@ class DateCaster
     private static function formatSeconds(string $s, string $us): string
     {
         return \sprintf('%02d.%s', $s, 0 === ($len = \strlen($t = rtrim($us, '0'))) ? '0' : ($len <= 3 ? str_pad($t, 3, '0') : $us));
+    }
+
+    private static function toTimestamp(\DateTimeInterface $date): float
+    {
+        return \PHP_INT_SIZE >= 8 ? $date->getTimestamp() + $date->getMicrosecond() / 1e6 : (float) $date->format('U.u');
     }
 }

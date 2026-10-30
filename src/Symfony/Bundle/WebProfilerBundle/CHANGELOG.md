@@ -4,10 +4,12 @@ CHANGELOG
 8.2
 ---
 
+ * Capture AJAX requests started before the web debug toolbar loads
  * Add dump indicator to profiler list view for profiles with dumped content
  * Log the profiler URL of each request at debug level on the `profiler` channel
- * Add a Key Management panel, reporting what a request encrypted per call site and per key rather than call by call
+ * Add a Key Management panel
  * Display the duration and the transferred sizes of each request in the HTTP Client panel
+ * Show the descriptions of workflows, places and transitions in the Workflow panel
 
 8.1
 ---

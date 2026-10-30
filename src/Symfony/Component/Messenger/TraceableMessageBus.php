@@ -12,6 +12,7 @@
 namespace Symfony\Component\Messenger;
 
 use Symfony\Component\Messenger\Stamp\StampInterface;
+use Symfony\Component\Messenger\Transport\Sender\BatchCollector;
 
 /**
  * @author Samuel Roze <samuel.roze@gmail.com>
@@ -78,13 +79,17 @@ class TraceableMessageBus implements MessageBusInterface
     {
         $trace = debug_backtrace(\DEBUG_BACKTRACE_IGNORE_ARGS, 8);
 
-        $file = $trace[1]['file'] ?? null;
-        $line = $trace[1]['line'] ?? null;
+        $file = $trace[1]['file'] ?? $trace[2]['file'] ?? null;
+        $line = $trace[1]['line'] ?? $trace[2]['line'] ?? null;
 
-        $handleTraitFile = (new \ReflectionClass(HandleTrait::class))->getFileName();
+        $helperFiles = [(new \ReflectionClass(HandleTrait::class))->getFileName(), (new \ReflectionClass(BatchDispatcher::class))->getFileName(), (new \ReflectionClass(BatchCollector::class))->getFileName()];
         $found = false;
         for ($i = 1; $i < 8; ++$i) {
-            if (isset($trace[$i]['file'], $trace[$i + 1]['file'], $trace[$i + 1]['line']) && $trace[$i]['file'] === $handleTraitFile) {
+            while (isset($trace[$i]['file'], $trace[$i + 1]['file']) && \in_array($trace[$i]['file'], $helperFiles, true) && \in_array($trace[$i + 1]['file'], $helperFiles, true)) {
+                ++$i;
+            }
+
+            if (isset($trace[$i]['file'], $trace[$i + 1]['file'], $trace[$i + 1]['line']) && \in_array($trace[$i]['file'], $helperFiles, true)) {
                 $file = $trace[$i + 1]['file'];
                 $line = $trace[$i + 1]['line'];
                 $found = true;
@@ -98,8 +103,8 @@ class TraceableMessageBus implements MessageBusInterface
                 && 'dispatch' === $trace[$i]['function']
                 && is_a($trace[$i]['class'], MessageBusInterface::class, true)
             ) {
-                $file = $trace[$i]['file'];
-                $line = $trace[$i]['line'];
+                $file = $trace[$i]['file'] ?? $trace[$i + 1]['file'] ?? null;
+                $line = $trace[$i]['line'] ?? $trace[$i + 1]['line'] ?? null;
 
                 while (++$i < 8) {
                     if (isset($trace[$i]['function'], $trace[$i]['file']) && empty($trace[$i]['class']) && !str_starts_with($trace[$i]['function'], 'call_user_func')) {

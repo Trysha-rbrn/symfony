@@ -12,12 +12,15 @@
 namespace Symfony\Component\Messenger\Bridge\Amqp\Transport;
 
 use Symfony\Component\Messenger\Envelope;
+use Symfony\Component\Messenger\Exception\BatchSendFailedException;
 use Symfony\Component\Messenger\Exception\TransportException;
+use Symfony\Component\Messenger\Stamp\CorrelationStamp;
 use Symfony\Component\Messenger\Stamp\DelayStamp;
+use Symfony\Component\Messenger\Stamp\MessageIdStamp;
 use Symfony\Component\Messenger\Stamp\RedeliveryStamp;
 use Symfony\Component\Messenger\Stamp\SentToFailureTransportStamp;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
-use Symfony\Component\Messenger\Transport\Sender\SenderInterface;
+use Symfony\Component\Messenger\Transport\Sender\BatchSenderInterface;
 use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
 
@@ -26,7 +29,7 @@ use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
  *
  * @author Samuel Roze <samuel.roze@gmail.com>
  */
-class AmqpSender implements SenderInterface
+class AmqpSender implements BatchSenderInterface
 {
     private SerializerInterface $serializer;
 
@@ -38,6 +41,43 @@ class AmqpSender implements SenderInterface
     }
 
     public function send(Envelope $envelope): Envelope
+    {
+        [$envelope, $message] = $this->getMessage($envelope);
+
+        try {
+            $this->connection->publish(...$message);
+        } catch (\AMQPException $e) {
+            throw new TransportException($e->getMessage(), 0, $e);
+        }
+
+        return $envelope;
+    }
+
+    public function sendBatch(array $envelopes): array
+    {
+        $messages = [];
+
+        foreach ($envelopes as $key => $envelope) {
+            [$envelopes[$key], $messages[$key]] = $this->getMessage($envelope);
+        }
+
+        try {
+            $exceptions = $this->connection->publishBatch($messages);
+        } catch (\AMQPException $e) {
+            throw new TransportException($e->getMessage(), 0, $e);
+        }
+
+        if ($exceptions) {
+            throw new BatchSendFailedException(array_diff_key($envelopes, $exceptions), $exceptions);
+        }
+
+        return $envelopes;
+    }
+
+    /**
+     * @return array{Envelope, array{string, array, int, ?AmqpStamp}} The envelope to return and the arguments of Connection::publish()
+     */
+    private function getMessage(Envelope $envelope): array
     {
         $encodedMessage = $this->serializer->encode($envelope);
 
@@ -57,29 +97,39 @@ class AmqpSender implements SenderInterface
             $amqpStamp = AmqpStamp::createWithAttributes(['priority' => $priorityStamp->priority], $amqpStamp);
         }
 
+        // AMQP rejects message_id and correlation_id values longer than 255 bytes
+        if (!($amqpStamp?->getAttributes()['message_id'] ?? null) && ($id = $envelope->last(MessageIdStamp::class)?->getId()) && 255 >= \strlen($id)) {
+            $amqpStamp = AmqpStamp::createWithAttributes(['message_id' => $id], $amqpStamp);
+        }
+
+        if (!($amqpStamp?->getAttributes()['correlation_id'] ?? null) && ($id = $envelope->last(CorrelationStamp::class)?->getId()) && 255 >= \strlen($id)) {
+            $amqpStamp = AmqpStamp::createWithAttributes(['correlation_id' => $id], $amqpStamp);
+        }
+
         if ($amqpStamp?->getAttributes()['message_id'] ?? null) {
             $envelope = $envelope->with(new TransportMessageIdStamp($amqpStamp->getAttributes()['message_id']));
         }
 
         if ($amqpReceivedStamp = $envelope->last(AmqpReceivedStamp::class)) {
+            $isSameTransport = \in_array($amqpReceivedStamp->getQueueName(), $this->connection->getQueueNames(), true);
+            $routingKey = $amqpStamp?->getRoutingKey();
+            $hasExpiration = isset($amqpStamp?->getAttributes()['expiration']);
+
             $amqpStamp = AmqpStamp::createFromAmqpEnvelope(
                 $amqpReceivedStamp->getAmqpEnvelope(),
                 $amqpStamp,
-                $envelope->last(RedeliveryStamp::class) && !$envelope->last(SentToFailureTransportStamp::class) ? $amqpReceivedStamp->getQueueName() : null
+                $isSameTransport && $envelope->last(RedeliveryStamp::class) && !$envelope->last(SentToFailureTransportStamp::class) ? $amqpReceivedStamp->getQueueName() : null
             );
+
+            if (!$isSameTransport) {
+                $attributes = $amqpStamp->getAttributes();
+                if (!$hasExpiration) {
+                    unset($attributes['expiration']);
+                }
+                $amqpStamp = new AmqpStamp($routingKey, $amqpStamp->getFlags(), $attributes);
+            }
         }
 
-        try {
-            $this->connection->publish(
-                $encodedMessage['body'],
-                $encodedMessage['headers'] ?? [],
-                $delay,
-                $amqpStamp
-            );
-        } catch (\AMQPException $e) {
-            throw new TransportException($e->getMessage(), 0, $e);
-        }
-
-        return $envelope;
+        return [$envelope, [$encodedMessage['body'], $encodedMessage['headers'] ?? [], $delay, $amqpStamp]];
     }
 }

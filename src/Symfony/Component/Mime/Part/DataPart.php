@@ -44,9 +44,14 @@ class DataPart extends TextPart
         $this->setDisposition('attachment');
     }
 
-    public static function fromPath(string $path, ?string $name = null, ?string $contentType = null): self
+    /**
+     * @param string|null $encoding The Content-Transfer-Encoding of the part, "base64" or "8bit" in a FormDataPart when null
+     */
+    public static function fromPath(string $path, ?string $name = null, ?string $contentType = null/* , ?string $encoding = null */): self
     {
-        return new self(new File($path), $name, $contentType);
+        $encoding = 3 < \func_num_args() ? func_get_arg(3) : null;
+
+        return new self(new File($path), $name, $contentType, $encoding);
     }
 
     /**
@@ -143,9 +148,9 @@ class DataPart extends TextPart
 
     public function __unserialize(array $data): void
     {
-        if (($data['filename'] ?? $data["\0".self::class."\0filename"] ?? null) instanceof \Stringable
-            || ($data['mediaType'] ?? $data["\0".self::class."\0mediaType"] ?? null) instanceof \Stringable
-            || ($data['cid'] ?? $data["\0".self::class."\0cid"] ?? null) instanceof \Stringable
+        if (!\is_string($data['filename'] ?? $data["\0".self::class."\0filename"] ?? '')
+            || !\is_string($data['mediaType'] ?? $data["\0".self::class."\0mediaType"] ?? null)
+            || !\is_string($data['cid'] ?? $data["\0".self::class."\0cid"] ?? '')
         ) {
             throw new \BadMethodCallException('Cannot unserialize '.self::class);
         }

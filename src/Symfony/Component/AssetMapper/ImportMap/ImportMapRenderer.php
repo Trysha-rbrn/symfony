@@ -13,6 +13,7 @@ namespace Symfony\Component\AssetMapper\ImportMap;
 
 use Psr\Link\EvolvableLinkProviderInterface;
 use Symfony\Component\Asset\Packages;
+use Symfony\Component\Console\Helper\CommandInvocation;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\RequestStack;
 use Symfony\Component\WebLink\EventListener\AddLinkHeaderListener;
@@ -34,6 +35,8 @@ class ImportMapRenderer
     private const LOADER_JSON = 'export default (async()=>await(await fetch(`%s`)).json())()';
     private const LOADER_CSS = 'document.head.appendChild(Object.assign(document.createElement(`link`),{rel:`stylesheet`,href:`%s`}))';
     private const LOADER_CSS_WITH_INTEGRITY = 'document.head.appendChild(Object.assign(document.createElement(`link`),{rel:`stylesheet`,href:`%s`,integrity:`%s`}))';
+
+    private array $rendered = [];
 
     public function __construct(
         private readonly ImportMapGenerator $importMapGenerator,
@@ -103,6 +106,18 @@ class ImportMapRenderer
             }
         }
 
+        // the HTML only depends on these values, so it can be reused when they did not change
+        $inputs = [$entryPoint, $attributes, $importMap, $integrity, $modulePreloads, $webLinks, $styleIntegrity, $polyfillPath, $polyfillIntegrity];
+        $renderKey = implode("\n", $entryPoint);
+
+        if (($this->rendered[$renderKey][0] ?? null) === $inputs) {
+            if (class_exists(AddLinkHeaderListener::class) && $request = $this->requestStack?->getCurrentRequest()) {
+                $this->addWebLinkPreloads($request, $webLinks);
+            }
+
+            return $this->rendered[$renderKey][1];
+        }
+
         $output = '';
         foreach ($webLinks as $url => $as) {
             if ('style' === $as) {
@@ -130,7 +145,9 @@ class ImportMapRenderer
 
         if (false !== $this->polyfillImportName && null === $polyfillPath) {
             if ('es-module-shims' !== $this->polyfillImportName) {
-                throw new \InvalidArgumentException(\sprintf('The JavaScript module polyfill was not found in your import map. Either disable the polyfill or run "php bin/console importmap:require "%s"" to install it.', $this->polyfillImportName));
+                $command = class_exists(CommandInvocation::class) ? CommandInvocation::format('importmap:require', 'bin/console') : 'importmap:require';
+
+                throw new \InvalidArgumentException(\sprintf('The JavaScript module polyfill was not found in your import map. Either disable the polyfill or run "%s "%s"" to install it.', $command, $this->polyfillImportName));
             }
 
             // a fallback for the default polyfill in case it's not in the importmap
@@ -187,6 +204,8 @@ class ImportMapRenderer
             }
             $output .= '</script>';
         }
+
+        $this->rendered[$renderKey] = [$inputs, $output];
 
         return $output;
     }

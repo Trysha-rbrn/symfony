@@ -12,7 +12,7 @@
 namespace Symfony\Component\Messenger\Attribute;
 
 /**
- * Service tag to autoconfigure message handlers.
+ * Registers the class or the method as a message handler.
  *
  * @author Alireza Mirsepassi <alirezamirsepassi@gmail.com>
  */
@@ -41,12 +41,13 @@ class AsMessageHandler
         public ?string $method = null,
 
         /**
-         * Priority of this handler when multiple handlers can process the same message.
+         * Priority of this handler when multiple handlers can process the same message; null lets the before/after constraints decide where it goes.
          */
-        public int $priority = 0,
+        public ?int $priority = null,
 
         /**
-         * Whether messages should be signed when sent on a transport.
+         * Whether the handler requires a verified signature for the messages received from a transport.
+         * Such messages should come from transports that sign every message.
          */
         public bool $sign = false,
 
@@ -55,6 +56,16 @@ class AsMessageHandler
          * The handler then only receives messages from that transport, as with $fromTransport.
          */
         public ?string $transport = null,
+
+        /**
+         * Handlers this one runs before, as service ids, classes or service::method.
+         */
+        public string|array|null $before = null,
+
+        /**
+         * Handlers this one runs after, as service ids, classes or service::method.
+         */
+        public string|array|null $after = null,
     ) {
     }
 }

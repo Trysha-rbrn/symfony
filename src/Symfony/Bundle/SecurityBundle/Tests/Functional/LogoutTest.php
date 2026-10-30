@@ -53,7 +53,7 @@ class LogoutTest extends AbstractWebTestCase
         $client = $this->createClient(['test_case' => 'Logout', 'root_config' => 'config_cookie_clearing.yml']);
 
         $cookieJar = $client->getCookieJar();
-        $cookieJar->set(new Cookie('flavor', 'chocolate', strtotime('+1 day'), null, 'somedomain'));
+        $cookieJar->set(new Cookie('flavor', 'chocolate', strtotime('+1 day'), null, 'localhost'));
 
         $client->request('POST', '/login', ['_username' => 'johannes', '_password' => 'test']);
         $client->request('GET', '/logout');
@@ -112,6 +112,18 @@ class LogoutTest extends AbstractWebTestCase
 
         $crawler = $client->request('GET', '/logout-form');
         $client->submit($crawler->selectButton('logout')->form());
+
+        $this->assertRedirect($client->getResponse(), '/');
+    }
+
+    public function testTheLogoutButtonPostsAFormTheListenerAccepts()
+    {
+        $client = $this->createAuthenticatedClient();
+
+        $crawler = $client->request('GET', '/logout-button');
+        $this->assertSame('csrf-protection', $crawler->filter('input[name="_csrf_token"]')->attr('data-controller'));
+
+        $client->submit($crawler->selectButton('Log out')->form());
 
         $this->assertRedirect($client->getResponse(), '/');
     }

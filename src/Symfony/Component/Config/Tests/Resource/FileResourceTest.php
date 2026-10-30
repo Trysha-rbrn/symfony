@@ -11,6 +11,7 @@
 
 namespace Symfony\Component\Config\Tests\Resource;
 
+use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Config\Resource\FileResource;
 
@@ -58,6 +59,7 @@ class FileResourceTest extends TestCase
         new FileResource('/____foo/foobar'.random_int(1, 999999));
     }
 
+    #[Group('time-sensitive')]
     public function testIsFresh()
     {
         $this->assertTrue($this->resource->isFresh($this->time), '->isFresh() returns true if the resource has not changed in same second');
@@ -100,6 +102,21 @@ class FileResourceTest extends TestCase
         unserialize(serialize($this->resource));
 
         $this->assertSame(realpath($this->file), $this->resource->getResource());
+    }
+
+    public function testSerializedFormDoesNotDependOnModificationTimeWhenSourceDateEpochIsSet()
+    {
+        $_SERVER['SOURCE_DATE_EPOCH'] = '1700000000';
+
+        try {
+            $this->touch($this->time - 10);
+            $serialized = serialize(new FileResource($this->file));
+            $this->touch($this->time);
+
+            $this->assertSame($serialized, serialize(new FileResource($this->file)));
+        } finally {
+            unset($_SERVER['SOURCE_DATE_EPOCH']);
+        }
     }
 
     private function touch(int $time): void

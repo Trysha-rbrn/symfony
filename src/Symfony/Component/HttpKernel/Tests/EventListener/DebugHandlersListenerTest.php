@@ -12,6 +12,7 @@
 namespace Symfony\Component\HttpKernel\Tests\EventListener;
 
 use PHPUnit\Framework\TestCase;
+use Psr\Log\NullLogger;
 use Symfony\Component\Console\Application;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\ConsoleEvents;
@@ -24,6 +25,7 @@ use Symfony\Component\EventDispatcher\EventDispatcher;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpKernel\Event\KernelEvent;
 use Symfony\Component\HttpKernel\EventListener\DebugHandlersListener;
+use Symfony\Component\HttpKernel\HttpKernel;
 use Symfony\Component\HttpKernel\HttpKernelInterface;
 use Symfony\Component\HttpKernel\KernelEvents;
 
@@ -79,6 +81,99 @@ class DebugHandlersListenerTest extends TestCase
         }
 
         $this->assertNull($h);
+    }
+
+    public function testUncaughtExceptionLoggersAreDisabledOncePerErrorHandler()
+    {
+        $listener = new DebugHandlersListener(null);
+        $event = new KernelEvent($this->createStub(HttpKernel::class), Request::create('/'), HttpKernelInterface::MAIN_REQUEST);
+        $eHandler = new class extends ErrorHandler {
+            public int $setLoggersCalls = 0;
+
+            public function setLoggers(array $loggers): array
+            {
+                ++$this->setLoggersCalls;
+
+                return parent::setLoggers($loggers);
+            }
+        };
+        $eHandler->setDefaultLogger(new NullLogger());
+        $otherHandler = new ErrorHandler();
+        $otherHandler->setDefaultLogger(new NullLogger());
+
+        set_exception_handler([$eHandler, 'handleException']);
+        try {
+            $listener->configure($event);
+            $setLoggersCalls = $eHandler->setLoggersCalls;
+            $listener->configure($event);
+        } finally {
+            restore_exception_handler();
+        }
+
+        $this->assertSame($setLoggersCalls, $eHandler->setLoggersCalls);
+        $this->assertNull($eHandler->setLoggers([])[\E_ERROR][0]);
+
+        set_exception_handler([$otherHandler, 'handleException']);
+        try {
+            $listener->configure($event);
+        } finally {
+            restore_exception_handler();
+        }
+
+        $this->assertNull($otherHandler->setLoggers([])[\E_ERROR][0]);
+    }
+
+    public function testResetRestoresTheExceptionHandlerReplacedForTheMainRequest()
+    {
+        $listener = new DebugHandlersListener(null);
+        $kernel = $this->createStub(HttpKernel::class);
+        $request = Request::create('/');
+        $requestRef = \WeakReference::create($request);
+        $eHandler = new ErrorHandler();
+        $previous = static fn () => null;
+        $eHandler->setExceptionHandler($previous);
+        $getExceptionHandler = static function () use ($eHandler) {
+            $handler = $eHandler->setExceptionHandler(null);
+            $eHandler->setExceptionHandler($handler);
+
+            return $handler;
+        };
+
+        set_exception_handler([$eHandler, 'handleException']);
+        try {
+            $listener->configure(new KernelEvent($kernel, Request::create('/'), HttpKernelInterface::MAIN_REQUEST));
+            $listener->configure(new KernelEvent($kernel, $request, HttpKernelInterface::MAIN_REQUEST));
+        } finally {
+            restore_exception_handler();
+        }
+        unset($request);
+
+        $this->assertNotSame($previous, $getExceptionHandler());
+        $this->assertNotNull($requestRef->get());
+
+        $listener->reset();
+
+        $this->assertSame($previous, $getExceptionHandler());
+        $this->assertNull($requestRef->get());
+    }
+
+    public function testResetKeepsAnExceptionHandlerSetAfterConfiguring()
+    {
+        $listener = new DebugHandlersListener(null);
+        $eHandler = new ErrorHandler();
+
+        set_exception_handler([$eHandler, 'handleException']);
+        try {
+            $listener->configure(new KernelEvent($this->createStub(HttpKernel::class), Request::create('/'), HttpKernelInterface::MAIN_REQUEST));
+        } finally {
+            restore_exception_handler();
+        }
+
+        $userHandler = static fn () => null;
+        $eHandler->setExceptionHandler($userHandler);
+        $listener->reset();
+
+        $this->assertSame($userHandler, $eHandler->setExceptionHandler(null));
     }
 
     public function testConsoleEvent()

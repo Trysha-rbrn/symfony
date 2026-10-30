@@ -164,11 +164,244 @@ class JsonSchemaDumperTest extends TestCase
         $child->setRequired(true);
         $root = new ArrayNode('root');
         $root->addChild($child);
-        yield [$root, [
+        yield 'a required child can come from another file' => [$root, [
             '$ref' => '#/$defs/types/object',
             'properties' => ['node' => ['$ref' => '#/$defs/types/boolean']],
-            'required' => ['node'],
             'additionalProperties' => false,
+        ]];
+
+        $list = (new ArrayNodeDefinition('list'))
+            ->arrayPrototype()
+                ->children()
+                    ->booleanNode('node')->isRequired()->end()
+                ->end()
+            ->end()
+            ->getNode();
+        yield 'a required child is required in the items of a list' => [$list, [
+            '$ref' => '#/$defs/types/array_null',
+            'items' => [
+                '$ref' => '#/$defs/types/object_null',
+                'properties' => ['node' => ['$ref' => '#/$defs/types/boolean']],
+                'required' => ['node'],
+                'additionalProperties' => false,
+            ],
+        ]];
+
+        $shortcut = (new ArrayNodeDefinition('node'))
+            ->beforeNormalization()
+                ->ifTrue(static fn ($v) => \is_array($v) && !isset($v['connections']))
+                ->then(static fn ($v) => ['connections' => [$v]])
+            ->end()
+            ->children()
+                ->variableNode('connections')->end()
+            ->end()
+            ->getNode();
+        yield 'a node normalized from any value accepts any value' => [$shortcut, ['$ref' => '#/$defs/types/variable']];
+
+        $connections = (new ArrayNodeDefinition('connections'))
+            ->useAttributeAsKey('name')
+            ->acceptElementsAtParentLevel()
+            ->prototype('array')
+                ->children()
+                    ->scalarNode('driver')->end()
+                ->end()
+            ->end();
+        $elementsAtParentLevel = (new ArrayNodeDefinition('node'))
+            ->beforeNormalization()
+                ->ifTrue(static fn ($v) => \is_array($v) && !isset($v['connections']))
+                ->then(static fn ($v) => ['connections' => [$v]])
+            ->end()
+            ->children()
+                ->scalarNode('default_connection')->end()
+            ->end()
+            ->append($connections)
+            ->getNode();
+        yield 'the elements of a child declared as accepted at the parent level are described' => [$elementsAtParentLevel, [
+            'anyOf' => [
+                [
+                    '$ref' => '#/$defs/types/object_null',
+                    'properties' => [
+                        'default_connection' => ['$ref' => '#/$defs/types/scalar'],
+                        'connections' => [
+                            '$ref' => '#/$defs/types/object_null',
+                            'additionalProperties' => [
+                                '$ref' => '#/$defs/types/object_null',
+                                'properties' => ['driver' => ['$ref' => '#/$defs/types/scalar']],
+                                'additionalProperties' => false,
+                            ],
+                        ],
+                    ],
+                    'additionalProperties' => false,
+                ],
+                [
+                    '$ref' => '#/$defs/types/object_null',
+                    'properties' => [
+                        'default_connection' => ['$ref' => '#/$defs/types/scalar'],
+                        'driver' => ['$ref' => '#/$defs/types/scalar'],
+                    ],
+                    'additionalProperties' => false,
+                ],
+            ],
+        ]];
+
+        $connectionsWithKeyAttribute = (new ArrayNodeDefinition('connections'))
+            ->useAttributeAsKey('name')
+            ->acceptElementsAtParentLevel()
+            ->prototype('array')
+                ->children()
+                    ->scalarNode('name')->end()
+                    ->scalarNode('host')->end()
+                ->end()
+            ->end();
+        $keyAttributeAtParentLevel = (new ArrayNodeDefinition('node'))
+            ->beforeNormalization()
+                ->ifTrue(static fn ($v) => \is_array($v) && !isset($v['connections']))
+                ->then(static fn ($v) => ['connections' => [$v]])
+            ->end()
+            ->children()
+                ->scalarNode('default_connection')->end()
+            ->end()
+            ->append($connectionsWithKeyAttribute)
+            ->getNode();
+        yield 'the key attribute of the elements is not provided at the parent level' => [$keyAttributeAtParentLevel, [
+            'anyOf' => [
+                [
+                    '$ref' => '#/$defs/types/object_null',
+                    'properties' => [
+                        'default_connection' => ['$ref' => '#/$defs/types/scalar'],
+                        'connections' => [
+                            '$ref' => '#/$defs/types/object_null',
+                            'additionalProperties' => [
+                                '$ref' => '#/$defs/types/object_null',
+                                'properties' => [
+                                    'name' => ['$ref' => '#/$defs/types/scalar'],
+                                    'host' => ['$ref' => '#/$defs/types/scalar'],
+                                ],
+                                'additionalProperties' => false,
+                            ],
+                        ],
+                    ],
+                    'additionalProperties' => false,
+                ],
+                [
+                    '$ref' => '#/$defs/types/object_null',
+                    'properties' => [
+                        'default_connection' => ['$ref' => '#/$defs/types/scalar'],
+                        'host' => ['$ref' => '#/$defs/types/scalar'],
+                    ],
+                    'additionalProperties' => false,
+                ],
+            ],
+        ]];
+
+        $castToArray = (new ArrayNodeDefinition('node'))->beforeNormalization()->castToArray()->end()->scalarPrototype()->end()->getNode();
+        yield 'a list cast from any value accepts any value' => [$castToArray, ['$ref' => '#/$defs/types/variable']];
+
+        $remapped = (new ArrayNodeDefinition('node'))
+            ->fixXmlConfig('adapter')
+            ->fixXmlConfig('connection')
+            ->children()
+                ->arrayNode('adapters')->scalarPrototype()->end()->end()
+                ->arrayNode('connections')->useAttributeAsKey('name')->scalarPrototype()->end()->end()
+            ->end()
+            ->getNode();
+        yield 'the singular key of a remapped node is accepted' => [$remapped, [
+            '$ref' => '#/$defs/types/object_null',
+            'properties' => [
+                'adapters' => [
+                    '$ref' => '#/$defs/types/array_null',
+                    'items' => ['$ref' => '#/$defs/types/scalar'],
+                ],
+                'connections' => [
+                    '$ref' => '#/$defs/types/object_null',
+                    'additionalProperties' => ['$ref' => '#/$defs/types/scalar'],
+                ],
+            ],
+            'patternProperties' => [
+                '^adapter$' => ['anyOf' => [
+                    ['$ref' => '#/$defs/types/scalar'],
+                    [
+                        '$ref' => '#/$defs/types/array_null',
+                        'items' => ['$ref' => '#/$defs/types/scalar'],
+                    ],
+                ]],
+                '^connection$' => ['$ref' => '#/$defs/types/variable'],
+            ],
+            'additionalProperties' => false,
+        ]];
+
+        $wrapping = (new ArrayNodeDefinition('node'))
+            ->acceptAndWrap(['array'], 'connections')
+            ->children()
+                ->arrayNode('adapters', 'adapter')->scalarPrototype()->end()->end()
+                ->arrayNode('connections', 'connection')->useAttributeAsKey('name')->scalarPrototype()->end()->end()
+            ->end()
+            ->getNode();
+        $adapters = [
+            '$ref' => '#/$defs/types/array_null',
+            'items' => ['$ref' => '#/$defs/types/scalar'],
+        ];
+        yield 'an array that does not set the child declared by acceptAndWrap() goes into that child' => [$wrapping, [
+            'anyOf' => [
+                [
+                    '$ref' => '#/$defs/types/object_null',
+                    'properties' => [
+                        'adapters' => $adapters,
+                        'connections' => [
+                            '$ref' => '#/$defs/types/object_null',
+                            'additionalProperties' => ['$ref' => '#/$defs/types/scalar'],
+                        ],
+                    ],
+                    'patternProperties' => [
+                        '^adapter$' => ['anyOf' => [['$ref' => '#/$defs/types/scalar'], $adapters]],
+                        '^connection$' => ['$ref' => '#/$defs/types/variable'],
+                    ],
+                    'additionalProperties' => false,
+                ],
+                [
+                    '$ref' => '#/$defs/types/object_null',
+                    'properties' => ['adapters' => $adapters],
+                    'patternProperties' => [
+                        '^adapter$' => ['anyOf' => [['$ref' => '#/$defs/types/scalar'], $adapters]],
+                    ],
+                    'additionalProperties' => ['$ref' => '#/$defs/types/scalar'],
+                    'propertyNames' => ['not' => ['enum' => ['connections', 'connection']]],
+                ],
+            ],
+        ]];
+
+        $keyedList = (new ArrayNodeDefinition('node'))
+            ->acceptAndWrap(['array'], 'name')
+            ->requiresAtLeastOneElement()
+            ->arrayPrototype()
+                ->children()
+                    ->scalarNode('name')->isRequired()->end()
+                ->end()
+            ->end()
+            ->getNode();
+        $item = [
+            '$ref' => '#/$defs/types/object_null',
+            'properties' => ['name' => ['$ref' => '#/$defs/types/scalar']],
+            'additionalProperties' => false,
+        ];
+        yield 'a map given to a list declared by acceptAndWrap() puts its keys into the items' => [$keyedList, [
+            'anyOf' => [
+                [
+                    '$ref' => '#/$defs/types/array_null',
+                    'items' => [
+                        '$ref' => '#/$defs/types/object_null',
+                        'properties' => ['name' => ['$ref' => '#/$defs/types/scalar']],
+                        'required' => ['name'],
+                        'additionalProperties' => false,
+                    ],
+                    'minItems' => 1,
+                ],
+                [
+                    '$ref' => '#/$defs/types/object_null',
+                    'additionalProperties' => $item,
+                    'minProperties' => 1,
+                ],
+            ],
         ]];
 
         $child = new BooleanNode('node');
@@ -257,7 +490,6 @@ class JsonSchemaDumperTest extends TestCase
                             'name' => ['$ref' => '#/$defs/types/string_null'],
                             'price' => ['$ref' => '#/$defs/types/number'],
                         ],
-                        'required' => ['price'],
                         'additionalProperties' => false,
                     ],
                     [
@@ -328,6 +560,10 @@ class JsonSchemaDumperTest extends TestCase
         $this->assertSame(['type' => 'string'], $types['string']);
         $this->assertSame(['type' => 'boolean'], $types['boolean']);
         $this->assertSame(['type' => 'integer'], $types['integer']);
+
+        // PHP decodes an empty map and an empty list to the same array
+        $this->assertSame(['type' => ['object', 'array'], 'maxItems' => 0], $types['object']);
+        $this->assertSame(['type' => ['object', 'array', 'null'], 'maxItems' => 0], $types['object_null']);
 
         // With parameterSchemas: anyOf with param
         $param = self::param();

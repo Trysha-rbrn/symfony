@@ -17,11 +17,15 @@ use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Event\MessageSentToTransportsEvent;
 use Symfony\Component\Messenger\Event\SendMessageToTransportsEvent;
 use Symfony\Component\Messenger\Exception\NoSenderForMessageException;
+use Symfony\Component\Messenger\Stamp\BatchStamp;
 use Symfony\Component\Messenger\Stamp\FlushBatchHandlersStamp;
 use Symfony\Component\Messenger\Stamp\OutboxStamp;
 use Symfony\Component\Messenger\Stamp\ReceivedStamp;
+use Symfony\Component\Messenger\Stamp\RedispatchStamp;
 use Symfony\Component\Messenger\Stamp\SentStamp;
 use Symfony\Component\Messenger\Stamp\TransportNamesStamp;
+use Symfony\Component\Messenger\Stamp\TrustStamp;
+use Symfony\Component\Messenger\Transport\Sender\OutboxSender;
 use Symfony\Component\Messenger\Transport\Sender\SendersLocatorInterface;
 
 /**
@@ -47,11 +51,10 @@ class SendMessageMiddleware implements MiddlewareInterface
 
         $relayStamp = null;
 
-        if (!$receivedStamp = $envelope->last(ReceivedStamp::class)) {
+        if (!($receivedStamp = $envelope->last(ReceivedStamp::class)) || (null !== $envelope->last(RedispatchStamp::class) && $envelope->last(TrustStamp::class)?->isTrusted())) {
             $senders = $this->sendersLocator->getSenders($envelope);
-        } elseif (($relayStamp = $envelope->last(OutboxStamp::class)) && $relayStamp->getTransportName() !== $receivedStamp->getTransportName()) {
+        } elseif (($relayStamp = $envelope->last(OutboxStamp::class)) && $relayStamp->getTransportName() !== $receivedStamp->getTransportName() && $senders = $this->getOutboxSenders($envelope, $relayStamp, $context)) {
             $this->logger?->info('Forwarding message {class} from the outbox to {alias}', $context + ['alias' => $relayStamp->getTransportName()]);
-            $senders = $this->sendersLocator->getSenders($envelope->with(new TransportNamesStamp($relayStamp->getTransportName())));
         } else {
             // it's a received message, do not send it back
             if (!$envelope->all(FlushBatchHandlersStamp::class)) {
@@ -71,6 +74,9 @@ class SendMessageMiddleware implements MiddlewareInterface
             return $stack->next()->handle($envelope, $stack);
         }
 
+        // the redispatch is done once sent: transports that keep the envelope as is, like the sync one, must not trigger it again
+        $envelope = $envelope->withoutAll(RedispatchStamp::class);
+
         if (null !== $this->eventDispatcher) {
             $event = new SendMessageToTransportsEvent($envelope, $senders);
             $this->eventDispatcher->dispatch($event);
@@ -82,6 +88,15 @@ class SendMessageMiddleware implements MiddlewareInterface
             }
         }
 
+        if ($envelope->last(BatchStamp::class)?->defer($envelope, $senders, $this->eventDispatcher)) {
+            foreach ($senders as $alias => $sender) {
+                $this->logger?->info('Batching message {class} with {alias} sender using {sender}', $context + ['alias' => $alias, 'sender' => $sender::class]);
+                $envelope = $envelope->with(new SentStamp($sender::class, \is_string($alias) ? $alias : null));
+            }
+
+            return $envelope;
+        }
+
         foreach ($senders as $alias => $sender) {
             $this->logger?->info('Sending message {class} with {alias} sender using {sender}', $context + ['alias' => $alias, 'sender' => $sender::class]);
             $envelope = $sender->send($envelope->with(new SentStamp($sender::class, \is_string($alias) ? $alias : null)));
@@ -91,5 +106,20 @@ class SendMessageMiddleware implements MiddlewareInterface
 
         // message should only be sent and not be handled by the next middleware
         return $envelope;
+    }
+
+    private function getOutboxSenders(Envelope $envelope, OutboxStamp $relayStamp, array $context): array
+    {
+        $senders = $this->sendersLocator->getSenders($envelope->with(new TransportNamesStamp($relayStamp->getTransportName())));
+        $senders = \is_array($senders) ? $senders : iterator_to_array($senders);
+
+        // any transport can receive an OutboxStamp: only the outbox of the transport it names gets the message forwarded
+        if (!$senders || array_any($senders, static fn ($sender) => !$sender instanceof OutboxSender || !$sender->canForward($envelope))) {
+            $this->logger?->warning('Not forwarding message {class} to {alias}: it was not received from the outbox of that transport', $context + ['alias' => $relayStamp->getTransportName()]);
+
+            return [];
+        }
+
+        return $senders;
     }
 }

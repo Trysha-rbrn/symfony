@@ -12,7 +12,9 @@
 namespace Symfony\Component\Messenger\Tests;
 
 use PHPUnit\Framework\TestCase;
+use Symfony\Component\Messenger\BatchDispatcher;
 use Symfony\Component\Messenger\Envelope;
+use Symfony\Component\Messenger\MessageBus;
 use Symfony\Component\Messenger\MessageBusInterface;
 use Symfony\Component\Messenger\Stamp\DelayStamp;
 use Symfony\Component\Messenger\Stamp\HandledStamp;
@@ -71,6 +73,42 @@ class TraceableMessageBusTest extends TestCase
                 'line' => (new \ReflectionMethod(TestTracesWithHandleTraitAction::class, '__invoke'))->getStartLine() + 2,
             ],
         ], $actualTracedMessage);
+    }
+
+    public function testItTracesTheCallerOfTheBatchDispatcher()
+    {
+        $message = new DummyMessage('Hello');
+
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->expects($this->once())->method('dispatch')->willReturn(new Envelope($message));
+
+        $traceableBus = new TraceableMessageBus($bus);
+        $line = __LINE__ + 1;
+        (new BatchDispatcher($traceableBus))->dispatch([$message]);
+
+        $this->assertSame([
+            'name' => 'TraceableMessageBusTest.php',
+            'file' => __FILE__,
+            'line' => $line,
+        ], $traceableBus->getDispatchedMessages()[0]['caller']);
+    }
+
+    public function testItTracesTheCallerOfTheBatchDispatcherBus()
+    {
+        $message = new DummyMessage('Hello');
+
+        $bus = $this->createMock(MessageBusInterface::class);
+        $bus->expects($this->once())->method('dispatch')->willReturn(new Envelope($message));
+
+        $traceableBus = new TraceableMessageBus($bus);
+        $line = __LINE__ + 1;
+        (new BatchDispatcher($traceableBus))->run(static fn (MessageBusInterface $bus) => $bus->dispatch($message));
+
+        $this->assertSame([
+            'name' => 'TraceableMessageBusTest.php',
+            'file' => __FILE__,
+            'line' => $line,
+        ], $traceableBus->getDispatchedMessages()[0]['caller']);
     }
 
     public function testItTracesDispatchWithEnvelope()
@@ -173,5 +211,44 @@ class TraceableMessageBusTest extends TestCase
         $this->expectExceptionObject($exception);
 
         array_map($traceableBus->dispatch(...), [$message]);
+    }
+
+    public function testItTracesTheCallerWhenDispatchIsCalledFromAnInternalFunction()
+    {
+        $traceableBus = new TraceableMessageBus(new MessageBus());
+
+        $line = __LINE__ + 1;
+        array_map($traceableBus->dispatch(...), [new DummyMessage('Hello')]);
+
+        $this->assertSame([
+            'name' => 'TraceableMessageBusTest.php',
+            'file' => __FILE__,
+            'line' => $line,
+        ], $traceableBus->getDispatchedMessages()[0]['caller']);
+    }
+
+    public function testItTracesTheCallerWhenADecoratingBusIsCalledFromAnInternalFunction()
+    {
+        $traceableBus = new TraceableMessageBus(new MessageBus());
+        $bus = new class($traceableBus) implements MessageBusInterface {
+            public function __construct(
+                private MessageBusInterface $bus,
+            ) {
+            }
+
+            public function dispatch(object $message, array $stamps = []): Envelope
+            {
+                return $this->bus->dispatch($message, $stamps);
+            }
+        };
+
+        $line = __LINE__ + 1;
+        array_map($bus->dispatch(...), [new DummyMessage('Hello')]);
+
+        $this->assertSame([
+            'name' => 'TraceableMessageBusTest.php',
+            'file' => __FILE__,
+            'line' => $line,
+        ], $traceableBus->getDispatchedMessages()[0]['caller']);
     }
 }

@@ -11,6 +11,7 @@
 
 namespace Symfony\Component\Console\Tests;
 
+use PHPUnit\Framework\Attributes\BackupGlobals;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\RequiresPhpExtension;
@@ -89,6 +90,7 @@ class ApplicationTest extends TestCase
 
             // We reset all signals to their default value to avoid side effects
             pcntl_signal(\SIGINT, \SIG_DFL);
+            pcntl_signal(\SIGQUIT, \SIG_DFL);
             pcntl_signal(\SIGTERM, \SIG_DFL);
             pcntl_signal(\SIGUSR1, \SIG_DFL);
             pcntl_signal(\SIGUSR2, \SIG_DFL);
@@ -133,7 +135,7 @@ class ApplicationTest extends TestCase
     protected function ensureStaticCommandHelp(Application $application)
     {
         foreach ($application->all() as $command) {
-            $command->setHelp(str_replace('%command.full_name%', 'app/console %command.name%', $command->getHelp()));
+            $command->setHelp(str_replace(['%command.full_name%', '%command.invocation%'], 'app/console %command.name%', $command->getHelp()));
         }
     }
 
@@ -1038,6 +1040,35 @@ class ApplicationTest extends TestCase
         $this->assertFalse($application->isAutoExitEnabled());
     }
 
+    #[BackupGlobals(true)]
+    #[TestWith([null, 'composer', false])]
+    #[TestWith(['', 'composer', false])]
+    #[TestWith(['symfony', 'symfony composer', false])]
+    #[TestWith(['symfony', 'symfony composer', true])]
+    #[TestWith(['symfony-local', 'symfony-local composer', false])]
+    #[TestWith(['symfony-local', 'symfony-local composer', true])]
+    #[TestWith(['0', '0 composer', false])]
+    #[TestWith(['symfony', 'symfony composer', false, 32])]
+    #[TestWith(['symfony', 'symfony composer', true, 32])]
+    public function testRenderExceptionAdaptsComposerSuggestions(?string $binary, string $composer, bool $decorated, int $width = 160)
+    {
+        $_SERVER['SYMFONY_CLI_BINARY_NAME'] = $binary;
+        putenv('COLUMNS='.$width);
+        $previous = new \RuntimeException('Try running "composer require symfony/cache".');
+        $exception = new \RuntimeException('Try running "composer require symfony/http-client". Already suggested: "symfony composer require symfony/yaml".', 0, $previous);
+        $output = new BufferedOutput(Output::VERBOSITY_NORMAL, $decorated);
+
+        (new Application())->renderThrowable($exception, $output);
+        $display = preg_replace('/\x1b\[[0-9;]*m/', '', $output->fetch());
+        $display = preg_replace('/\s+/', ' ', $display);
+
+        $this->assertStringContainsString('Try running "'.$composer.' require symfony/http-client".', $display);
+        $this->assertStringContainsString('Try running "'.$composer.' require symfony/cache".', $display);
+        $this->assertStringContainsString('Already suggested: "symfony composer require symfony/yaml".', $display);
+        $this->assertSame('Try running "composer require symfony/http-client". Already suggested: "symfony composer require symfony/yaml".', $exception->getMessage());
+        $this->assertSame('Try running "composer require symfony/cache".', $previous->getMessage());
+    }
+
     public function testRenderException()
     {
         $application = new Application();
@@ -1142,6 +1173,55 @@ class ApplicationTest extends TestCase
 
         $tester->run(['command' => 'foo'], ['decorated' => false]);
         $this->assertStringMatchesFormatFile(self::$fixturesPath.'/application_renderexception_linebreaks.txt', $tester->getDisplay(true), '->renderException() keep multiple line breaks');
+    }
+
+    #[DataProvider('provideWordWrappedExceptionMessages')]
+    public function testRenderExceptionWrapsLinesOnWordBoundaries(string $message, array $expectedBlock)
+    {
+        $application = new Application();
+        $application->setAutoExit(false);
+        putenv('COLUMNS=33');
+        $application->register('foo')->setCode(static function () use ($message) {
+            throw new \Exception($message);
+        });
+        $tester = new ApplicationTester($application);
+
+        $tester->run(['command' => 'foo'], ['decorated' => false, 'capture_stderr_separately' => true]);
+        $this->assertStringMatchesFormat("\nIn ApplicationTest.php line %d:\n".implode("\n", $expectedBlock)."\n\nfoo\n\n", $tester->getErrorOutput(true));
+    }
+
+    public static function provideWordWrappedExceptionMessages(): iterable
+    {
+        yield 'words crossing the width' => ['The value "bogus" is not valid for the "status" option.', [
+            '                                ',
+            '  The value "bogus" is not      ',
+            '  valid for the "status"        ',
+            '  option.                       ',
+            '                                ',
+        ]];
+
+        yield 'word longer than the width' => ['Cannot read /a/very/long/path/to/some/file.yaml now', [
+            '                                ',
+            '  Cannot read                   ',
+            '  /a/very/long/path/to/some/fi  ',
+            '  le.yaml now                   ',
+            '                                ',
+        ]];
+
+        yield 'spaces around the breaks' => ['Errors:'.str_repeat(' ', 30)."\n  The value \"bogus\" is not      valid", [
+            '                                ',
+            '  Errors:                       ',
+            '    The value "bogus" is not    ',
+            '  valid                         ',
+            '                                ',
+        ]];
+
+        yield 'wide characters' => ['The file 設定ファイル.yaml cannot be read', [
+            '                                ',
+            '  The file 設定ファイル.yaml    ',
+            '  cannot be read                ',
+            '                                ',
+        ]];
     }
 
     #[Group('transient-on-windows')]
@@ -2253,6 +2333,112 @@ class ApplicationTest extends TestCase
     }
 
     #[RequiresPhpExtension('pcntl')]
+    public function testSignalInterruptingTheAutoloadOfAClassNeededByALazyListener()
+    {
+        $class = 'Symfony\\Component\\Console\\Tests\\AutoloadedDuringSignal'.bin2hex(random_bytes(4));
+        $commandRunning = false;
+        $autoloader = static function (string $name) use ($class, &$commandRunning) {
+            if ($class !== $name) {
+                return;
+            }
+            if ($commandRunning) {
+                // the async handler runs before this autoload completes
+                posix_kill(posix_getpid(), \SIGUSR1);
+            }
+            eval('namespace Symfony\\Component\\Console\\Tests; final class '.substr($class, strrpos($class, '\\') + 1).' {}');
+        };
+
+        $listener = new class {
+            public bool $called = false;
+
+            public function onSignal(ConsoleSignalEvent $event): void
+            {
+                $event->abortExit();
+                $this->called = true;
+            }
+        };
+        $dispatcher = new EventDispatcher();
+        $dispatcher->addListener(ConsoleEvents::SIGNAL, [static function () use ($class, $listener) {
+            new $class();
+
+            return $listener;
+        }, 'onSignal']);
+
+        $command = new Command('signal');
+        $command->setCode(static function () use ($class, &$commandRunning) {
+            $commandRunning = true;
+            new $class();
+            posix_kill(posix_getpid(), \SIGUSR1);
+
+            return 0;
+        });
+
+        $application = $this->createSignalableApplication($command, $dispatcher);
+        $application->setCatchExceptions(false);
+
+        spl_autoload_register($autoloader, true, true);
+        try {
+            $this->assertSame(0, $application->run(new ArrayInput(['signal'])));
+        } finally {
+            spl_autoload_unregister($autoloader);
+        }
+        $this->assertTrue($listener->called);
+    }
+
+    #[RequiresPhpExtension('pcntl')]
+    public function testAlarmInterruptingTheAutoloadOfAClassNeededByALazyListener()
+    {
+        $class = 'Symfony\\Component\\Console\\Tests\\AutoloadedDuringAlarm'.bin2hex(random_bytes(4));
+        $commandRunning = false;
+        $autoloader = static function (string $name) use ($class, &$commandRunning) {
+            if ($class !== $name) {
+                return;
+            }
+            if ($commandRunning) {
+                // the async handler runs before this autoload completes
+                posix_kill(posix_getpid(), \SIGALRM);
+            }
+            eval('namespace Symfony\\Component\\Console\\Tests; final class '.substr($class, strrpos($class, '\\') + 1).' {}');
+        };
+
+        $listener = new class {
+            public bool $called = false;
+
+            public function onAlarm(ConsoleAlarmEvent $event): void
+            {
+                $event->abortExit();
+                $this->called = true;
+            }
+        };
+        $dispatcher = new EventDispatcher();
+        $dispatcher->addListener(ConsoleAlarmEvent::class, [static function () use ($class, $listener) {
+            new $class();
+
+            return $listener;
+        }, 'onAlarm']);
+
+        $command = new Command('signal');
+        $command->setCode(static function () use ($class, &$commandRunning) {
+            $commandRunning = true;
+            new $class();
+            posix_kill(posix_getpid(), \SIGALRM);
+
+            return 0;
+        });
+
+        $application = $this->createSignalableApplication($command, $dispatcher);
+        $application->setCatchExceptions(false);
+
+        spl_autoload_register($autoloader, true, true);
+        try {
+            $this->assertSame(0, $application->run(new ArrayInput(['signal'])));
+        } finally {
+            spl_autoload_unregister($autoloader);
+        }
+        $this->assertTrue($listener->called);
+    }
+
+    #[RequiresPhpExtension('pcntl')]
     public function testSignalDispatchWithoutEventToDispatch()
     {
         $command = new SignableCommand();
@@ -2399,13 +2585,55 @@ class ApplicationTest extends TestCase
         $this->assertSame(51, $tester->run(['signal']));
         $expected = <<<EOTXT
             Still processing...
-            ["handling event",2,0]
+            ["handling event",2,130]
             ["exit code",2,125]
             Wrapping up, wait a sec...
 
             EOTXT;
         $this->assertSame($expected, $tester->getDisplay(true));
         $this->assertTrue($terminateEventDispatched);
+    }
+
+    #[RequiresPhpExtension('pcntl')]
+    #[DataProvider('provideSignalExitCodes')]
+    public function testSignalableCommandReceivesTheExitCodeOfTheSignal(string $signalName)
+    {
+        $signal = \constant($signalName);
+
+        foreach ([new EventDispatcher(), null] as $dispatcher) {
+            $command = new SignalExitCodeCommand($signal);
+
+            $application = new Application();
+            $application->setAutoExit(false);
+            if ($dispatcher) {
+                $application->setDispatcher($dispatcher);
+            }
+            $application->addCommand($command);
+            $application->run(new ArrayInput(['signal']));
+
+            $this->assertSame(128 + $signal, $command->previousExitCode);
+        }
+    }
+
+    #[RequiresPhpExtension('pcntl')]
+    #[DataProvider('provideSignalExitCodes')]
+    public function testSignalExitsWithTheExitCodeOfTheSignal(string $signalName)
+    {
+        $process = new Process([\PHP_BINARY, __DIR__.'/Fixtures/application_signal_exit_code.php', $signalName]);
+        $process->run();
+
+        $this->assertSame(128 + \constant($signalName), $process->getExitCode(), $process->getErrorOutput());
+        $this->assertStringNotContainsString('should not be displayed', $process->getOutput());
+    }
+
+    public static function provideSignalExitCodes(): iterable
+    {
+        yield 'SIGINT' => ['SIGINT'];
+        yield 'SIGQUIT' => ['SIGQUIT'];
+        yield 'SIGTERM' => ['SIGTERM'];
+        yield 'SIGUSR1' => ['SIGUSR1'];
+        yield 'SIGUSR2' => ['SIGUSR2'];
+        yield 'SIGALRM' => ['SIGALRM'];
     }
 
     #[Group('tty')]
@@ -2732,6 +2960,16 @@ class ApplicationTest extends TestCase
         $this->assertStringContainsString('Outer pre-run.Inner execute.Outer post-run.', $tester->getDisplay());
 
         $this->assertCount(0, $this->getHandlersForSignal($signalRegistry, \SIGUSR1), 'Registry must be empty after all commands are finished.');
+    }
+
+    #[RequiresPhpExtension('pcntl')]
+    public function testNestedApplicationLeavesTheExitToTheOuterApplication()
+    {
+        $process = new Process([\PHP_BINARY, __DIR__.'/Fixtures/application_nested_signal.php']);
+        $process->run();
+
+        $this->assertSame('Outer handled the signal. Inner done. Outer done.', $process->getOutput());
+        $this->assertSame(0, $process->getExitCode());
     }
 
     #[RequiresPhpExtension('pcntl')]
@@ -3094,6 +3332,31 @@ class TerminatableCommand extends BaseSignableCommand
     {
         $this->signaled = true;
         $this->signalHandlers[] = __CLASS__;
+
+        return false;
+    }
+}
+
+#[AsCommand(name: 'signal')]
+class SignalExitCodeCommand extends BaseSignableCommand
+{
+    public int|false|null $previousExitCode = null;
+
+    public function __construct(
+        private int $subscribedSignal,
+    ) {
+        parent::__construct(true, $subscribedSignal);
+    }
+
+    public function getSubscribedSignals(): array
+    {
+        return [$this->subscribedSignal];
+    }
+
+    public function handleSignal(int $signal, int|false $previousExitCode = 0): int|false
+    {
+        $this->signaled = true;
+        $this->previousExitCode = $previousExitCode;
 
         return false;
     }

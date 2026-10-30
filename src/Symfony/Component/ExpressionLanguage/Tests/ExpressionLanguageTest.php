@@ -12,12 +12,23 @@
 namespace Symfony\Component\ExpressionLanguage\Tests;
 
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\Group;
+use PHPUnit\Framework\Attributes\IgnoreDeprecations;
 use PHPUnit\Framework\TestCase;
 use Psr\Cache\CacheItemInterface;
 use Psr\Cache\CacheItemPoolInterface;
+use Symfony\Component\Cache\Adapter\ArrayAdapter;
+use Symfony\Component\Cache\Adapter\TraceableAdapter;
+use Symfony\Component\ExpressionLanguage\ConstantFunctionProvider;
+use Symfony\Component\ExpressionLanguage\Exception\DivisionByZeroError;
+use Symfony\Component\ExpressionLanguage\Exception\ExceptionInterface;
+use Symfony\Component\ExpressionLanguage\Exception\LogicException;
+use Symfony\Component\ExpressionLanguage\Exception\RuntimeException;
+use Symfony\Component\ExpressionLanguage\Exception\TypeError;
 use Symfony\Component\ExpressionLanguage\ExpressionFunction;
 use Symfony\Component\ExpressionLanguage\ExpressionLanguage;
 use Symfony\Component\ExpressionLanguage\ParsedExpression;
+use Symfony\Component\ExpressionLanguage\Parser;
 use Symfony\Component\ExpressionLanguage\SyntaxError;
 use Symfony\Component\ExpressionLanguage\Tests\Fixtures\FooBackedEnum;
 use Symfony\Component\ExpressionLanguage\Tests\Fixtures\FooEnum;
@@ -33,14 +44,14 @@ class ExpressionLanguageTest extends TestCase
         $expressionLanguage = new ExpressionLanguage($cacheMock);
 
         $cacheMock
-            ->expects($this->exactly(2))
+            ->expects($this->once())
             ->method('getItem')
             ->with('1%20%2B%201%2F%2F')
             ->willReturn($cacheItemMock)
         ;
 
         $cacheItemMock
-            ->expects($this->exactly(2))
+            ->expects($this->once())
             ->method('get')
             ->willReturnCallback(static function () use (&$savedParsedExpression) {
                 return $savedParsedExpression;
@@ -72,6 +83,27 @@ class ExpressionLanguageTest extends TestCase
         $this->assertSame($savedParsedExpression, $parsedExpression);
     }
 
+    public function testKeepsTheLastUsedParsedExpressionsInMemory()
+    {
+        $cache = new TraceableAdapter(new ArrayAdapter());
+        $expressionLanguage = new ExpressionLanguage($cache);
+
+        for ($i = 0; $i < 1024; ++$i) {
+            $expressionLanguage->parse((string) $i, []);
+        }
+
+        $expressionLanguage->parse('0', []);
+        $expressionLanguage->parse('1024', []);
+        $cache->clearCalls();
+
+        $expressionLanguage->parse('0', []);
+        $expressionLanguage->parse('1024', []);
+        $this->assertSame([], $cache->getCalls());
+
+        $expressionLanguage->parse('1', []);
+        $this->assertSame(['getItem'], array_column($cache->getCalls(), 'name'));
+    }
+
     #[DataProvider('basicPhpFunctionProvider')]
     public function testBasicPhpFunction($expression, $expected, $compiled)
     {
@@ -83,36 +115,57 @@ class ExpressionLanguageTest extends TestCase
     public static function basicPhpFunctionProvider()
     {
         return [
-            ['constant("PHP_VERSION")', \PHP_VERSION, '\constant("PHP_VERSION")'],
             ['min(1,2,3)', 1, '\min(1, 2, 3)'],
             ['max(1,2,3)', 3, '\max(1, 2, 3)'],
         ];
     }
 
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
+    public function testConstantFunction()
+    {
+        $this->expectUserDeprecationMessage('Since symfony/expression-language 8.2: Using the built-in "constant()" expression function is deprecated, register a "Symfony\Component\ExpressionLanguage\ConstantFunctionProvider" listing the allowed constants instead.');
+        $expressionLanguage = new ExpressionLanguage();
+        $this->assertSame(\PHP_VERSION, $expressionLanguage->evaluate('constant("PHP_VERSION")'));
+        $this->assertSame('\constant("PHP_VERSION")', $expressionLanguage->compile('constant("PHP_VERSION")'));
+    }
+
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
     public function testEnumFunctionWithConstantThrows()
     {
+        $this->expectUserDeprecationMessage('Since symfony/expression-language 8.2: Using the built-in "enum()" expression function is deprecated, register a "Symfony\Component\ExpressionLanguage\ConstantFunctionProvider" listing the allowed constants instead.');
         $this->expectException(\TypeError::class);
         $this->expectExceptionMessage('The string "PHP_VERSION" is not the name of a valid enum case.');
         $expressionLanguage = new ExpressionLanguage();
         $expressionLanguage->evaluate('enum("PHP_VERSION")');
     }
 
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
     public function testCompiledEnumFunctionWithConstantThrows()
     {
+        $this->expectUserDeprecationMessage('Since symfony/expression-language 8.2: Using the built-in "enum()" expression function is deprecated, register a "Symfony\Component\ExpressionLanguage\ConstantFunctionProvider" listing the allowed constants instead.');
         $this->expectException(\TypeError::class);
         $this->expectExceptionMessage('The string "PHP_VERSION" is not the name of a valid enum case.');
         $expressionLanguage = new ExpressionLanguage();
         eval($expressionLanguage->compile('enum("PHP_VERSION")').';');
     }
 
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
     public function testEnumFunction()
     {
+        $this->expectUserDeprecationMessage('Since symfony/expression-language 8.2: Using the built-in "enum()" expression function is deprecated, register a "Symfony\Component\ExpressionLanguage\ConstantFunctionProvider" listing the allowed constants instead.');
         $expressionLanguage = new ExpressionLanguage();
         $this->assertSame(FooEnum::Foo, $expressionLanguage->evaluate('enum("Symfony\\\\Component\\\\ExpressionLanguage\\\\Tests\\\\Fixtures\\\\FooEnum::Foo")'));
     }
 
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
     public function testCompiledEnumFunction()
     {
+        $this->expectUserDeprecationMessage('Since symfony/expression-language 8.2: Using the built-in "enum()" expression function is deprecated, register a "Symfony\Component\ExpressionLanguage\ConstantFunctionProvider" listing the allowed constants instead.');
         $result = null;
         $expressionLanguage = new ExpressionLanguage();
         eval(\sprintf('$result = %s;', $expressionLanguage->compile('enum("Symfony\\\\Component\\\\ExpressionLanguage\\\\Tests\\\\Fixtures\\\\FooEnum::Foo")')));
@@ -120,20 +173,60 @@ class ExpressionLanguageTest extends TestCase
         $this->assertSame(FooEnum::Foo, $result);
     }
 
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
     public function testBackedEnumFunction()
     {
+        $this->expectUserDeprecationMessage('Since symfony/expression-language 8.2: Using the built-in "enum()" expression function is deprecated, register a "Symfony\Component\ExpressionLanguage\ConstantFunctionProvider" listing the allowed constants instead.');
         $expressionLanguage = new ExpressionLanguage();
         $this->assertSame(FooBackedEnum::Bar, $expressionLanguage->evaluate('enum("Symfony\\\\Component\\\\ExpressionLanguage\\\\Tests\\\\Fixtures\\\\FooBackedEnum::Bar")'));
         $this->assertSame('Foo', $expressionLanguage->evaluate('enum("Symfony\\\\Component\\\\ExpressionLanguage\\\\Tests\\\\Fixtures\\\\FooBackedEnum::Bar").value'));
     }
 
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
     public function testCompiledEnumFunctionWithBackedEnum()
     {
+        $this->expectUserDeprecationMessage('Since symfony/expression-language 8.2: Using the built-in "enum()" expression function is deprecated, register a "Symfony\Component\ExpressionLanguage\ConstantFunctionProvider" listing the allowed constants instead.');
         $result = null;
         $expressionLanguage = new ExpressionLanguage();
         eval(\sprintf('$result = %s;', $expressionLanguage->compile('enum("Symfony\\\\Component\\\\ExpressionLanguage\\\\Tests\\\\Fixtures\\\\FooBackedEnum::Bar")')));
 
         $this->assertSame(FooBackedEnum::Bar, $result);
+    }
+
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
+    #[DataProvider('provideBuiltinConstantFunctions')]
+    public function testLintingBuiltinConstantFunctionsIsDeprecated(string $function)
+    {
+        $this->expectUserDeprecationMessage(\sprintf('Since symfony/expression-language 8.2: Using the built-in "%s()" expression function is deprecated, register a "Symfony\Component\ExpressionLanguage\ConstantFunctionProvider" listing the allowed constants instead.', $function));
+
+        (new ExpressionLanguage())->lint($function.'("PHP_VERSION")', []);
+    }
+
+    public static function provideBuiltinConstantFunctions(): iterable
+    {
+        yield ['constant'];
+        yield ['enum'];
+    }
+
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
+    public function testCompiledEnumFunctionInsideExpression()
+    {
+        $this->expectUserDeprecationMessage('Since symfony/expression-language 8.2: Using the built-in "enum()" expression function is deprecated, register a "Symfony\Component\ExpressionLanguage\ConstantFunctionProvider" listing the allowed constants instead.');
+
+        $expressionLanguage = new ExpressionLanguage();
+        $enum = 'enum("Symfony\\\\Component\\\\ExpressionLanguage\\\\Tests\\\\Fixtures\\\\FooEnum::Foo")';
+        $foo = null;
+        $v = 'bar';
+
+        $this->assertFalse(eval(\sprintf('return %s;', $expressionLanguage->compile($enum.' == foo', ['foo']))));
+        $this->assertFalse(eval(\sprintf('return %s;', $expressionLanguage->compile('foo == '.$enum, ['foo']))));
+        $this->assertSame('Foobar', eval(\sprintf('return %s;', $expressionLanguage->compile($enum.'.name ~ v', ['v']))));
+        $this->assertSame([FooEnum::Foo, 'bar'], eval(\sprintf('return %s;', $expressionLanguage->compile('['.$enum.', v]', ['v']))));
+        $this->assertSame('bar', $v);
     }
 
     #[DataProvider('providerTestCases')]
@@ -249,14 +342,14 @@ class ExpressionLanguageTest extends TestCase
         $savedParsedExpression = null;
 
         $cacheMock
-            ->expects($this->exactly(2))
+            ->expects($this->once())
             ->method('getItem')
             ->with('a%20%2B%20b%2F%2Fa%7CB%3Ab')
             ->willReturn($cacheItemMock)
         ;
 
         $cacheItemMock
-            ->expects($this->exactly(2))
+            ->expects($this->once())
             ->method('get')
             ->willReturnCallback(static function () use (&$savedParsedExpression) {
                 return $savedParsedExpression;
@@ -300,7 +393,7 @@ class ExpressionLanguageTest extends TestCase
     #[DataProvider('getRegisterCallbacks')]
     public function testRegisterAfterParse($registerCallback)
     {
-        $this->expectException(\LogicException::class);
+        $this->expectException(LogicException::class);
         $el = new ExpressionLanguage();
         $el->parse('1 + 1', []);
         $registerCallback($el);
@@ -309,7 +402,7 @@ class ExpressionLanguageTest extends TestCase
     #[DataProvider('getRegisterCallbacks')]
     public function testRegisterAfterEval($registerCallback)
     {
-        $this->expectException(\LogicException::class);
+        $this->expectException(LogicException::class);
         $el = new ExpressionLanguage();
         $el->evaluate('1 + 1');
         $registerCallback($el);
@@ -393,6 +486,49 @@ class ExpressionLanguageTest extends TestCase
         }
     }
 
+    public function testNullSafeEvaluateFailsWithReusedParsedExpression()
+    {
+        $expressionLanguage = new ExpressionLanguage();
+
+        foreach (self::provideInvalidNullSafe() as [$expression, $foo, $message]) {
+            $parsedExpression = $expressionLanguage->parse($expression, ['foo']);
+            $this->assertNull($expressionLanguage->evaluate($parsedExpression, ['foo' => null]));
+
+            try {
+                $expressionLanguage->evaluate($parsedExpression, ['foo' => $foo]);
+            } catch (\RuntimeException $e) {
+                $this->assertSame($message, $e->getMessage());
+                continue;
+            }
+
+            $this->fail(\sprintf('Evaluating "%s" again should throw.', $expression));
+        }
+    }
+
+    public function testNullSafeEvaluateFailsWhileAnotherFiberEvaluatesTheSameParsedExpression()
+    {
+        $expressionLanguage = new ExpressionLanguage();
+        $parsedExpression = $expressionLanguage->parse('foo?.bar().baz', ['foo']);
+        $foo = new class {
+            public function bar()
+            {
+                \Fiber::suspend();
+
+                return null;
+            }
+        };
+
+        $fiber = new \Fiber(static fn () => $expressionLanguage->evaluate($parsedExpression, ['foo' => $foo]));
+        $fiber->start();
+
+        $this->assertNull($expressionLanguage->evaluate($parsedExpression, ['foo' => null]));
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Unable to get property "baz" of non-object "foo?.bar()".');
+
+        $fiber->resume();
+    }
+
     public static function provideInvalidNullSafe()
     {
         yield ['foo?.bar.baz', (object) ['bar' => null], 'Unable to get property "baz" of non-object "foo?.bar".'];
@@ -413,6 +549,16 @@ class ExpressionLanguageTest extends TestCase
     {
         $expressionLanguage = new ExpressionLanguage();
         $this->assertSame(eval(\sprintf('return %s;', $expressionLanguage->compile($expression, ['foo' => 'foo']))), 'default');
+    }
+
+    public function testNullCoalescingEvaluateFailsOnObjectWithoutArrayAccess()
+    {
+        $expressionLanguage = new ExpressionLanguage();
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Unable to get an item of non-array "foo".');
+
+        $expressionLanguage->evaluate('foo["bar"] ?? "default"', ['foo' => new \stdClass()]);
     }
 
     public static function provideNullCoalescing()
@@ -437,12 +583,18 @@ class ExpressionLanguageTest extends TestCase
         yield ['foo.bar.baz.bam ?? "default"', (object) ['bar' => null]];
         yield ['foo?.bar?.baz?.qux ?? "default"', (object) ['bar' => null]];
         yield ['foo[123][456][789] ?? "default"', [123 => []]];
+        yield ['foo.bar ?? "default"', 'foo'];
+        yield ['foo.bar ?? "default"', 123];
+        yield ['foo.bar.baz ?? "default"', (object) ['bar' => 'foo']];
+        yield ['foo["bar"] ?? "default"', 'foo'];
+        yield ['foo[0] ?? "default"', 123];
+        yield ['foo[0]["bar"] ?? "default"', ['foo']];
     }
 
     #[DataProvider('getRegisterCallbacks')]
     public function testRegisterAfterCompile($registerCallback)
     {
-        $this->expectException(\LogicException::class);
+        $this->expectException(LogicException::class);
         $el = new ExpressionLanguage();
         $el->compile('1 + 1');
         $registerCallback($el);
@@ -527,6 +679,17 @@ class ExpressionLanguageTest extends TestCase
         ];
     }
 
+    public function testParseDoesNotReuseAnExpressionParsedWithOtherFlags()
+    {
+        $expressionLanguage = new ExpressionLanguage();
+        $expressionLanguage->parse('a + 1', [], Parser::IGNORE_UNKNOWN_VARIABLES);
+
+        $this->expectException(SyntaxError::class);
+        $this->expectExceptionMessage('Variable "a" is not valid around position 1 for expression `a + 1`.');
+
+        $expressionLanguage->parse('a + 1', []);
+    }
+
     public function testParseAlreadyParsedExpressionReturnsSameObject()
     {
         $el = new ExpressionLanguage();
@@ -539,5 +702,37 @@ class ExpressionLanguageTest extends TestCase
         $language = new ExpressionLanguage();
         $this->assertSame(3, $language->evaluate('count([1, 2, 3])'));
         $this->assertSame(0, $language->evaluate('count([])'));
+    }
+
+    /**
+     * @param class-string<ExceptionInterface> $class
+     */
+    #[DataProvider('provideFailingExpressions')]
+    public function testEvaluateThrowsAnExceptionOfTheComponent(string $expression, array $values, string $class)
+    {
+        $expressionLanguage = new ExpressionLanguage(null, [new ConstantFunctionProvider(['PHP_VERSION'])]);
+
+        try {
+            $expressionLanguage->evaluate($expression, $values);
+            $this->fail('An exception should have been thrown.');
+        } catch (ExceptionInterface $e) {
+            $this->assertSame($class, $e::class);
+        }
+    }
+
+    public static function provideFailingExpressions(): iterable
+    {
+        yield 'syntax' => ['1 +', [], SyntaxError::class];
+        yield 'unknown variable' => ['foo', [], SyntaxError::class];
+        yield 'invalid regexp' => ['"a" matches foo', ['foo' => 'not a regexp'], SyntaxError::class];
+        yield 'property of non-object' => ['foo.bar', ['foo' => null], RuntimeException::class];
+        yield 'method of non-object' => ['foo.bar()', ['foo' => null], RuntimeException::class];
+        yield 'undefined method' => ['foo.bar()', ['foo' => new \stdClass()], RuntimeException::class];
+        yield 'item of non-array' => ['foo["bar"]', ['foo' => null], RuntimeException::class];
+        yield 'not allowed constant' => ['constant("E_ALL")', [], RuntimeException::class];
+        yield 'not allowed enum case' => ['enum("E_ALL")', [], RuntimeException::class];
+        yield 'not an enum case' => ['enum("PHP_VERSION")', [], TypeError::class];
+        yield 'division by zero' => ['1 / 0', [], DivisionByZeroError::class];
+        yield 'modulo by zero' => ['1 % 0', [], DivisionByZeroError::class];
     }
 }

@@ -89,7 +89,6 @@ class CurrenciesTest extends ResourceBundleTestCase
         'CLF',
         'CLP',
         'CNH',
-        'CNX',
         'CNY',
         'COP',
         'COU',
@@ -786,6 +785,17 @@ class CurrenciesTest extends ResourceBundleTestCase
         Currencies::getName('foo');
     }
 
+    public function testGetSymbolAndNameOfLocalizedSymbols()
+    {
+        $this->assertSame('ARS', Currencies::getSymbol('ARS', 'en'));
+        $this->assertSame('$AR', Currencies::getSymbol('ARS', 'fr'));
+        $this->assertSame('peso argentin', Currencies::getName('ARS', 'fr'));
+        $this->assertSame('A$', Currencies::getSymbol('AUD', 'en'));
+        $this->assertSame('$AU', Currencies::getSymbol('AUD', 'fr'));
+        $this->assertSame("\$\u{A0}AU", Currencies::getSymbol('AUD', 'fr_CA'));
+        $this->assertSame('dollar australien', Currencies::getName('AUD', 'fr_CA'));
+    }
+
     public function testExists()
     {
         $this->assertTrue(Currencies::exists('EUR'));
@@ -876,9 +886,9 @@ class CurrenciesTest extends ResourceBundleTestCase
         $this->assertTrue(Currencies::isValidInCountry('CH', 'CHE', false, null));
     }
 
-    public function testInactiveCurrenciesOfChinaIn2025()
+    public function testInactiveCurrenciesOfFranceIn2025()
     {
-        $this->assertSame(['CNX'], Currencies::forCountry('CN', null, false, new \DateTimeImmutable('2025-01-01', new \DateTimeZone('Etc/UTC'))));
+        $this->assertSame(['FRF'], Currencies::forCountry('FR', null, false, new \DateTimeImmutable('2025-01-01', new \DateTimeZone('Etc/UTC'))));
     }
 
     public function testUsdCurrencyDoesNotExistInFranceIn2025()

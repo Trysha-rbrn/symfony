@@ -11,6 +11,9 @@
 
 namespace Symfony\Component\HttpKernel\Tests\HttpCache;
 
+use PHPUnit\Framework\Attributes\PreserveGlobalState;
+use PHPUnit\Framework\Attributes\RequiresPhpExtension;
+use PHPUnit\Framework\Attributes\RunInSeparateProcess;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\HttpFoundation\BinaryFileResponse;
 use Symfony\Component\HttpFoundation\Cookie;
@@ -46,6 +49,36 @@ class StoreTest extends TestCase
         $this->assertSame([], $this->getStoreMetadata('/nothing'));
     }
 
+    #[RequiresPhpExtension('pcntl')]
+    #[RunInSeparateProcess]
+    #[PreserveGlobalState(false)]
+    public function testAForkedStoreOnlyCleansUpItsOwnLocks()
+    {
+        $observer = new Store(sys_get_temp_dir().'/http_cache');
+        $childRequest = Request::create('/child');
+        $this->assertTrue($this->store->lock($this->request));
+
+        if (0 === $pid = pcntl_fork()) {
+            if (true === $this->store->lock($this->request) || $this->store->unlock($this->request)) {
+                exit(1);
+            }
+            if (true !== $this->store->lock($childRequest) || !$observer->isLocked($childRequest)) {
+                exit(2);
+            }
+            $this->store->cleanup();
+
+            exit(!$observer->isLocked($childRequest) && $observer->isLocked($this->request) ? 0 : 3);
+        }
+
+        $this->assertGreaterThan(0, $pid);
+        $this->assertSame($pid, pcntl_waitpid($pid, $status));
+        $this->assertTrue(pcntl_wifexited($status));
+        $this->assertSame(0, pcntl_wexitstatus($status));
+        $this->assertTrue($observer->isLocked($this->request));
+        $this->assertTrue($this->store->unlock($this->request));
+        $this->assertFalse($observer->isLocked($this->request));
+    }
+
     public function testUnlockFileThatDoesExist()
     {
         $this->storeSimpleEntry();
@@ -75,6 +108,57 @@ class StoreTest extends TestCase
         $this->assertTrue(is_file($path));
 
         $this->assertFalse($this->store->purge('/bar'));
+    }
+
+    public function testClearRemovesAllEntries()
+    {
+        $request1 = Request::create('/foo');
+        $request2 = Request::create('https://example.com/bar');
+        $this->store->write($request1, new Response('foo'));
+        $this->store->write($request2, new Response('bar'));
+
+        $this->store->clear();
+
+        $this->assertNull($this->store->lookup($request1));
+        $this->assertNull($this->store->lookup($request2));
+        $this->assertSame(['.', '..'], scandir(sys_get_temp_dir().'/http_cache'));
+    }
+
+    public function testStoreIsUsableAfterClear()
+    {
+        $this->storeSimpleEntry();
+
+        $this->store->clear();
+
+        $this->assertNull($this->store->lookup($this->request));
+
+        $this->storeSimpleEntry();
+
+        $this->assertStringEqualsFile($this->store->lookup($this->request)->headers->get('X-Body-File'), 'test');
+    }
+
+    public function testClearReleasesLocks()
+    {
+        $this->storeSimpleEntry();
+        $this->assertTrue($this->store->lock($this->request));
+
+        $this->store->clear();
+
+        $this->assertFalse($this->store->isLocked($this->request));
+        $this->assertFalse($this->store->unlock($this->request));
+        $this->assertTrue((new Store(sys_get_temp_dir().'/http_cache'))->lock($this->request));
+    }
+
+    public function testClearWhenTheRootDirectoryIsMissing()
+    {
+        HttpCacheTestCase::clearDirectory(sys_get_temp_dir().'/http_cache');
+        rmdir(sys_get_temp_dir().'/http_cache');
+
+        $this->store->clear();
+
+        $this->storeSimpleEntry();
+
+        $this->assertStringEqualsFile($this->store->lookup($this->request)->headers->get('X-Body-File'), 'test');
     }
 
     public function testStoresACacheEntry()

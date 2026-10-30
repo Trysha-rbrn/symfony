@@ -12,7 +12,6 @@
 namespace Symfony\Component\Security\Http\Authenticator;
 
 use Psr\Clock\ClockInterface;
-use Symfony\Component\Clock\Clock;
 use Symfony\Component\HttpFoundation\RedirectResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
@@ -34,6 +33,7 @@ use Symfony\Component\Security\Http\EntryPoint\AuthenticationEntryPointInterface
 use Symfony\Component\Security\Http\EntryPoint\ReAuthenticationEntryPointInterface;
 use Symfony\Component\Security\Http\Event\OidcAuthorizationRequestEvent;
 use Symfony\Component\Security\Http\HttpUtils;
+use Symfony\Component\Security\Http\OAuth2\Dpop\DpopProofFactory;
 use Symfony\Component\Security\Http\Oidc\OidcDiscovery;
 use Symfony\Component\Security\Http\SecurityRequestAttributes;
 use Symfony\Contracts\EventDispatcher\EventDispatcherInterface;
@@ -52,18 +52,11 @@ final class OidcLoginAuthenticator extends AbstractAuthenticator implements Auth
     // parameters of the authorization request the authenticator computes itself, so
     // that no configuration can weaken them; "max_age" is owned too, as sending it
     // obliges this client to check the "auth_time" claim of the resulting ID token
-    private const MANAGED_PARAMS = ['response_type', 'client_id', 'redirect_uri', 'scope', 'state', 'nonce', 'code_challenge', 'code_challenge_method', 'max_age'];
+    private const MANAGED_PARAMS = ['response_type', 'client_id', 'redirect_uri', 'scope', 'state', 'nonce', 'code_challenge', 'code_challenge_method', 'max_age', 'dpop_jkt'];
 
     private array $options;
-    private readonly ClockInterface $clock;
 
     /**
-     * Refuses a public client that turns PKCE or the ID token signature check off.
-     *
-     * Such a client, which authenticates with "none", sends no secret: PKCE is then the only
-     * thing binding the authorization code to it, and the ID token signature the only thing
-     * tying the token endpoint response to the provider beyond the TLS verification.
-     *
      * @param array<string, string>         $authorizationParams Additional parameters of the authorization request, e.g.
      *                                                           "prompt" or "ui_locales"; the protocol parameters the
      *                                                           authenticator manages itself are rejected. Listen to
@@ -74,7 +67,7 @@ final class OidcLoginAuthenticator extends AbstractAuthenticator implements Auth
      *                                                           as the token endpoint request verifies TLS
      * @param ClockInterface|null           $clock               Turns the "expires_in" of the token endpoint response into
      *                                                           the absolute expiry the security token carries, or null to
-     *                                                           use the clock of the "symfony/clock" component
+     *                                                           use the system time
      * @param EventDispatcherInterface|null $eventDispatcher     Dispatches OidcAuthorizationRequestEvent before the user is
      *                                                           redirected to the provider, or null to always send the
      *                                                           authorization request $authorizationParams describes
@@ -91,15 +84,10 @@ final class OidcLoginAuthenticator extends AbstractAuthenticator implements Auth
         array $options,
         private readonly array $authorizationParams = [],
         private readonly ?OidcSignatureVerifier $signatureVerifier = null,
-        ?ClockInterface $clock = null,
+        private readonly ?ClockInterface $clock = null,
         private readonly ?EventDispatcherInterface $eventDispatcher = null,
+        private readonly ?DpopProofFactory $dpopProofFactory = null,
     ) {
-        if (null === $clock && !class_exists(Clock::class)) {
-            throw new \LogicException(\sprintf('The "symfony/clock" component is required to build "%s" without a clock. Try running "composer require symfony/clock", or pass any PSR-20 clock to the constructor.', self::class));
-        }
-
-        $this->clock = $clock ?? new Clock();
-
         $this->options = array_merge([
             'check_path' => '/oidc/callback',
             'firewall_name' => 'main',
@@ -112,16 +100,6 @@ final class OidcLoginAuthenticator extends AbstractAuthenticator implements Auth
 
         if (!\in_array($this->options['pkce_method'], ['S256', 'plain'], true)) {
             throw new \InvalidArgumentException(\sprintf('Invalid PKCE method "%s": RFC 7636 defines "S256" and "plain" only.', $this->options['pkce_method']));
-        }
-
-        if ('none' === $oidcClient->getClientAuthenticationMethod()) {
-            if (!$this->options['pkce_enabled']) {
-                throw new \InvalidArgumentException('PKCE cannot be disabled for a public OIDC client, which authenticates with "none": it is the only thing binding the authorization code to this client.');
-            }
-
-            if (null === $signatureVerifier) {
-                throw new \InvalidArgumentException('The ID token signature must be verified for a public OIDC client, which authenticates with "none": without the check, only the TLS verification of the token request ties the ID token to the provider, which is too little for a client that has nothing but PKCE protecting its code exchange.');
-            }
         }
 
         if ($managed = array_intersect_key($authorizationParams, array_flip(self::MANAGED_PARAMS))) {
@@ -178,6 +156,8 @@ final class OidcLoginAuthenticator extends AbstractAuthenticator implements Auth
      */
     private function startAuthorizationRequest(Request $request, array $forcedParams = []): Response
     {
+        $this->checkPublicClient();
+
         $session = $this->getSession($request);
         $prefix = $this->getSessionPrefix();
 
@@ -212,6 +192,14 @@ final class OidcLoginAuthenticator extends AbstractAuthenticator implements Auth
 
         if (null !== ($this->options['max_age'] ?? null)) {
             $params['max_age'] = (string) $this->options['max_age'];
+        }
+
+        // RFC 9449, Section 10: the code is bound to the key before it exists, so that a
+        // code stolen from the redirect cannot be exchanged by whoever does not hold it. The
+        // thumbprint names the key without carrying it, which is what lets it travel here,
+        // in a front channel.
+        if (null !== $this->dpopProofFactory) {
+            $params['dpop_jkt'] = $this->dpopProofFactory->getKeyThumbprint();
         }
 
         $extraParams = $this->authorizationParams;
@@ -258,6 +246,8 @@ final class OidcLoginAuthenticator extends AbstractAuthenticator implements Auth
 
     public function authenticate(Request $request): Passport
     {
+        $this->checkPublicClient();
+
         $session = $this->getSession($request);
         $prefix = $this->getSessionPrefix();
 
@@ -381,6 +371,9 @@ final class OidcLoginAuthenticator extends AbstractAuthenticator implements Auth
         // request asks for; it is compared as-is, so anything but a non-empty string is no class
         $acr = $idTokenClaims['acr'] ?? null;
         $passport->setAttribute('oidc_acr', \is_string($acr) && '' !== $acr ? $acr : null);
+        // "sid" names the provider session of this login (Back-Channel Logout 1.0, Section 2.1), which is what a logout token names
+        $sid = $idTokenClaims['sid'] ?? null;
+        $passport->setAttribute('oidc_sid', \is_string($sid) && '' !== $sid ? $sid : null);
 
         return $passport;
     }
@@ -397,14 +390,16 @@ final class OidcLoginAuthenticator extends AbstractAuthenticator implements Auth
             // it renews; both are null unless the provider issued them, as it only issues
             // a refresh token when it was asked for one, and "expires_in" is optional
             $token->setAttribute('oidc_refresh_token', $tokenData['refresh_token'] ?? null);
-            $token->setAttribute('oidc_access_token_expires_at', is_numeric($tokenData['expires_in'] ?? null) ? $this->clock->now()->getTimestamp() + (int) $tokenData['expires_in'] : null);
+            $token->setAttribute('oidc_access_token_expires_at', is_numeric($tokenData['expires_in'] ?? null) ? ($this->clock?->now()->getTimestamp() ?? time()) + (int) $tokenData['expires_in'] : null);
         }
 
         $token->setAttribute('oidc_acr', $passport->getAttribute('oidc_acr'));
 
+        $token->setAttribute('oidc_sid', $passport->getAttribute('oidc_sid'));
+
         $methods = $passport->getAttribute('oidc_amr');
         $methods = \is_array($methods) && $methods ? $methods : [AuthenticationMethod::UNSPECIFIED];
-        $now = $this->clock->now()->getTimestamp();
+        $now = $this->clock?->now()->getTimestamp() ?? time();
 
         // a provider whose clock runs ahead would otherwise extend the window that
         // IS_AUTHENTICATED_RECENTLY grants, so the claim never dates from the future
@@ -607,5 +602,30 @@ final class OidcLoginAuthenticator extends AbstractAuthenticator implements Auth
     private function getSessionPrefix(): string
     {
         return '_security.oidc_login.'.$this->options['firewall_name'].'.';
+    }
+
+    /**
+     * Refuses a public client that turns PKCE or the ID token signature check off.
+     *
+     * Such a client, which authenticates with "none", sends no secret: PKCE is then the only
+     * thing binding the authorization code to it, and the ID token signature the only thing
+     * tying the token endpoint response to the provider beyond the TLS verification.
+     *
+     * This is checked when the authenticator is used rather than when it is created, so that
+     * the client can be a lazy service.
+     */
+    private function checkPublicClient(): void
+    {
+        if ('none' !== $this->oidcClient->getClientAuthenticationMethod()) {
+            return;
+        }
+
+        if (!$this->options['pkce_enabled']) {
+            throw new \LogicException('PKCE cannot be disabled for a public OIDC client, which authenticates with "none": it is the only thing binding the authorization code to this client.');
+        }
+
+        if (null === $this->signatureVerifier) {
+            throw new \LogicException('The ID token signature must be verified for a public OIDC client, which authenticates with "none": without the check, only the TLS verification of the token request ties the ID token to the provider, which is too little for a client that has nothing but PKCE protecting its code exchange.');
+        }
     }
 }

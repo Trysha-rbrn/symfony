@@ -11,10 +11,12 @@
 
 namespace Symfony\Component\DependencyInjection\Loader\Configurator;
 
-use Symfony\Bundle\SecurityBundle\CacheWarmer\ExpressionCacheWarmer;
+use Symfony\Bridge\Doctrine\ArgumentResolver\EntityValueResolver;
 use Symfony\Bundle\SecurityBundle\EventListener\FirewallListener;
 use Symfony\Bundle\SecurityBundle\Routing\LogoutRouteLoader;
 use Symfony\Bundle\SecurityBundle\Routing\OidcLoginRouteLoader;
+use Symfony\Bundle\SecurityBundle\Routing\ProtectedResourceMetadataRouteLoader;
+use Symfony\Bundle\SecurityBundle\Routing\SecurityRouteLoader;
 use Symfony\Bundle\SecurityBundle\Security;
 use Symfony\Bundle\SecurityBundle\Security\FirewallConfig;
 use Symfony\Bundle\SecurityBundle\Security\FirewallContext;
@@ -22,6 +24,7 @@ use Symfony\Bundle\SecurityBundle\Security\FirewallMap;
 use Symfony\Bundle\SecurityBundle\Security\LazyFirewallContext;
 use Symfony\Component\DependencyInjection\ContainerInterface;
 use Symfony\Component\DependencyInjection\ServiceLocator;
+use Symfony\Component\ExpressionLanguage\ConstantFunctionProvider;
 use Symfony\Component\ExpressionLanguage\ExpressionLanguage as BaseExpressionLanguage;
 use Symfony\Component\Ldap\Security\LdapUserProvider;
 use Symfony\Component\Security\Core\Authentication\AuthenticationTrustResolver;
@@ -50,9 +53,12 @@ use Symfony\Component\Security\Core\User\MissingUserProvider;
 use Symfony\Component\Security\Core\User\OidcUserProvider;
 use Symfony\Component\Security\Core\Validator\Constraints\UserPasswordValidator;
 use Symfony\Component\Security\Csrf\DelegatingCsrfTokenManager;
+use Symfony\Component\Security\Http\Attribute\IsCsrfTokenValid;
+use Symfony\Component\Security\Http\Attribute\IsGranted;
 use Symfony\Component\Security\Http\Authentication\AuthenticationUtils;
 use Symfony\Component\Security\Http\Controller\SecurityTokenValueResolver;
 use Symfony\Component\Security\Http\Controller\UserValueResolver;
+use Symfony\Component\Security\Http\EntryPoint\RedirectAuthenticationEntryPoint;
 use Symfony\Component\Security\Http\EventListener\IsGrantedAttributeListener;
 use Symfony\Component\Security\Http\Firewall;
 use Symfony\Component\Security\Http\FirewallMapInterface;
@@ -69,6 +75,7 @@ return static function (ContainerConfigurator $container) {
         // "oidc_login" firewall factory fills in; they stay empty when no firewall uses one
         ->set('security.oidc_login.callback_uris', [])
         ->set('security.oidc_login.start_paths', [])
+        ->set('security.oidc_login.backchannel_logout_paths', [])
     ;
 
     $container->services()
@@ -116,7 +123,8 @@ return static function (ContainerConfigurator $container) {
             ->args([
                 service('security.token_storage'),
             ])
-            ->tag('controller.argument_value_resolver', ['priority' => 120, 'name' => UserValueResolver::class])
+            // the current user must never be loaded from the request instead
+            ->tag('controller.argument_value_resolver', ['priority' => 120, 'before' => EntityValueResolver::class, 'name' => UserValueResolver::class])
 
         ->set('security.security_token_value_resolver', SecurityTokenValueResolver::class)
             ->args([
@@ -147,8 +155,9 @@ return static function (ContainerConfigurator $container) {
             ->args([[]])
 
         ->set('security.delegating_csrf_token_manager', DelegatingCsrfTokenManager::class)
-            // outside SameOriginCsrfTokenManager (0), so that the manager a firewall configures for a token id wins
+            // around SameOriginCsrfTokenManager, so that the manager a firewall configures for a token id wins
             ->decorate('security.csrf.token_manager', null, -10, ContainerInterface::IGNORE_ON_INVALID_REFERENCE)
+            ->tag('container.decoration_order', ['around' => 'security.csrf.same_origin_token_manager'])
             ->args([
                 service('.inner'),
                 service('security.csrf_token_manager_locator'),
@@ -202,12 +211,16 @@ return static function (ContainerConfigurator $container) {
                 service('security.authentication.trust_resolver'),
                 service('security.authorization_checker'),
                 service('security.role_hierarchy')->nullOnInvalid(),
+                service('security.access.decision_manager'),
+                service('security.token_storage'),
             ])
             ->tag('security.voter', ['priority' => 245])
 
         ->set('security.access.closure_voter', ClosureVoter::class)
             ->args([
                 service('security.authorization_checker'),
+                service('security.access.decision_manager'),
+                service('security.token_storage'),
             ])
             ->tag('security.voter', ['priority' => 245])
 
@@ -228,6 +241,7 @@ return static function (ContainerConfigurator $container) {
             ])
             ->tag('kernel.event_subscriber')
         ->alias(Firewall::class, 'security.firewall')
+            ->deprecate('symfony/security-bundle', '8.2', 'The "%alias_id%" alias is deprecated, the firewall listens to kernel events and is not meant to be injected.')
 
         ->set('security.firewall.map', FirewallMap::class)
             ->args([
@@ -281,21 +295,37 @@ return static function (ContainerConfigurator $container) {
             ])
             ->tag('kernel.reset', ['method' => 'reset', 'on_invalid' => 'ignore'])
 
+        ->set('security.route_loader', SecurityRouteLoader::class)
+            ->args([[
+                inline_service(LogoutRouteLoader::class)
+                    ->args([
+                        '%security.logout_uris%',
+                        'security.logout_uris',
+                    ]),
+                inline_service(OidcLoginRouteLoader::class)
+                    ->args([
+                        '%security.oidc_login.callback_uris%',
+                        'security.oidc_login.callback_uris',
+                        '%security.oidc_login.start_paths%',
+                        'security.oidc_login.start_paths',
+                        '%security.oidc_login.backchannel_logout_paths%',
+                        'security.oidc_login.backchannel_logout_paths',
+                    ]),
+                inline_service(ProtectedResourceMetadataRouteLoader::class)
+                    ->args([
+                        '%security.access_token.resource_metadata_paths%',
+                        'security.access_token.resource_metadata_paths',
+                    ]),
+            ]])
+            ->tag('routing.route_loader')
+
         ->set('security.route_loader.logout', LogoutRouteLoader::class)
             ->args([
                 '%security.logout_uris%',
                 'security.logout_uris',
             ])
             ->tag('routing.route_loader')
-
-        ->set('security.authenticator.oidc_login.route_loader', OidcLoginRouteLoader::class)
-            ->args([
-                '%security.oidc_login.callback_uris%',
-                'security.oidc_login.callback_uris',
-                '%security.oidc_login.start_paths%',
-                'security.oidc_login.start_paths',
-            ])
-            ->tag('routing.route_loader')
+            ->deprecate('symfony/security-bundle', '8.2', 'The "%service_id%" service is deprecated, use "security.route_loader" instead.')
 
         // Provisioning
         ->set('security.user.provider.missing', MissingUserProvider::class)
@@ -334,6 +364,13 @@ return static function (ContainerConfigurator $container) {
             ])
         ->alias(HttpUtils::class, 'security.http_utils')
 
+        ->set('security.authentication.redirect_entry_point', RedirectAuthenticationEntryPoint::class)
+            ->abstract()
+            ->args([
+                service('security.http_utils'),
+                abstract_arg('path'),
+            ])
+
         // Validator
         ->set('security.validator.user_password', UserPasswordValidator::class)
             ->args([
@@ -349,23 +386,21 @@ return static function (ContainerConfigurator $container) {
             ->tag('cache.pool')
             ->tag('container.remove_if_missing', ['service' => 'cache.system'])
 
-        // Cache Warmers
-        ->set('security.cache_warmer.expression', ExpressionCacheWarmer::class)
-            ->args([
-                [],
-                service('security.expression_language'),
-            ])
-            ->tag('kernel.cache_warmer')
-
         ->set('controller.is_granted_attribute_listener', IsGrantedAttributeListener::class)
             ->args([
                 service('security.authorization_checker'),
                 service('security.is_granted_attribute_expression_language')->nullOnInvalid(),
+                closure([service('argument_resolver.request_payload'), 'onKernelControllerArguments'])->lazy(),
             ])
             ->tag('kernel.event_subscriber')
 
         ->set('security.is_granted_attribute_expression_language', BaseExpressionLanguage::class)
-            ->args([service('cache.security_is_granted_attribute_expression_language')->nullOnInvalid()])
+            ->lazy()
+            ->args([
+                service('cache.security_is_granted_attribute_expression_language')->nullOnInvalid(),
+                class_exists(ConstantFunctionProvider::class) ? [inline_service(ConstantFunctionProvider::class)->args([['*', '*::*']])] : [],
+            ])
+            ->tag('expression_language.compiled', ['attributes' => [IsGranted::class => ['subject']], 'variables' => ['request', 'args', 'this']])
 
         ->set('cache.security_is_granted_attribute_expression_language')
             ->parent('cache.system')
@@ -374,7 +409,12 @@ return static function (ContainerConfigurator $container) {
             ->tag('container.remove_if_missing', ['service' => 'cache.system'])
 
         ->set('security.is_csrf_token_valid_attribute_expression_language', BaseExpressionLanguage::class)
-            ->args([service('cache.security_is_csrf_token_valid_attribute_expression_language')->nullOnInvalid()])
+            ->lazy()
+            ->args([
+                service('cache.security_is_csrf_token_valid_attribute_expression_language')->nullOnInvalid(),
+                class_exists(ConstantFunctionProvider::class) ? [inline_service(ConstantFunctionProvider::class)->args([['*', '*::*']])] : [],
+            ])
+            ->tag('expression_language.compiled', ['attributes' => [IsCsrfTokenValid::class => ['id']], 'variables' => ['request', 'args', 'this']])
 
         ->set('cache.security_is_csrf_token_valid_attribute_expression_language')
             ->parent('cache.system')

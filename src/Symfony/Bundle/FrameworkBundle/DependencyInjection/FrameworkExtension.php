@@ -28,6 +28,7 @@ use Symfony\Component\Console\Attribute\AsTargetedValueResolver as AsTargetedCon
 use Symfony\Component\Console\Messenger\RunCommandMessageHandler;
 use Symfony\Component\DependencyInjection\Alias;
 use Symfony\Component\DependencyInjection\Argument\EnvClosureArgument;
+use Symfony\Component\DependencyInjection\Argument\ServiceClosureArgument;
 use Symfony\Component\DependencyInjection\ChildDefinition;
 use Symfony\Component\DependencyInjection\Compiler\MergeExtensionConfigurationContainerBuilder;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
@@ -119,6 +120,8 @@ class FrameworkExtension extends Extension
 
         if (!ContainerBuilder::willBeAvailable('symfony/expression-language', ExpressionLanguage::class, ['symfony/framework-bundle'])) {
             $container->removeDefinition('controller.expression_language');
+            $container->removeDefinition('expression_language.collector');
+            $container->removeDefinition('expression_language.cache_warmer');
         }
 
         if ($this->hasConsole()) {
@@ -215,7 +218,14 @@ class FrameworkExtension extends Extension
 
         if (null !== $config['response']['serializer'] && $container->hasDefinition('serialize_controller_result_listener')) {
             $container->getDefinition('serialize_controller_result_listener')
-                ->replaceArgument(0, new Reference($config['response']['serializer']));
+                ->replaceArgument(0, new ServiceClosureArgument(new Reference($config['response']['serializer'])));
+        }
+
+        if ($container->getParameter('kernel.debug')) {
+            // return types are read from the controllers at runtime, so they cannot be cached in debug mode
+            $container->removeDefinition('serialize_controller_result_listener.cache_warmer');
+            $container->removeDefinition('serialize_controller_result_listener.type_cache');
+            $container->removeDefinition('cache.serialize_controller_result');
         }
 
         $this->registerHttpCacheConfiguration($config['http_cache'], $container, $config['http_method_override'], $config['allowed_http_method_override']);
@@ -223,6 +233,11 @@ class FrameworkExtension extends Extension
         $this->registerSsiConfiguration($config['ssi'], $container, $loader);
         $this->registerFragmentsConfiguration($config['fragments'], $container, $loader);
         $container->getDefinition('uri_signer')->addArgument($config['uri_signer']['expiration']);
+
+        if ($config['uri_signer']['secret']) {
+            $container->getDefinition('uri_signer')->replaceArgument(0, $config['uri_signer']['secret']);
+        }
+
         $this->registerDebugConfiguration($config['php_errors'], $container, $loader);
         $this->registerSecretsConfiguration($config['secrets'], $container, $loader, $config['secret'] ?? null);
 
@@ -246,6 +261,7 @@ class FrameworkExtension extends Extension
                 throw new LogicException('Session support cannot be enabled as the session extension is not installed. See https://php.net/session.installation for instructions.');
             }
 
+            $config['session']['storage_factory_id'] ??= empty($config['test']) ? 'session.storage.factory.native' : 'session.storage.factory.mock_file';
             $this->registerSessionConfiguration($config['session'], $container, $loader);
             if (!empty($config['test'])) {
                 // test listener will replace the existing session listener
@@ -346,6 +362,12 @@ class FrameworkExtension extends Extension
     private function registerFormConfiguration(array $config, ContainerBuilder $container, PhpFileLoader $loader): void
     {
         $loader->load('form.php');
+
+        if ($container->getParameter('kernel.debug')) {
+            $container->removeDefinition('form.type_guesser.type_info.cache_warmer');
+            $container->removeDefinition('form.type_guesser.type_info.cache');
+            $container->removeDefinition('cache.form');
+        }
 
         if (!property_exists(ValidatorExtension::class, 'violationMapper')) {
             $container->removeDefinition('form.violation_mapper');
@@ -605,6 +627,8 @@ class FrameworkExtension extends Extension
         $container->setParameter('session.save_path', $config['save_path']);
 
         $container->setParameter('session.metadata.update_threshold', $config['metadata_update_threshold']);
+
+        $container->getDefinition('session.attribute_bag')->replaceArgument(1, $config['isolate_attributes']);
     }
 
     private function registerRequestConfiguration(array $config, ContainerBuilder $container, PhpFileLoader $loader): void

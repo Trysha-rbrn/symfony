@@ -11,6 +11,8 @@
 
 namespace Symfony\Component\Messenger\Command;
 
+use Psr\Clock\ClockInterface;
+use Symfony\Component\Clock\DatePoint;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Completion\CompletionInput;
 use Symfony\Component\Console\Completion\CompletionSuggestions;
@@ -27,6 +29,7 @@ use Symfony\Component\Messenger\Failure\FailedMessageFilter;
 use Symfony\Component\Messenger\Failure\FailedMessageRepository;
 use Symfony\Component\Messenger\Stamp\ErrorDetailsStamp;
 use Symfony\Component\Messenger\Stamp\MessageDecodingFailedStamp;
+use Symfony\Component\Messenger\Stamp\NonSendableStampInterface;
 use Symfony\Component\Messenger\Stamp\RedeliveryStamp;
 use Symfony\Component\Messenger\Stamp\SentToFailureTransportStamp;
 use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
@@ -55,6 +58,7 @@ abstract class AbstractFailedMessagesCommand extends Command
          */
         protected ServiceProviderInterface $failureTransports,
         protected ?PhpSerializer $phpSerializer = null,
+        private ?ClockInterface $clock = null,
     ) {
         parent::__construct();
 
@@ -112,6 +116,9 @@ abstract class AbstractFailedMessagesCommand extends Command
             }
             $dump = new Dumper($io, null, $this->createCloner());
             $io->writeln($dump($envelope->getMessage()));
+            $io->title('Stamps:');
+            $stamps = array_merge([], ...array_values($envelope->withoutStampsOfType(NonSendableStampInterface::class)->withoutAll(ErrorDetailsStamp::class)->all()));
+            $io->writeln($stamps ? $dump($stamps) : '(no data)');
             $io->title('Exception:');
             $flattenException = $lastErrorDetailsStamp?->getFlattenException();
             $io->writeln(null === $flattenException ? '(no data)' : $dump($flattenException));
@@ -161,7 +168,7 @@ abstract class AbstractFailedMessagesCommand extends Command
         }
 
         try {
-            return new \DateTimeImmutable($value);
+            return new DatePoint($value, null, $this->clock?->now() ?? \DateTimeImmutable::createFromTimestamp(microtime(true))->setTimezone(new \DateTimeZone(date_default_timezone_get())));
         } catch (\DateMalformedStringException $e) {
             throw new InvalidArgumentException(\sprintf('The value of the "--%s" option is not a valid date: "%s".', $option, $value), previous: $e);
         }

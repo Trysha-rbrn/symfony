@@ -13,19 +13,25 @@ namespace Symfony\Component\Cache\Tests\DependencyInjection;
 
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use Symfony\Component\Cache\Adapter\AbstractAdapter;
+use Symfony\Component\Cache\Adapter\AdapterInterface;
 use Symfony\Component\Cache\Adapter\ApcuAdapter;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
 use Symfony\Component\Cache\Adapter\ChainAdapter;
 use Symfony\Component\Cache\Adapter\FilesystemAdapter;
+use Symfony\Component\Cache\Adapter\FilesystemTagAwareAdapter;
 use Symfony\Component\Cache\Adapter\NullAdapter;
 use Symfony\Component\Cache\Adapter\ParameterNormalizer;
+use Symfony\Component\Cache\Adapter\PhpFilesAdapter;
 use Symfony\Component\Cache\Adapter\RedisAdapter;
 use Symfony\Component\Cache\Adapter\TagAwareAdapter;
 use Symfony\Component\Cache\DependencyInjection\CachePoolPass;
 use Symfony\Component\DependencyInjection\ChildDefinition;
+use Symfony\Component\DependencyInjection\Compiler\ResolveChildDefinitionsPass;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\ContainerInterface;
 use Symfony\Component\DependencyInjection\Definition;
+use Symfony\Component\DependencyInjection\Dumper\PhpDumper;
 use Symfony\Component\DependencyInjection\Reference;
 use Symfony\Component\HttpKernel\CacheClearer\Psr6CacheClearer;
 
@@ -131,6 +137,87 @@ class CachePoolPassTest extends TestCase
         yield [TagAwareAdapter::class];
     }
 
+    public function testUnusedProviderIsIgnored()
+    {
+        foreach ([ArrayAdapter::class, NullAdapter::class] as $adapterClass) {
+            foreach ([false, true] as $chained) {
+                $container = new ContainerBuilder();
+                $container->setParameter('cache.prefix.seed', 'test');
+                $container->register('cache.adapter', $adapterClass)
+                    ->setAbstract(true)
+                    ->setArguments(ArrayAdapter::class === $adapterClass ? [0] : [])
+                    ->addTag('cache.pool');
+
+                if ($chained) {
+                    $container->register('cache.adapter.chain', ChainAdapter::class)->setAbstract(true)->setArguments([[], 0]);
+                    $pool = new ChildDefinition('cache.adapter.chain');
+                    $pool->addArgument(['unused.provider' => 'cache.adapter']);
+                } else {
+                    $pool = new ChildDefinition('cache.adapter');
+                }
+
+                $pool->setPublic(true)->addTag('cache.pool', ['provider' => 'unused.provider', 'default_lifetime' => 30]);
+                $container->setDefinition('cache.pool', $pool);
+                $container->addCompilerPass($this->cachePoolPass);
+                $container->compile();
+
+                $cache = $container->get('cache.pool');
+                $this->assertInstanceOf($chained ? ChainAdapter::class : $adapterClass, $cache);
+                $this->assertFalse($cache->getItem('missing')->isHit());
+            }
+        }
+    }
+
+    public function testEnvVarsOfIgnoredAttributesAreNotReportedAsUnused()
+    {
+        $container = new ContainerBuilder();
+        $container->setParameter('cache.prefix.seed', 'test');
+        $container->register('cache.adapter.array', ArrayAdapter::class)->setAbstract(true)->addArgument(0)->addTag('cache.pool');
+        $container->register('cache.adapter.null', NullAdapter::class)->setAbstract(true)->addTag('cache.pool');
+
+        $bag = $container->getParameterBag();
+        $container->setDefinition('array.pool', new ChildDefinition('cache.adapter.array'))
+            ->setPublic(true)
+            ->addTag('cache.pool', ['provider' => $bag->get('env(ARRAY_DSN)'), 'default_lifetime' => 30]);
+        $container->setDefinition('null.pool', new ChildDefinition('cache.adapter.null'))
+            ->setPublic(true)
+            ->addTag('cache.pool', ['provider' => $bag->get('env(NULL_DSN)'), 'default_lifetime' => $bag->get('env(NULL_LIFETIME)')]);
+
+        $container->addCompilerPass($this->cachePoolPass);
+        $container->compile();
+
+        $this->assertStringNotContainsString('getEnv', (new PhpDumper($container))->dump());
+    }
+
+    public function testProviderIsIgnoredByAdaptersThatTakeANamespaceFirst()
+    {
+        $dir = sys_get_temp_dir().'/symfony-cache';
+        $container = new ContainerBuilder();
+        $container->setParameter('cache.prefix.seed', 'test');
+        $container->register('app.provider', \stdClass::class);
+        $container->register('cache.adapter.apcu', ApcuAdapter::class)->setAbstract(true)->setArguments(['', 0, 'version'])->addTag('cache.pool');
+        $container->register('cache.adapter.filesystem', FilesystemAdapter::class)->setAbstract(true)->setArguments(['', 0, $dir])->addTag('cache.pool');
+        $container->register('cache.adapter.filesystem_tag_aware', FilesystemTagAwareAdapter::class)->setAbstract(true)->setArguments(['', 0, $dir])->addTag('cache.pool');
+        $container->register('cache.adapter.php_files', PhpFilesAdapter::class)->setAbstract(true)->setArguments(['', 0, $dir])->addTag('cache.pool');
+        $container->register('cache.adapter.system', AdapterInterface::class)->setAbstract(true)->setFactory([AbstractAdapter::class, 'createSystemCache'])->setArguments(['', 0, 'version', $dir])->addTag('cache.pool');
+
+        $pools = ['apcu.pool' => 'cache.adapter.apcu', 'filesystem.pool' => 'cache.adapter.filesystem', 'filesystem_tag_aware.pool' => 'cache.adapter.filesystem_tag_aware', 'php_files.pool' => 'cache.adapter.php_files', 'system.pool' => 'cache.adapter.system'];
+        foreach ($pools as $id => $adapter) {
+            $container->setDefinition($id, new ChildDefinition($adapter))->setPublic(true)->addTag('cache.pool', ['provider' => 'app.provider', 'default_lifetime' => 30]);
+        }
+        $container->register('chain.pool', ChainAdapter::class)->setPublic(true)->setArguments([['app.provider' => 'cache.adapter.filesystem'], 0])->addTag('cache.pool', ['default_lifetime' => 30]);
+
+        $container->addCompilerPass($this->cachePoolPass);
+        $container->compile();
+
+        $this->assertInstanceOf(FilesystemAdapter::class, $container->get('filesystem.pool'));
+        $this->assertInstanceOf(FilesystemTagAwareAdapter::class, $container->get('filesystem_tag_aware.pool'));
+        $this->assertInstanceOf(PhpFilesAdapter::class, $container->get('php_files.pool'));
+        $this->assertInstanceOf(AdapterInterface::class, $container->get('system.pool'));
+        $this->assertInstanceOf(ChainAdapter::class, $container->get('chain.pool'));
+        $this->assertSame(30, $container->getDefinition('apcu.pool')->getArgument(1));
+    }
+
     public function testArgsAreReplaced()
     {
         $container = new ContainerBuilder();
@@ -152,6 +239,49 @@ class CachePoolPassTest extends TestCase
         $this->assertSame('foobar', (string) $cachePool->getArgument(0));
         $this->assertSame('ZmalVIjCbI', $cachePool->getArgument(1));
         $this->assertSame(3, $cachePool->getArgument(2));
+    }
+
+    public function testResetAttributePassesTheShutdownFlagToReset()
+    {
+        $container = new ContainerBuilder();
+        $container->setParameter('kernel.container_class', 'app');
+        $container->setParameter('cache.prefix.seed', 'foo');
+        $container->register('app.cache_pool', ArrayAdapter::class)->addTag('cache.pool', ['reset' => 'reset']);
+        $container->register('app.custom_pool', ArrayAdapter::class)->addTag('cache.pool', ['reset' => 'clear']);
+
+        $this->cachePoolPass->process($container);
+
+        $this->assertSame([['method' => 'reset', 'on_shutdown' => 'flag']], $container->getDefinition('app.cache_pool')->getTag('kernel.reset'));
+        $this->assertSame([['method' => 'clear']], $container->getDefinition('app.custom_pool')->getTag('kernel.reset'));
+    }
+
+    public function testChainedAdaptersAreResetOnTheirOwn()
+    {
+        $container = new ContainerBuilder();
+        $container->setParameter('kernel.container_class', 'app');
+        $container->setParameter('cache.prefix.seed', 'foo');
+        $container->register('cache.adapter.array', ArrayAdapter::class)->setAbstract(true)->addTag('cache.pool', ['reset' => 'reset']);
+        $container->register('cache.adapter.filesystem', FilesystemAdapter::class)->setAbstract(true)->setArguments([null, 0, null])->addTag('cache.pool', ['reset' => 'reset']);
+        $container->setDefinition('app.public_pool', new ChildDefinition('cache.adapter.filesystem'))->setPublic(true)->addTag('cache.pool');
+        $container->register('app.chain', ChainAdapter::class)->setArguments([['cache.adapter.array', 'app.public_pool'], 0])->addTag('cache.pool', ['reset' => 'reset']);
+        $container->register('app.chain_without_reset', ChainAdapter::class)->setArguments([['cache.adapter.array'], 0])->addTag('cache.pool');
+        $container->register('console.command.cache_pool_list')->addArgument([]);
+
+        $this->cachePoolPass->process($container);
+        (new ResolveChildDefinitionsPass())->process($container);
+
+        $this->assertEquals([new Reference('.app.chain.chained.0'), new Reference('.app.chain.chained.1')], $container->getDefinition('app.chain')->getArgument(0));
+        $this->assertSame([['method' => 'reset', 'on_shutdown' => 'flag']], $container->getDefinition('app.chain')->getTag('kernel.reset'));
+
+        foreach (['.app.chain.chained.0' => ArrayAdapter::class, '.app.chain.chained.1' => FilesystemAdapter::class] as $id => $class) {
+            $adapter = $container->getDefinition($id);
+            $this->assertSame($class, $adapter->getClass());
+            $this->assertFalse($adapter->isPublic());
+            $this->assertSame(['kernel.reset' => [['method' => 'reset', 'on_shutdown' => 'flag']]], $adapter->getTags());
+        }
+
+        $this->assertSame([], $container->getDefinition('.app.chain_without_reset.chained.0')->getTags());
+        $this->assertSame(['app.public_pool', 'app.chain', 'app.chain_without_reset'], $container->getDefinition('console.command.cache_pool_list')->getArgument(0));
     }
 
     public function testWithNameAttribute()
@@ -222,10 +352,10 @@ class CachePoolPassTest extends TestCase
         $chainCachePool = $container->getDefinition('cache.chain');
         $this->assertInstanceOf(ChildDefinition::class, $chainCachePool);
         $this->assertCount(2, $chainCachePool->getArgument(0));
-        $this->assertInstanceOf(ChildDefinition::class, $chainCachePool->getArgument(0)[0]);
-        $this->assertSame('cache.adapter.array', $chainCachePool->getArgument(0)[0]->getParent());
-        $this->assertInstanceOf(ChildDefinition::class, $chainCachePool->getArgument(0)[1]);
-        $this->assertSame('cache.adapter.apcu', $chainCachePool->getArgument(0)[1]->getParent());
+        $this->assertInstanceOf(ChildDefinition::class, $arrayAdapter = $container->getDefinition((string) $chainCachePool->getArgument(0)[0]));
+        $this->assertSame('cache.adapter.array', $arrayAdapter->getParent());
+        $this->assertInstanceOf(ChildDefinition::class, $apcuAdapter = $container->getDefinition((string) $chainCachePool->getArgument(0)[1]));
+        $this->assertSame('cache.adapter.apcu', $apcuAdapter->getParent());
 
         $doctrineCachePool = $container->getDefinition('doctrine.result_cache_pool');
         $this->assertInstanceOf(ChildDefinition::class, $doctrineCachePool);
@@ -255,8 +385,8 @@ class CachePoolPassTest extends TestCase
         $parentChain = $container->getDefinition('cache.parent.chain');
         $childChain = $container->getDefinition('foobar.chained.cache');
 
-        $parentNamespace = $parentChain->getArgument(0)[0]->getArgument(0);
-        $childNamespace = $childChain->getArgument(0)[0]->getArgument(0);
+        $parentNamespace = $container->getDefinition((string) $parentChain->getArgument(0)[0])->getArgument(0);
+        $childNamespace = $container->getDefinition((string) $childChain->getArgument(0)[0])->getArgument(0);
 
         $this->assertNotSame($parentNamespace, $childNamespace);
     }
@@ -301,9 +431,9 @@ class CachePoolPassTest extends TestCase
         $this->assertEquals($expectedMarshallerRef, $container->getDefinition('cache.with_marshaller')->getArgument(3));
         $this->assertEquals($expectedMarshallerRef, $container->getDefinition('cache.apcu_with_marshaller')->getArgument(3));
 
-        $adapters = $container->getDefinition('cache.chain_with_marshaller')->getArgument(0);
-        $this->assertArrayNotHasKey('index_3', $adapters[0]->getArguments());
-        $this->assertEquals($expectedMarshallerRef, $adapters[1]->getArgument(3));
+        [$arrayAdapter, $filesystemAdapter] = $container->getDefinition('cache.chain_with_marshaller')->getArgument(0);
+        $this->assertArrayNotHasKey('index_3', $container->getDefinition((string) $arrayAdapter)->getArguments());
+        $this->assertEquals($expectedMarshallerRef, $container->getDefinition((string) $filesystemAdapter)->getArgument(3));
     }
 
     public function testChainAdapterNormalizesDefaultLifetimeDurationString()
@@ -326,7 +456,7 @@ class CachePoolPassTest extends TestCase
 
         $chainPool = $container->getDefinition('cache.chain');
         foreach ($chainPool->getArgument(0) as $innerAdapter) {
-            $this->assertInstanceOf(Definition::class, $innerAdapter);
+            $this->assertInstanceOf(Definition::class, $innerAdapter = $container->getDefinition((string) $innerAdapter));
             $arguments = $innerAdapter->getArguments();
             $lifetimeArg = $arguments[array_key_last($arguments)];
             $this->assertSame([ParameterNormalizer::class, 'normalizeDuration'], $lifetimeArg->getFactory());

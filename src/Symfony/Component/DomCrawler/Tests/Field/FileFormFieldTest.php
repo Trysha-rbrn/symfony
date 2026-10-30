@@ -92,6 +92,89 @@ class FileFormFieldTest extends FormFieldTestCase
         ];
     }
 
+    public function testTemporaryUploadsAreRemovedAtShutdown()
+    {
+        $code = <<<'PHP'
+            namespace Symfony\Component\DomCrawler\Field {
+                function register_shutdown_function(callable $callback): void
+                {
+                    ++$GLOBALS['shutdownCallbacks'];
+                    \register_shutdown_function($callback);
+                }
+            }
+
+            namespace {
+                $GLOBALS['shutdownCallbacks'] = 0;
+                require $argv[1].'/FormField.php';
+                require $argv[1].'/FileFormField.php';
+
+                $document = new \DOMDocument();
+                $node = $document->createElement('input');
+                $node->setAttribute('type', 'file');
+                $field = new \Symfony\Component\DomCrawler\Field\FileFormField($node);
+                $field->upload($argv[2]);
+                $first = $field->getValue()['tmp_name'];
+                $field->upload($argv[2]);
+                $second = $field->getValue()['tmp_name'];
+                $other = new \Symfony\Component\DomCrawler\Field\FileFormField($node);
+                $other->upload($argv[2]);
+                $third = $other->getValue()['tmp_name'];
+                unset($field, $other);
+
+                if (function_exists('pcntl_fork')) {
+                    if (0 > $pid = pcntl_fork()) {
+                        throw new \RuntimeException('Could not fork.');
+                    }
+
+                    if (0 === $pid) {
+                        $child = new \Symfony\Component\DomCrawler\Field\FileFormField($node);
+                        $child->upload($argv[2]);
+                        echo json_encode($child->getValue()['tmp_name']), "\n";
+                        exit(0);
+                    }
+
+                    if ($pid !== pcntl_waitpid($pid, $status) || !pcntl_wifexited($status) || 0 !== pcntl_wexitstatus($status)) {
+                        throw new \RuntimeException('The child process failed.');
+                    }
+                }
+
+                clearstatcache();
+                echo json_encode([$first, $second, $third, is_file($first), is_file($second), is_file($third), $GLOBALS['shutdownCallbacks']]);
+            }
+            PHP;
+        $process = proc_open([\PHP_BINARY, '-r', $code, \dirname(__DIR__, 2).'/Field', __FILE__], [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+        $output = stream_get_contents($pipes[1]);
+        $errors = stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        $this->assertSame(0, proc_close($process), $errors);
+        $lines = explode("\n", $output);
+        $output = array_pop($lines);
+        $child = $lines ? json_decode($lines[0], true, 512, \JSON_THROW_ON_ERROR) : null;
+        [$first, $second, $third, $firstExists, $secondExists, $thirdExists, $shutdownCallbacks] = json_decode($output, true, 512, \JSON_THROW_ON_ERROR);
+
+        try {
+            $this->assertTrue($firstExists);
+            $this->assertTrue($secondExists);
+            $this->assertTrue($thirdExists);
+            $this->assertFileDoesNotExist($first);
+            $this->assertFileDoesNotExist($second);
+            $this->assertFileDoesNotExist($third);
+            $this->assertFileExists(__FILE__);
+            $this->assertSame(1, $shutdownCallbacks);
+            if (null !== $child) {
+                $this->assertFileDoesNotExist($child);
+            }
+        } finally {
+            if (null !== $child) {
+                @unlink($child);
+            }
+            @unlink($first);
+            @unlink($second);
+            @unlink($third);
+        }
+    }
+
     public function testSetErrorCode()
     {
         $node = $this->createNode('input', '', ['type' => 'file']);

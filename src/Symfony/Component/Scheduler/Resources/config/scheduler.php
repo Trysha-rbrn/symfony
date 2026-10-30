@@ -23,12 +23,13 @@ return static function (ContainerConfigurator $container) {
             ->parent('cache.app')
             ->private()
             ->tag('cache.pool')
+            ->tag('kernel.test_state', ['method' => 'clear'])
 
         ->set('scheduler.messenger.service_call_message_handler', ServiceCallMessageHandler::class)
             ->args([
                 tagged_locator('scheduler.task'),
             ])
-            ->tag('messenger.message_handler')
+            ->tag('messenger.message_handler', ['sign' => true])
         ->set('scheduler.messenger_transport_factory', SchedulerTransportFactory::class)
             ->args([
                 tagged_locator('scheduler.schedule_provider', 'name'),
@@ -49,12 +50,8 @@ return static function (ContainerConfigurator $container) {
         ->set('console.command.scheduler_debug', SchedulerDebugCommand::class)
             ->args([
                 tagged_locator('scheduler.schedule_provider', 'name'),
+                service('clock'),
             ])
             ->tag('console.command')
-
-        ->set('cache.scheduler')
-            ->parent('cache.app')
-            ->private()
-            ->tag('cache.pool')
     ;
 };

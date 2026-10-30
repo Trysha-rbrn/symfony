@@ -787,6 +787,29 @@ class OptionsResolverTest extends TestCase
         $this->assertSame(['foo' => '1'], $options);
     }
 
+    public function testCallableCanBecomeValidOnTheSecondAutoloadAttempt()
+    {
+        $class = __NAMESPACE__.'\\CallableLoadedAfterSecondAttempt';
+        $attempts = 0;
+        $loader = static function (string $name) use ($class, &$attempts): void {
+            if ($class === $name && 2 === ++$attempts) {
+                class_alias(Assert::class, $class);
+            }
+        };
+        spl_autoload_register($loader, true, true);
+
+        try {
+            $callable = $class.'::assertTrue';
+            $this->resolver->setDefined('foo');
+            $this->resolver->setAllowedTypes('foo', 'callable');
+
+            $this->assertSame(['foo' => $callable], $this->resolver->resolve(['foo' => $callable]));
+            $this->assertSame(2, $attempts);
+        } finally {
+            spl_autoload_unregister($loader);
+        }
+    }
+
     public function testResolveTypedWithUnionAndWhitespaces()
     {
         $this->resolver->setDefined('foo');
@@ -1689,6 +1712,22 @@ class OptionsResolverTest extends TestCase
         $this->resolver->setDefault('foo', 'bar');
 
         $this->assertSame(['foo' => 'bar'], $this->resolver->resolve());
+    }
+
+    public function testRemoveNestedOption()
+    {
+        $this->resolver->setOptions('database', static function (OptionsResolver $resolver) {
+            $resolver->setDefault('host', 'localhost');
+        });
+        $this->resolver->remove('database');
+
+        $this->assertFalse($this->resolver->isNested('database'));
+
+        $this->resolver->setOptions('database', static function (OptionsResolver $resolver) {
+            $resolver->setDefault('port', 3306);
+        });
+
+        $this->assertSame(['database' => ['port' => 3306]], $this->resolver->resolve());
     }
 
     public function testFailIfRemoveFromLazyOption()

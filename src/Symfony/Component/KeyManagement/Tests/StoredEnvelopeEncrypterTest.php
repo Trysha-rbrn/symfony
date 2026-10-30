@@ -13,6 +13,10 @@ namespace Symfony\Component\KeyManagement\Tests;
 
 use PHPUnit\Framework\Attributes\RequiresPhpExtension;
 use PHPUnit\Framework\TestCase;
+use Symfony\Component\KeyManagement\Ciphertext;
+use Symfony\Component\KeyManagement\DataKey;
+use Symfony\Component\KeyManagement\DataKeyHandle;
+use Symfony\Component\KeyManagement\DataKeyStoreInterface;
 use Symfony\Component\KeyManagement\Envelope;
 use Symfony\Component\KeyManagement\EnvelopeEncrypter;
 use Symfony\Component\KeyManagement\Exception\DataKeyNotFoundException;
@@ -78,6 +82,50 @@ class StoredEnvelopeEncrypterTest extends TestCase
 
         $this->assertSame('written before', $this->encrypter->decrypt($envelope));
         $this->assertNotSame($envelope->reference, $this->encrypter->encrypt('user.email', 'after')->reference);
+    }
+
+    public function testAChangedReferenceToTheSameDataKeyIsRejected()
+    {
+        $store = $this->createStub(DataKeyStoreInterface::class);
+        $store->method('current')->willReturn(new DataKeyHandle('first', new DataKey(str_repeat('K', 32), new Ciphertext('wrapped', 'app'))));
+        $store->method('get')->willReturnCallback(static fn (string $reference): DataKeyHandle => new DataKeyHandle($reference, new DataKey(str_repeat('K', 32), new Ciphertext('wrapped', 'app'))));
+        $encrypter = new StoredEnvelopeEncrypter($store);
+        $envelope = $encrypter->encrypt('user.email', 'hello', 'context');
+        $aliased = Envelope::referencing('second', $envelope->iv, $envelope->tag, $envelope->ciphertext);
+
+        $this->assertSame('hello', $encrypter->decrypt($envelope, 'context'));
+        $this->expectException(DecryptionFailedException::class);
+        $encrypter->decrypt($aliased, 'context');
+    }
+
+    public function testTheReferenceAndAadCannotBeShiftedIntoEachOther()
+    {
+        $store = $this->createStub(DataKeyStoreInterface::class);
+        $store->method('current')->willReturn(new DataKeyHandle('a', new DataKey(str_repeat('K', 32), new Ciphertext('wrapped', 'app'))));
+        $store->method('get')->willReturnCallback(static fn (string $reference): DataKeyHandle => new DataKeyHandle($reference, new DataKey(str_repeat('K', 32), new Ciphertext('wrapped', 'app'))));
+        $encrypter = new StoredEnvelopeEncrypter($store);
+        $envelope = $encrypter->encrypt('user.email', 'hello', 'bc');
+        $shifted = Envelope::referencing('ab', $envelope->iv, $envelope->tag, $envelope->ciphertext);
+
+        $this->assertSame('hello', $encrypter->decrypt($envelope, 'bc'));
+        $this->expectException(DecryptionFailedException::class);
+        $encrypter->decrypt($shifted, 'c');
+    }
+
+    public function testAnEnvelopeSurvivesRewrappingItsStoredDataKey()
+    {
+        $old = new InMemoryKms();
+        $new = new InMemoryKms();
+        $store = new InMemoryDataKeyStore(['old' => $old, 'new' => $new], 'old');
+        $encrypter = new StoredEnvelopeEncrypter($store);
+        $envelope = $encrypter->encrypt('user.email', 'hello', 'context');
+        $bytes = (string) $envelope;
+        $rewrapped = $store->get($envelope->reference)->use(static fn (string $key): DataKey => new DataKey($key, $new->encrypt('new-master', $key)));
+        $store->rewrap(iterator_to_array($store->all(), false)[0], $rewrapped, 'new');
+        $store->forget();
+
+        $this->assertSame('hello', $encrypter->decrypt(Envelope::fromBytes($bytes), 'context'));
+        $this->assertSame($bytes, (string) $envelope);
     }
 
     public function testAnEnvelopeSurvivesItsOwnFraming()
@@ -149,7 +197,7 @@ class StoredEnvelopeEncrypterTest extends TestCase
         $legacy = (new EnvelopeEncrypter(new InMemoryKms()))->encrypt('app', 'hello');
 
         $this->expectException(LogicException::class);
-        $this->expectExceptionMessage('carries its own data key');
+        $this->expectExceptionMessage('which is what the "key_management.store.read_self_contained" option does.');
         $this->encrypter->decrypt($legacy);
     }
 
@@ -185,6 +233,37 @@ class StoredEnvelopeEncrypterTest extends TestCase
         $this->expectException(LogicException::class);
         $this->expectExceptionMessage('The data key must be 32 bytes long for "aes-256-gcm", 16 given.');
         (new StoredEnvelopeEncrypter($store))->decrypt($foreign);
+    }
+
+    /**
+     * The envelope is assembled out of pieces on purpose: a row's master key id and wrapped data key,
+     * then a stored payload's iv, tag and ciphertext.
+     */
+    public function testAPayloadConvertedToTheOtherFormatIsRefusedWithoutAFallback()
+    {
+        $envelope = $this->encrypter->encrypt('user.email', 'jane@example.com');
+        $row = iterator_to_array($this->store->all(), false)[0];
+        $converted = Envelope::selfContained($row->wrapped->keyId, $row->wrapped->blob, $envelope->iv, $envelope->tag, $envelope->ciphertext);
+
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage('The envelope carries its own data key');
+        $this->encrypter->decrypt($converted);
+    }
+
+    public function testAFallbackDoesNotReadAPayloadConvertedToTheOtherFormat()
+    {
+        $kms = new InMemoryKms();
+        $store = new InMemoryDataKeyStore(['default' => $kms]);
+        $encrypter = new StoredEnvelopeEncrypter($store, new EnvelopeEncrypter($kms));
+
+        $envelope = $encrypter->encrypt('user.email', 'jane@example.com');
+        $row = iterator_to_array($store->all(), false)[0];
+        $converted = Envelope::selfContained($row->wrapped->keyId, $row->wrapped->blob, $envelope->iv, $envelope->tag, $envelope->ciphertext);
+
+        $this->assertSame('jane@example.com', $encrypter->decrypt($envelope), 'the payload the pieces come from reads, so the refusal below is the format binding and not a broken fixture.');
+
+        $this->expectException(DecryptionFailedException::class);
+        $encrypter->decrypt($converted);
     }
 
     public function testAnEnvelopeRePointedAtAnotherScopesKeyDoesNotDecrypt()

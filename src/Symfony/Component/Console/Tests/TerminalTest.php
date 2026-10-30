@@ -33,7 +33,7 @@ class TerminalTest extends TestCase
     protected function tearDown(): void
     {
         putenv($this->colSize ? 'COLUMNS='.$this->colSize : 'COLUMNS');
-        putenv($this->lineSize ? 'LINES' : 'LINES='.$this->lineSize);
+        putenv($this->lineSize ? 'LINES='.$this->lineSize : 'LINES');
         putenv($this->ansiCon ? 'ANSICON='.$this->ansiCon : 'ANSICON');
         $this->resetStatics();
     }
@@ -70,6 +70,21 @@ class TerminalTest extends TestCase
 
         $this->assertSame(0, $terminal->getWidth());
         $this->assertSame(0, $terminal->getHeight());
+    }
+
+    public function testDimensionsAreProbedOnlyOnce()
+    {
+        putenv('COLUMNS');
+        putenv('LINES');
+
+        $terminal = new Terminal();
+        $width = $terminal->getWidth();
+        $height = $terminal->getHeight();
+
+        $this->assertNotNull((new \ReflectionProperty(Terminal::class, 'width'))->getValue());
+        $this->assertNotNull((new \ReflectionProperty(Terminal::class, 'height'))->getValue());
+        $this->assertSame($width, $terminal->getWidth());
+        $this->assertSame($height, $terminal->getHeight());
     }
 
     public function testSttyOnWindows()

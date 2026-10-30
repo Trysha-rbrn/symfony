@@ -11,6 +11,8 @@
 
 namespace Symfony\Component\AssetMapper\Tests\ImportMap;
 
+use PHPUnit\Framework\Attributes\BackupGlobals;
+use PHPUnit\Framework\Attributes\TestWith;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Asset\Packages;
 use Symfony\Component\AssetMapper\ImportMap\ImportMapGenerator;
@@ -188,6 +190,30 @@ class ImportMapRendererTest extends TestCase
         (new ImportMapRenderer($importMapGenerator, polyfillImportName: 'es-module-shims'))->render(['app']);
     }
 
+    #[BackupGlobals(true)]
+    #[TestWith([true])]
+    #[TestWith([false])]
+    public function testMissingPolyfillSuggestsCurrentLauncher(bool $symfonyCli)
+    {
+        $_SERVER['PHP_SELF'] = 'tools/render-importmap.php';
+        $_SERVER['SCRIPT_FILENAME'] = __FILE__;
+        if ($symfonyCli) {
+            $_SERVER['SYMFONY_CLI_CONSOLE_COMMAND'] = '["symfony","console"]';
+            $_SERVER['SYMFONY_CLI_CONSOLE_SCRIPT'] = __FILE__;
+        } else {
+            unset($_SERVER['SYMFONY_CLI_CONSOLE_COMMAND'], $_SERVER['SYMFONY_CLI_CONSOLE_SCRIPT']);
+        }
+
+        $importMapGenerator = $this->createStub(ImportMapGenerator::class);
+        $importMapGenerator->method('getImportMapData')->willReturn([]);
+        $renderer = new ImportMapRenderer($importMapGenerator, null, 'UTF-8', 'custom-polyfill');
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage($symfonyCli ? 'The JavaScript module polyfill was not found in your import map. Either disable the polyfill or run "symfony console importmap:require "custom-polyfill"" to install it.' : ' bin/console importmap:require "custom-polyfill"" to install it.');
+
+        $renderer->render([]);
+    }
+
     public function testIntegrityIsRenderedForCssAndPolyfill()
     {
         $importMapGenerator = $this->createMock(ImportMapGenerator::class);
@@ -310,6 +336,77 @@ class ImportMapRendererTest extends TestCase
         $this->assertSame(['preload'], $linkProvider->getLinks()[0]->getRels());
         $this->assertSame(['as' => 'style'], $linkProvider->getLinks()[0]->getAttributes());
         $this->assertSame('/assets/styles/app-preload-d1g35t.css', $linkProvider->getLinks()[0]->getHref());
+    }
+
+    public function testItAddsPreloadLinksOnEachRender()
+    {
+        $importMapGenerator = $this->createStub(ImportMapGenerator::class);
+        $importMapGenerator->method('getImportMapData')->willReturn([
+            'app_css_preload' => ['path' => '/assets/styles/app-preload-d1g35t.css', 'type' => 'css', 'preload' => true],
+        ]);
+        $requestStack = new RequestStack();
+        $renderer = new ImportMapRenderer($importMapGenerator, null, 'UTF-8', false, [], $requestStack);
+
+        foreach ([Request::create('/foo'), Request::create('/bar')] as $request) {
+            $requestStack->push($request);
+            $renderer->render(['app']);
+
+            $links = $request->attributes->get('_links')->getLinks();
+            $this->assertCount(1, $links);
+            $this->assertSame('/assets/styles/app-preload-d1g35t.css', $links[0]->getHref());
+        }
+    }
+
+    public function testRenderingAgainGivesTheSameHtmlAsANewRenderer()
+    {
+        $base = [
+            'app' => ['path' => '/assets/app-d1g35t.js', 'type' => 'js', 'preload' => true],
+            '/assets/lazy.js' => ['path' => '/assets/lazy-d1g35t.js', 'type' => 'js'],
+            '/assets/app.css' => ['path' => '/assets/app-d1g35t.css', 'type' => 'css', 'preload' => true],
+            'es-module-shims' => ['path' => '/assets/es-module-shims-d1g35t.js', 'type' => 'js'],
+        ];
+        $importMapData = $base;
+        $importMapGenerator = $this->createStub(ImportMapGenerator::class);
+        $importMapGenerator->method('getImportMapData')->willReturnCallback(static function () use (&$importMapData) {
+            return $importMapData;
+        });
+        $urls = [];
+        $assetPackages = $this->createStub(Packages::class);
+        $assetPackages->method('getUrl')->willReturnCallback(static function (string $path) use (&$urls) {
+            return $urls[$path] ?? '/'.$path;
+        });
+        $renderer = new ImportMapRenderer($importMapGenerator, $assetPackages, 'UTF-8', 'es-module-shims');
+
+        $changes = [
+            static function () use (&$urls) { $urls['assets/app-d1g35t.js'] = '/cdn/app-d1g35t.js'; },
+            static function () use (&$urls) { $urls['assets/lazy.js'] = '/cdn/lazy.js'; },
+            static function () use (&$urls) { $urls['assets/app-d1g35t.css'] = '/cdn/app-d1g35t.css'; },
+            static function () use (&$urls) { $urls['assets/es-module-shims-d1g35t.js'] = '/cdn/es-module-shims-d1g35t.js'; },
+            static function () use (&$importMapData) { $importMapData['/assets/lazy.js']['preload'] = true; },
+            static function () use (&$importMapData) { $importMapData['app']['integrity'] = 'sha384-app'; },
+            static function () use (&$importMapData) { $importMapData['/assets/lazy.js']['integrity'] = 'sha384-lazy'; },
+            static function () use (&$importMapData) { $importMapData['/assets/app.css']['integrity'] = 'sha384-css'; },
+            static function () use (&$importMapData) { $importMapData['es-module-shims']['integrity'] = 'sha384-polyfill'; },
+        ];
+        $assertSameHtml = function (string $entryPoint = 'app', array $attributes = []) use ($renderer, $importMapGenerator, $assetPackages) {
+            $expected = (new ImportMapRenderer($importMapGenerator, $assetPackages, 'UTF-8', 'es-module-shims'))->render($entryPoint, $attributes);
+
+            $this->assertSame($expected, $renderer->render($entryPoint, $attributes));
+        };
+
+        $assertSameHtml();
+        foreach ($changes as $change) {
+            $change();
+            $assertSameHtml();
+
+            $urls = [];
+            $importMapData = $base;
+            $assertSameHtml();
+        }
+        $assertSameHtml('app', ['defer' => true]);
+        $assertSameHtml();
+        $assertSameHtml('other');
+        $assertSameHtml();
     }
 
     public function testLoadersCanBeInlinedInSingleQuotedJavaScriptStrings()

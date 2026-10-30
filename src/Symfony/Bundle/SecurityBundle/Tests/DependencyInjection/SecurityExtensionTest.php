@@ -13,14 +13,17 @@ namespace Symfony\Bundle\SecurityBundle\Tests\DependencyInjection;
 
 use Jose\Component\Core\JWK;
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\TestWith;
 use PHPUnit\Framework\TestCase;
 use Symfony\Bundle\SecurityBundle\DependencyInjection\Security\Factory\AuthenticatorFactoryInterface;
 use Symfony\Bundle\SecurityBundle\DependencyInjection\Security\Factory\FirewallListenerFactoryInterface;
 use Symfony\Bundle\SecurityBundle\DependencyInjection\SecurityExtension;
-use Symfony\Bundle\SecurityBundle\Routing\OidcLoginRouteLoader;
+use Symfony\Bundle\SecurityBundle\Routing\SecurityRouteLoader;
+use Symfony\Bundle\SecurityBundle\Security\TestBrowserAccessTokenAuthenticator;
 use Symfony\Bundle\SecurityBundle\SecurityBundle;
 use Symfony\Bundle\SecurityBundle\Tests\DependencyInjection\Fixtures\UserProviderFactory\CustomProviderFactory;
 use Symfony\Bundle\SecurityBundle\Tests\DependencyInjection\Fixtures\UserProviderFactory\DummyProviderFactory;
+use Symfony\Component\Cache\Adapter\ArrayAdapter;
 use Symfony\Component\Config\Definition\Builder\NodeDefinition;
 use Symfony\Component\Config\Definition\Exception\InvalidConfigurationException;
 use Symfony\Component\DependencyInjection\Argument\IteratorArgument;
@@ -30,33 +33,50 @@ use Symfony\Component\DependencyInjection\Compiler\ResolveChildDefinitionsPass;
 use Symfony\Component\DependencyInjection\Compiler\ResolveReferencesToAliasesPass;
 use Symfony\Component\DependencyInjection\Compiler\ValidateEnvPlaceholdersPass;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
+use Symfony\Component\DependencyInjection\Extension\Extension;
 use Symfony\Component\DependencyInjection\Reference;
 use Symfony\Component\ExpressionLanguage\Expression;
+use Symfony\Component\ExpressionLanguage\ExpressionLanguage;
 use Symfony\Component\HttpClient\MockHttpClient;
+use Symfony\Component\HttpClient\Response\JsonMockResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\RequestMatcher\PathRequestMatcher;
 use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpKernel\Event\ControllerArgumentsEvent;
+use Symfony\Component\HttpKernel\HttpKernelInterface;
 use Symfony\Component\HttpKernel\KernelEvents;
 use Symfony\Component\Ldap\Ldap;
 use Symfony\Component\Ldap\Security\CheckLdapCredentialsListener;
 use Symfony\Component\PasswordHasher\PasswordHasherInterface;
+use Symfony\Component\Security\Core\Authentication\AuthenticationTrustResolver;
+use Symfony\Component\Security\Core\Authentication\Token\NullToken;
 use Symfony\Component\Security\Core\Authentication\Token\TokenInterface;
+use Symfony\Component\Security\Core\Authorization\AuthorizationCheckerInterface;
+use Symfony\Component\Security\Core\Authorization\Voter\ExpressionVoter;
 use Symfony\Component\Security\Core\Exception\AuthenticationException;
 use Symfony\Component\Security\Core\User\InMemoryUserChecker;
 use Symfony\Component\Security\Core\User\UserCheckerInterface;
 use Symfony\Component\Security\Core\User\UserInterface;
 use Symfony\Component\Security\Core\User\UserProviderInterface;
+use Symfony\Component\Security\Http\Attribute\IsCsrfTokenValid;
+use Symfony\Component\Security\Http\Attribute\IsGranted;
 use Symfony\Component\Security\Http\Authenticator\AuthenticatorInterface;
 use Symfony\Component\Security\Http\Authenticator\HttpBasicAuthenticator;
 use Symfony\Component\Security\Http\Authenticator\Oidc\OidcClient;
 use Symfony\Component\Security\Http\Authenticator\Oidc\OidcSignatureVerifier;
 use Symfony\Component\Security\Http\Authenticator\Passport\Passport;
 use Symfony\Component\Security\Http\EntryPoint\FallbackAuthenticationEntryPointInterface;
+use Symfony\Component\Security\Http\EntryPoint\RedirectAuthenticationEntryPoint;
 use Symfony\Component\Security\Http\Event\CheckRefreshedUserEvent;
+use Symfony\Component\Security\Http\Firewall;
+use Symfony\Component\Security\Http\OAuth2\ClientAuthentication\ClientSecretBasic;
 use Symfony\Component\Security\Http\OAuth2\ClientAuthentication\ClientSecretJwt;
 use Symfony\Component\Security\Http\OAuth2\ClientAuthentication\ClientSecretPost;
 use Symfony\Component\Security\Http\OAuth2\ClientAuthentication\NoClientAuthentication;
 use Symfony\Component\Security\Http\OAuth2\ClientAuthentication\PrivateKeyJwt;
+use Symfony\Component\Security\Http\OAuth2\ClientAuthentication\SelfSignedTlsClientAuth;
+use Symfony\Component\Security\Http\OAuth2\ClientAuthentication\TlsClientAuth;
+use Symfony\Component\Security\Http\Oidc\OidcDiscovery;
 
 class SecurityExtensionTest extends TestCase
 {
@@ -88,6 +108,65 @@ class SecurityExtensionTest extends TestCase
         $decorated = $container->getDefinition('security.authenticator.form_login_ldap.main')->getArgument(0);
         $this->assertSame('security.authenticator.form_login_ldap.main.inner', (string) $decorated);
         $this->assertSame('/login_check_ldap', $container->getDefinition((string) $decorated)->getArgument(4)['check_path']);
+    }
+
+    public function testExpressionLanguagesOfControllerAttributesAreTagged()
+    {
+        $container = $this->getRawContainer();
+        $container->loadFromExtension('security', [
+            'firewalls' => ['main' => ['security' => false]],
+        ]);
+        $container->compile();
+
+        $this->assertSame([IsGranted::class => ['attribute']], $container->getDefinition('security.expression_language')->getTag('expression_language.compiled')[0]['attributes']);
+
+        $expressionLanguage = new class extends ExpressionLanguage {
+            public array $variables = [];
+
+            public function evaluate(Expression|string $expression, array $values = []): mixed
+            {
+                $this->variables = array_keys($values);
+
+                return null;
+            }
+        };
+        (new ControllerArgumentsEvent($this->createStub(HttpKernelInterface::class), static fn () => null, [], new Request(), HttpKernelInterface::MAIN_REQUEST))->evaluate(new Expression('true'), $expressionLanguage);
+
+        $this->assertSame([['attributes' => [IsGranted::class => ['subject']], 'variables' => $expressionLanguage->variables]], $container->getDefinition('security.is_granted_attribute_expression_language')->getTag('expression_language.compiled'));
+        $this->assertSame([['attributes' => [IsCsrfTokenValid::class => ['id']], 'variables' => $expressionLanguage->variables]], $container->getDefinition('security.is_csrf_token_valid_attribute_expression_language')->getTag('expression_language.compiled'));
+    }
+
+    public function testAccessControlExpressionsAreCompiled()
+    {
+        $container = $this->getRawContainer();
+        $container->loadFromExtension('security', [
+            'firewalls' => ['main' => ['security' => false]],
+            'access_control' => [
+                ['path' => '^/admin', 'allow_if' => 'is_granted("ROLE_ADMIN")'],
+                ['path' => '^/api', 'allow_if' => 'request.isSecure()'],
+            ],
+        ]);
+        $container->compile();
+
+        $tags = $container->getDefinition('security.expression_language')->getTag('expression_language.compiled');
+        $this->assertCount(1, $tags);
+        $this->assertSame([IsGranted::class => ['attribute']], $tags[0]['attributes']);
+        $this->assertSame(['is_granted("ROLE_ADMIN")', 'request.isSecure()'], $tags[0]['expressions']);
+        $this->assertSame('security.access_control', $tags[0]['source']);
+
+        $expressionLanguage = new class extends ExpressionLanguage {
+            public array $variables = [];
+
+            public function evaluate(Expression|string $expression, array $values = []): mixed
+            {
+                $this->variables = array_keys($values);
+
+                return true;
+            }
+        };
+        (new ExpressionVoter($expressionLanguage, new AuthenticationTrustResolver(), $this->createStub(AuthorizationCheckerInterface::class)))->vote(new NullToken(), new Request(), [new Expression('true')]);
+
+        $this->assertEqualsCanonicalizing($expressionLanguage->variables, $tags[0]['variables']);
     }
 
     public function testLdapUsersOnlyReachesTheCredentialsListener()
@@ -141,6 +220,34 @@ class SecurityExtensionTest extends TestCase
         $container->compile();
     }
 
+    public function testEntryPointPathIsWiredToTheFirewall()
+    {
+        $container = $this->getRawContainer();
+        $container->loadFromExtension('security', [
+            'providers' => ['default' => ['memory' => ['users' => ['bob' => ['password' => 'x']]]]],
+            'firewalls' => ['main' => ['form_login' => true, 'http_basic' => true, 'entry_point_path' => 'app_login']],
+        ]);
+        $container->compile();
+
+        $entryPointId = 'security.authentication.redirect_entry_point.main';
+        $this->assertSame(RedirectAuthenticationEntryPoint::class, $container->getDefinition($entryPointId)->getClass());
+        $this->assertSame('app_login', $container->getDefinition($entryPointId)->getArgument(1));
+        $this->assertSame($entryPointId, (string) $container->getDefinition('security.exception_listener.main')->getArgument(4));
+        $this->assertSame($entryPointId, $container->getDefinition('security.firewall.map.config.main')->getArgument(7));
+    }
+
+    public function testEntryPointPathIsWiredToAFirewallWithoutAuthenticators()
+    {
+        $container = $this->getRawContainer();
+        $container->loadFromExtension('security', [
+            'providers' => ['default' => ['memory' => ['users' => ['bob' => ['password' => 'x']]]]],
+            'firewalls' => ['main' => ['entry_point_path' => '/login']],
+        ]);
+        $container->compile();
+
+        $this->assertSame('security.authentication.redirect_entry_point.main', (string) $container->getDefinition('security.exception_listener.main')->getArgument(4));
+    }
+
     public function testReAuthenticationEntryPointIsWiredToTheExceptionListener()
     {
         $container = $this->getRawContainer();
@@ -152,6 +259,30 @@ class SecurityExtensionTest extends TestCase
         $container->compile();
 
         $this->assertSame('app.confirm_password', (string) $container->getDefinition('security.exception_listener.main')->getArgument(9));
+    }
+
+    public function testReAuthenticationEntryPointAcceptsAnAuthenticatorKey()
+    {
+        $container = $this->getRawContainer();
+        $container->loadFromExtension('security', [
+            'providers' => ['default' => ['memory' => ['users' => ['bob' => ['password' => 'x']]]]],
+            'firewalls' => ['main' => ['form_login' => true, 'http_basic' => true, 'entry_point' => 'http_basic', 're_authentication_entry_point' => 'form_login']],
+        ]);
+        $container->compile();
+
+        $this->assertSame('security.authenticator.form_login.main', (string) $container->getDefinition('security.exception_listener.main')->getArgument(9));
+    }
+
+    public function testTheFirewallAliasIsDeprecated()
+    {
+        $container = $this->getRawContainer();
+        $container->loadFromExtension('security', [
+            'providers' => ['default' => ['memory' => ['users' => ['bob' => ['password' => 'x']]]]],
+            'firewalls' => ['main' => ['form_login' => true]],
+        ]);
+        $container->compile();
+
+        $this->assertTrue($container->getAlias(Firewall::class)->isDeprecated());
     }
 
     public function testTheAuthenticationLifetimesArePassedToTheTrustResolver()
@@ -235,6 +366,18 @@ class SecurityExtensionTest extends TestCase
         $container->compile();
 
         $this->assertFalse($container->getDefinition('security.listener.form_login_ldap.main')->getArgument(1));
+    }
+
+    public function testAttributeExpressionLanguagesAreLazy()
+    {
+        $container = $this->getRawContainer();
+        $container->loadFromExtension('security', [
+            'firewalls' => ['main' => ['security' => false]],
+        ]);
+        $container->compile();
+
+        $this->assertTrue($container->getDefinition('security.is_granted_attribute_expression_language')->isLazy());
+        $this->assertTrue($container->getDefinition('security.is_csrf_token_valid_attribute_expression_language')->isLazy());
     }
 
     public function testInvalidCheckPath()
@@ -688,11 +831,7 @@ class SecurityExtensionTest extends TestCase
         $this->assertSame(Expression::class, $expressionDef->getClass());
         $this->assertSame($rawExpression, $expressionDef->getArgument(0));
 
-        $this->assertTrue($container->hasDefinition('security.cache_warmer.expression'));
-        $this->assertEquals(
-            new IteratorArgument([new Reference($expressionId)]),
-            $container->getDefinition('security.cache_warmer.expression')->getArgument(0)
-        );
+        $this->assertFalse($container->hasDefinition('security.cache_warmer.expression'));
     }
 
     public function testRegisterAccessControlWithSpecifiedRequestMatcherService()
@@ -863,25 +1002,6 @@ class SecurityExtensionTest extends TestCase
         $container->compile();
     }
 
-    public function testRemovesExpressionCacheWarmerDefinitionIfNoExpressions()
-    {
-        $container = $this->getRawContainer();
-        $container->loadFromExtension('security', [
-            'providers' => [
-                'default' => ['id' => 'foo'],
-            ],
-            'firewalls' => [
-                'some_firewall' => [
-                    'pattern' => '/.*',
-                    'http_basic' => [],
-                ],
-            ],
-        ]);
-        $container->compile();
-
-        $this->assertFalse($container->hasDefinition('security.cache_warmer.expression'));
-    }
-
     public function testRegisterTheUserProviderAlias()
     {
         $container = $this->getRawContainer();
@@ -988,7 +1108,7 @@ class SecurityExtensionTest extends TestCase
         $container->compile();
 
         $handler = $container->getDefinition('security.authenticator.remember_me_signature_hasher.default');
-        $this->assertSame('very', $handler->getArgument(2));
+        $this->assertSame(['very'], $handler->getArgument(2));
     }
 
     public function testRememberMeSignaturePropertiesDefaultToPassword()
@@ -1245,6 +1365,57 @@ class SecurityExtensionTest extends TestCase
         yield 'next to form_login' => [['form_login' => true], 'security.authenticator.form_login.main'];
         // and it can still be asked for explicitly
         yield 'explicitly configured' => [['http_basic' => true, 'entry_point' => 'access_token'], 'security.authenticator.access_token.main'];
+    }
+
+    public function testStatelessAccessTokenFirewallReadsTheUserOfTheTestClientInTestMode()
+    {
+        $container = $this->getRawContainer();
+        $container->register('test.client', \stdClass::class);
+        $container->register('token_handler', \stdClass::class);
+        $container->loadFromExtension('security', [
+            'providers' => [
+                'default' => ['id' => 'foo'],
+            ],
+            'firewalls' => [
+                'main' => ['stateless' => true, 'access_token' => ['token_handler' => 'token_handler']],
+            ],
+        ]);
+
+        $container->compile();
+
+        $definition = $container->getDefinition('security.authenticator.access_token.test_browser.main');
+        $this->assertSame(TestBrowserAccessTokenAuthenticator::class, $definition->getClass());
+        $this->assertSame(['security.authenticator.access_token.main', null, 0], $definition->getDecoratedService());
+        $this->assertEquals([new Reference('security.authenticator.access_token.test_browser.main.inner'), 'main', new Reference('foo')], $definition->getArguments());
+    }
+
+    #[DataProvider('provideFirewallsNotReadingTheUserOfTheTestClient')]
+    public function testFirewallDoesNotReadTheUserOfTheTestClient(bool $stateless, bool $testMode)
+    {
+        $container = $this->getRawContainer();
+        if ($testMode) {
+            $container->register('test.client', \stdClass::class);
+        }
+        $container->register('token_handler', \stdClass::class);
+        $container->loadFromExtension('security', [
+            'providers' => [
+                'default' => ['id' => 'foo'],
+            ],
+            'firewalls' => [
+                'main' => ['stateless' => $stateless, 'access_token' => ['token_handler' => 'token_handler']],
+            ],
+        ]);
+
+        $container->compile();
+
+        $this->assertFalse($container->hasDefinition('security.authenticator.access_token.test_browser.main'));
+    }
+
+    public static function provideFirewallsNotReadingTheUserOfTheTestClient(): iterable
+    {
+        yield 'stateless outside test mode' => [true, false];
+        // the test client stores its token in the session of a stateful firewall
+        yield 'stateful in test mode' => [false, true];
     }
 
     public static function provideEntryPointFirewalls(): iterable
@@ -1517,6 +1688,43 @@ class SecurityExtensionTest extends TestCase
         $container->compile();
     }
 
+    /**
+     * A stateful firewall stores the token in the session, so the cookie alone would stand for an
+     * access token nobody has to sign for any more.
+     */
+    public function testDpopRequiresAStatelessFirewall()
+    {
+        $container = $this->getRawContainer();
+        $container->register('token_handler', \stdClass::class);
+
+        $container->loadFromExtension('security', [
+            'firewalls' => [
+                'main' => ['access_token' => ['token_handler' => 'token_handler', 'dpop' => true]],
+            ],
+        ]);
+
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('The "dpop" option of the "access_token" authenticator requires the "main" firewall to be stateless');
+
+        $container->compile();
+    }
+
+    public function testDpopOnAStatelessFirewallIsAccepted()
+    {
+        $container = $this->getRawContainer();
+        $container->register('token_handler', \stdClass::class);
+
+        $container->loadFromExtension('security', [
+            'firewalls' => [
+                'main' => ['stateless' => true, 'access_token' => ['token_handler' => 'token_handler', 'dpop' => true]],
+            ],
+        ]);
+
+        $container->compile();
+
+        $this->assertTrue($container->hasDefinition('security.authenticator.access_token.sender_constraint.dpop.main'));
+    }
+
     public function testOidcLoginRegistersTheTokenRefreshListenerAfterTheContextListener()
     {
         // the listener renews the tokens the context listener just restored from the
@@ -1682,6 +1890,63 @@ class SecurityExtensionTest extends TestCase
         $this->assertFalse($container->hasAlias(\sprintf('.%s $%s', PasswordHasherInterface::class, TestUserChecker::class)));
     }
 
+    #[DataProvider('provideFrameworkConfigsEnablingTest')]
+    public function testHashersUseTheLowestCostsWhenFrameworkTestIsEnabled(array $frameworkConfigs)
+    {
+        $hashers = $this->getPasswordHashersMap($frameworkConfigs, [
+            'App\User' => 'auto',
+            'App\Admin' => 'bcrypt',
+            'App\Legacy' => ['algorithm' => 'bcrypt', 'cost' => 12],
+        ]);
+
+        $this->assertSame(['auto', 4, 10, 3], [$hashers['App\User']['algorithm'], $hashers['App\User']['cost'], $hashers['App\User']['memory_cost'], $hashers['App\User']['time_cost']]);
+        $this->assertSame([3, 10 << 10, 4, \PASSWORD_BCRYPT], $hashers['App\Admin']['arguments']);
+        $this->assertSame([3, 10 << 10, 12, \PASSWORD_BCRYPT], $hashers['App\Legacy']['arguments']);
+    }
+
+    public static function provideFrameworkConfigsEnablingTest(): iterable
+    {
+        yield 'true' => [[['test' => true]]];
+        yield 'null' => [[['test' => null]]];
+        yield 'parameter' => [[['test' => '%app.test%']]];
+        yield 'last one wins' => [[['test' => false], ['test' => true], ['secret' => 's3cr3t']]];
+    }
+
+    #[DataProvider('provideFrameworkConfigsNotEnablingTest')]
+    public function testHashersKeepTheirDefaultCostsWhenFrameworkTestIsNotEnabled(array $frameworkConfigs)
+    {
+        $hashers = $this->getPasswordHashersMap($frameworkConfigs, [
+            'App\User' => 'auto',
+            'App\Admin' => 'bcrypt',
+        ]);
+
+        $this->assertSame(['auto', null, null, null], [$hashers['App\User']['algorithm'], $hashers['App\User']['cost'], $hashers['App\User']['memory_cost'], $hashers['App\User']['time_cost']]);
+        $this->assertSame([null, null, null, \PASSWORD_BCRYPT], $hashers['App\Admin']['arguments']);
+    }
+
+    public static function provideFrameworkConfigsNotEnablingTest(): iterable
+    {
+        yield 'unset' => [[['secret' => 's3cr3t']]];
+        yield 'false' => [[['test' => false]]];
+        yield 'last one wins' => [[['test' => true], ['test' => false]]];
+        yield 'undefined env var' => [[['test' => '%env(bool:UNDEFINED_FRAMEWORK_TEST)%']]];
+    }
+
+    #[TestWith(['true', 4])]
+    #[TestWith(['false', null])]
+    public function testFrameworkTestSetByAnEnvVarDrivesTheHasherCosts(string $env, ?int $cost)
+    {
+        $_ENV['FRAMEWORK_TEST'] = $env;
+
+        try {
+            $hashers = $this->getPasswordHashersMap([['test' => '%env(bool:FRAMEWORK_TEST)%']], ['App\User' => 'bcrypt']);
+        } finally {
+            unset($_ENV['FRAMEWORK_TEST']);
+        }
+
+        $this->assertSame($cost, $hashers['App\User']['arguments'][2]);
+    }
+
     public function testAuthenticatorsDecoration()
     {
         $container = $this->getRawContainer();
@@ -1766,6 +2031,81 @@ class SecurityExtensionTest extends TestCase
         $container->compile();
 
         $this->assertTrue($container->hasDefinition('security.authenticator.oidc_login.main'));
+    }
+
+    #[DataProvider('provideOidcDiscoveryEnvironmentVariables')]
+    public function testOidcLoginResolvesDiscoveryEnvironmentVariables(string $uri, ?string $expectedUrl)
+    {
+        $container = $this->getRawContainer();
+        $container->getCompilerPassConfig()->setOptimizationPasses([
+            new ValidateEnvPlaceholdersPass(),
+            new ResolveChildDefinitionsPass(),
+        ]);
+        $container->register('app.oidc_client', MockHttpClient::class);
+        $container->loadFromExtension('security', [
+            'providers' => ['oidc' => ['oidc' => null]],
+            'firewalls' => [
+                'main' => [
+                    'oidc_login' => [
+                        'provider_uri' => 'https://provider.example.com/tenant',
+                        'discovery_uri' => '%env(SYMFONY_TEST_OIDC_DISCOVERY_URI)%',
+                        'client_id' => 'app',
+                        'client_authentication' => 'none',
+                        'http_client' => 'app.oidc_client',
+                    ],
+                ],
+            ],
+        ]);
+        $container->compile();
+
+        $definition = $container->getDefinition('security.authenticator.oidc_login.discovery.main');
+        $this->assertEquals(new Reference('app.oidc_client'), $definition->getArgument(0));
+        $this->assertSame('https://provider.example.com/tenant', $definition->getArgument(3));
+        $requested = null;
+        $httpClient = new MockHttpClient(static function (string $method, string $url) use (&$requested): JsonMockResponse {
+            $requested = $url;
+
+            return new JsonMockResponse([
+                'issuer' => 'https://provider.example.com/tenant',
+                'authorization_endpoint' => 'https://provider.example.com/authorize',
+                'token_endpoint' => 'https://provider.example.com/token',
+                'userinfo_endpoint' => 'https://provider.example.com/userinfo',
+            ]);
+        });
+        $previous = $_ENV['SYMFONY_TEST_OIDC_DISCOVERY_URI'] ?? null;
+        $_ENV['SYMFONY_TEST_OIDC_DISCOVERY_URI'] = $uri;
+        try {
+            $resolvedUri = $container->resolveEnvPlaceholders($definition->getArgument(2), true);
+        } finally {
+            if (null === $previous) {
+                unset($_ENV['SYMFONY_TEST_OIDC_DISCOVERY_URI']);
+            } else {
+                $_ENV['SYMFONY_TEST_OIDC_DISCOVERY_URI'] = $previous;
+            }
+        }
+        $discovery = new OidcDiscovery($httpClient, new ArrayAdapter(), $resolvedUri, $definition->getArgument(3), 3600, null, $definition->getArgument(6), $definition->getArgument(7));
+
+        if (null === $expectedUrl) {
+            $this->expectException(AuthenticationException::class);
+            $this->expectExceptionMessage('must use HTTPS');
+
+            try {
+                $discovery->getIssuer();
+            } finally {
+                $this->assertSame(0, $httpClient->getRequestsCount());
+            }
+        } else {
+            $this->assertSame('https://provider.example.com/tenant', $discovery->getIssuer());
+            $this->assertSame($expectedUrl, $requested);
+        }
+    }
+
+    public static function provideOidcDiscoveryEnvironmentVariables(): iterable
+    {
+        yield 'HTTPS' => ['https://metadata.example.com/config', 'https://metadata.example.com/config'];
+        yield 'loopback HTTP' => ['http://[::1]:8080/config', 'http://[::1]:8080/config'];
+        yield 'empty' => ['', 'https://provider.example.com/tenant/.well-known/openid-configuration'];
+        yield 'remote HTTP' => ['http://provider.internal/config', null];
     }
 
     public function testOidcLoginUsesTheFirewallUserProvider()
@@ -1922,10 +2262,85 @@ class SecurityExtensionTest extends TestCase
         $this->assertSame(60, $clientAuthentication->getArgument(2));
     }
 
-    public function testOidcLoginCallbackRouteLoaderIsAlwaysRegistered()
+    public function testOidcLoginBuildsTheTlsClientAuthClientAuthentication()
+    {
+        $container = $this->getRawContainer();
+        $container->loadFromExtension('security', [
+            'providers' => ['oidc' => ['oidc' => null]],
+            'firewalls' => [
+                'main' => [
+                    'oidc_login' => [
+                        'provider_uri' => 'https://provider.example.com',
+                        'client_id' => 'my-client-id',
+                        'client_certificate' => ['certificate' => '/certs/client.pem', 'key' => '/certs/client.key'],
+                        'client_authentication' => ['tls_client_auth' => true],
+                    ],
+                ],
+            ],
+        ]);
+
+        $container->compile();
+
+        $client = $container->getDefinition('security.authenticator.oidc_login.client.main');
+        $this->assertSame(TlsClientAuth::class, $container->findDefinition((string) $client->getArgument(3))->getClass());
+        $this->assertSame(
+            ['local_cert' => '/certs/client.pem', 'local_pk' => '/certs/client.key', 'passphrase' => null],
+            $client->getArgument(4),
+        );
+    }
+
+    public function testOidcLoginBuildsTheSelfSignedTlsClientAuthClientAuthentication()
+    {
+        $container = $this->getRawContainer();
+        $container->loadFromExtension('security', [
+            'providers' => ['oidc' => ['oidc' => null]],
+            'firewalls' => [
+                'main' => [
+                    'oidc_login' => [
+                        'provider_uri' => 'https://provider.example.com',
+                        'client_id' => 'my-client-id',
+                        'client_certificate' => '/certs/self-signed.pem',
+                        'client_authentication' => 'self_signed_tls_client_auth',
+                    ],
+                ],
+            ],
+        ]);
+
+        $container->compile();
+
+        $client = $container->getDefinition('security.authenticator.oidc_login.client.main');
+        $this->assertSame(SelfSignedTlsClientAuth::class, $container->findDefinition((string) $client->getArgument(3))->getClass());
+        $this->assertSame(['local_cert' => '/certs/self-signed.pem', 'local_pk' => null, 'passphrase' => null], $client->getArgument(4));
+    }
+
+    public function testOidcLoginCarriesAClientCertificateBesideAnotherAuthenticationMethod()
+    {
+        $container = $this->getRawContainer();
+        $container->loadFromExtension('security', [
+            'providers' => ['oidc' => ['oidc' => null]],
+            'firewalls' => [
+                'main' => [
+                    'oidc_login' => [
+                        'provider_uri' => 'https://provider.example.com',
+                        'client_id' => 'my-client-id',
+                        'client_certificate' => '/certs/client.pem',
+                        'client_authentication' => ['client_secret_basic' => 'my-client-secret'],
+                    ],
+                ],
+            ],
+        ]);
+
+        $container->compile();
+
+        $client = $container->getDefinition('security.authenticator.oidc_login.client.main');
+        $this->assertSame(ClientSecretBasic::class, $container->findDefinition((string) $client->getArgument(3))->getClass());
+        $this->assertSame(['local_cert' => '/certs/client.pem', 'local_pk' => null, 'passphrase' => null], $client->getArgument(4), 'the certificate rides on the requests whatever the client authenticates with');
+    }
+
+    public function testRouteLoaderIsAlwaysRegistered()
     {
         // the "security.yaml" routing recipe imports this loader unconditionally, so it
-        // must exist even in an application no firewall of which uses the OIDC authenticator
+        // must exist even when no firewall declares a route
         $container = $this->getRawContainer();
         $container->loadFromExtension('security', [
             'providers' => ['default' => ['memory' => null]],
@@ -1934,15 +2349,9 @@ class SecurityExtensionTest extends TestCase
 
         $container->compile();
 
-        $this->assertTrue($container->hasDefinition('security.authenticator.oidc_login.route_loader'));
-        $this->assertSame([], $container->getParameter('security.oidc_login.callback_uris'));
-        $this->assertSame([], $container->getParameter('security.oidc_login.start_paths'));
-
-        $loader = $container->getDefinition('security.authenticator.oidc_login.route_loader');
-        $this->assertSame(OidcLoginRouteLoader::class, $loader->getClass());
+        $loader = $container->getDefinition('security.route_loader');
+        $this->assertSame(SecurityRouteLoader::class, $loader->getClass());
         $this->assertArrayHasKey('routing.route_loader', $loader->getTags());
-        // it declares no route as long as no firewall configures the OIDC authenticator
-        $this->assertCount(0, (new OidcLoginRouteLoader($container->getParameter('security.oidc_login.callback_uris'), 'security.oidc_login.callback_uris', $container->getParameter('security.oidc_login.start_paths'), 'security.oidc_login.start_paths'))());
     }
 
     public function testOidcLoginCallsTheProviderWithTheDefaultHttpClient()
@@ -1966,6 +2375,55 @@ class SecurityExtensionTest extends TestCase
         $this->assertSame('http_client', (string) $container->getDefinition('security.authenticator.oidc_login.discovery.main')->getArgument(0));
         $this->assertSame('http_client', (string) $container->getDefinition('security.authenticator.oidc_login.client.main')->getArgument(0));
         $this->assertSame('http_client', (string) $container->getDefinition('security.authenticator.oidc_login.signature_verifier.main')->getArgument(2));
+    }
+
+    public function testOidcLoginCachesTheDocumentsOfTheProviderInTheDiscoveryPool()
+    {
+        $container = $this->getRawContainer();
+        $container->loadFromExtension('security', [
+            'providers' => ['oidc' => ['oidc' => null]],
+            'firewalls' => [
+                'main' => [
+                    'oidc_login' => [
+                        'provider_uri' => 'https://provider.example.com',
+                        'client_id' => 'my-client-id',
+                        'client_authentication' => ['client_secret_post' => 'my-client-secret'],
+                    ],
+                ],
+            ],
+        ]);
+
+        $container->compile();
+
+        $this->assertSame('cache.security.discovery', (string) $container->getDefinition('security.authenticator.oidc_login.discovery.main')->getArgument(1));
+        $this->assertSame('cache.security.discovery', (string) $container->getDefinition('security.authenticator.oidc_login.signature_verifier.main')->getArgument(1));
+    }
+
+    public function testTheCachePoolsDeriveFromTheAppPoolAndAreClearedBetweenTests()
+    {
+        $container = $this->getRawContainer();
+        $container->getExtension('security')->load([[
+            'providers' => ['oidc' => ['oidc' => null]],
+            'firewalls' => [
+                'main' => [
+                    'oidc_login' => [
+                        'provider_uri' => 'https://provider.example.com',
+                        'client_id' => 'my-client-id',
+                        'client_authentication' => ['client_secret_post' => 'my-client-secret'],
+                    ],
+                ],
+            ],
+        ]], $container);
+
+        foreach (['cache.security.discovery', 'cache.security'] as $id) {
+            $pool = $container->getDefinition($id);
+            $this->assertSame('cache.app', $pool->getParent(), $id);
+            $this->assertSame([
+                'cache.pool' => [[]],
+                'kernel.test_state' => [['method' => 'clear']],
+                'container.remove_if_missing' => [['service' => 'cache.app']],
+            ], $pool->getTags(), $id);
+        }
     }
 
     public function testOidcLoginCallsTheProviderWithTheConfiguredHttpClient()
@@ -2020,6 +2478,238 @@ class SecurityExtensionTest extends TestCase
         $container->compile();
 
         return $container;
+    }
+
+    public function testOidcLoginBackChannelLogoutIsNotWiredUnlessItIsEnabled()
+    {
+        $container = $this->getRawContainer();
+        $container->loadFromExtension('security', [
+            'providers' => ['oidc' => ['oidc' => null]],
+            'firewalls' => [
+                'main' => [
+                    'oidc_login' => [
+                        'provider_uri' => 'https://provider.example.com',
+                        'client_id' => 'my-client-id',
+                        'client_authentication' => ['client_secret_post' => 'my-client-secret'],
+                    ],
+                ],
+            ],
+        ]);
+
+        $container->compile();
+
+        $this->assertFalse($container->hasDefinition('security.authenticator.oidc_login.backchannel_logout.main'));
+        $this->assertFalse($container->hasDefinition('security.authenticator.oidc_login.backchannel_logout_listener.main'));
+        $this->assertSame([], $container->getParameter('security.oidc_login.backchannel_logout_paths'));
+    }
+
+    public function testOidcLoginBackChannelLogoutDeclaresItsEndpointAndRefusesTheSessionsThatEnded()
+    {
+        $container = $this->getRawContainer();
+        $container->loadFromExtension('security', [
+            'providers' => ['oidc' => ['oidc' => null]],
+            'firewalls' => [
+                'main' => [
+                    'oidc_login' => [
+                        'provider_uri' => 'https://provider.example.com',
+                        'client_id' => 'my-client-id',
+                        'client_authentication' => ['client_secret_post' => 'my-client-secret'],
+                        'backchannel_logout' => ['enabled' => true, 'path' => '/oidc/logout-token'],
+                    ],
+                ],
+            ],
+        ]);
+
+        $container->compile();
+
+        $this->assertSame(['main' => '/oidc/logout-token'], $container->getParameter('security.oidc_login.backchannel_logout_paths'));
+
+        $backChannelLogout = $container->getDefinition('security.authenticator.oidc_login.backchannel_logout.main');
+        $this->assertSame('security.authenticator.oidc_login.signature_verifier.main', (string) $backChannelLogout->getArgument(0));
+        $this->assertSame('my-client-id', $backChannelLogout->getArgument(3));
+        $this->assertSame('security.authenticator.oidc_login.ended_sessions.main', (string) $backChannelLogout->getArgument(4));
+
+        $endedSessions = $container->getDefinition('security.authenticator.oidc_login.ended_sessions.main');
+        $this->assertSame('cache.security', (string) $endedSessions->getArgument(0));
+        $this->assertSame('main', $endedSessions->getArgument(1));
+        $this->assertSame(86400, $endedSessions->getArgument(2));
+
+        $listener = $container->getDefinition('security.authenticator.oidc_login.backchannel_logout_listener.main');
+        $this->assertSame('security.authenticator.oidc_login.ended_sessions.main', (string) $listener->getArgument(0));
+        $this->assertSame(
+            [['event' => CheckRefreshedUserEvent::class]],
+            $listener->getTag('kernel.event_listener'),
+            'on the global dispatcher, so that the login is refused on every firewall sharing the context it was made in',
+        );
+    }
+
+    public function testOidcLoginBackChannelLogoutTakesTheCachePoolOfTheApplication()
+    {
+        $container = $this->getRawContainer();
+        $container->register('app.shared_cache', \stdClass::class);
+        $container->loadFromExtension('security', [
+            'providers' => ['oidc' => ['oidc' => null]],
+            'firewalls' => [
+                'main' => [
+                    'oidc_login' => [
+                        'provider_uri' => 'https://provider.example.com',
+                        'client_id' => 'my-client-id',
+                        'client_authentication' => ['client_secret_post' => 'my-client-secret'],
+                        'backchannel_logout' => ['enabled' => true, 'cache' => 'app.shared_cache'],
+                    ],
+                ],
+            ],
+        ]);
+
+        $container->compile();
+
+        $this->assertSame('app.shared_cache', (string) $container->getDefinition('security.authenticator.oidc_login.ended_sessions.main')->getArgument(0));
+    }
+
+    public function testOidcLoginBackChannelLogoutRemembersAnEndedSessionForTheConfiguredLifetime()
+    {
+        $container = $this->getRawContainer();
+        $container->loadFromExtension('security', [
+            'providers' => ['oidc' => ['oidc' => null]],
+            'firewalls' => [
+                'main' => [
+                    'oidc_login' => [
+                        'provider_uri' => 'https://provider.example.com',
+                        'client_id' => 'my-client-id',
+                        'client_authentication' => ['client_secret_post' => 'my-client-secret'],
+                        'backchannel_logout' => ['enabled' => true, 'lifetime' => 604800],
+                    ],
+                ],
+            ],
+        ]);
+
+        $container->compile();
+
+        $this->assertSame(604800, $container->getDefinition('security.authenticator.oidc_login.ended_sessions.main')->getArgument(2));
+    }
+
+    public function testOidcLoginBackChannelLogoutNeedsTheSignatureOfTheProvider()
+    {
+        $container = $this->getRawContainer();
+        $container->loadFromExtension('security', [
+            'providers' => ['oidc' => ['oidc' => null]],
+            'firewalls' => [
+                'main' => [
+                    'oidc_login' => [
+                        'provider_uri' => 'https://provider.example.com',
+                        'client_id' => 'my-client-id',
+                        'client_authentication' => ['client_secret_post' => 'my-client-secret'],
+                        'id_token_signature' => ['required' => false],
+                        'backchannel_logout' => ['enabled' => true],
+                    ],
+                ],
+            ],
+        ]);
+
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('The OIDC "backchannel_logout" option cannot be enabled while "id_token_signature.required" is false');
+
+        $container->compile();
+    }
+
+    /**
+     * A stateless firewall restores no token, so the listener acting on a recorded end never runs.
+     */
+    public function testOidcLoginBackChannelLogoutRequiresAStatefulFirewall()
+    {
+        $container = $this->getRawContainer();
+        $container->loadFromExtension('security', [
+            'providers' => ['oidc' => ['oidc' => null]],
+            'firewalls' => [
+                'main' => [
+                    'stateless' => true,
+                    'oidc_login' => [
+                        'provider_uri' => 'https://provider.example.com',
+                        'client_id' => 'my-client-id',
+                        'client_authentication' => ['client_secret_post' => 'my-client-secret'],
+                        'backchannel_logout' => true,
+                    ],
+                ],
+            ],
+        ]);
+
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('The OIDC "backchannel_logout" option of the "main" firewall requires a stateful firewall');
+
+        $container->compile();
+    }
+
+    public function testOidcLoginOnAStatelessFirewallWithoutBackChannelLogoutIsAllowed()
+    {
+        $container = $this->getRawContainer();
+        $container->loadFromExtension('security', [
+            'providers' => ['oidc' => ['oidc' => null]],
+            'firewalls' => [
+                'main' => [
+                    'stateless' => true,
+                    'oidc_login' => [
+                        'provider_uri' => 'https://provider.example.com',
+                        'client_id' => 'my-client-id',
+                        'client_authentication' => ['client_secret_post' => 'my-client-secret'],
+                    ],
+                ],
+            ],
+        ]);
+
+        $container->compile();
+
+        $this->assertFalse($container->hasDefinition('security.authenticator.oidc_login.backchannel_logout_listener.main'));
+    }
+
+    public function testOidcLoginBackChannelLogoutPathMustBeAPath()
+    {
+        $container = $this->getRawContainer();
+        $container->loadFromExtension('security', [
+            'providers' => ['oidc' => ['oidc' => null]],
+            'firewalls' => [
+                'main' => [
+                    'oidc_login' => [
+                        'provider_uri' => 'https://provider.example.com',
+                        'client_id' => 'my-client-id',
+                        'client_authentication' => ['client_secret_post' => 'my-client-secret'],
+                        'backchannel_logout' => ['enabled' => true, 'path' => 'oidc/logout-token'],
+                    ],
+                ],
+            ],
+        ]);
+
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('The OIDC "backchannel_logout.path" option must be a path starting with "/".');
+
+        $container->compile();
+    }
+
+    private function getPasswordHashersMap(array $frameworkConfigs, array $passwordHashers): array
+    {
+        $container = $this->getRawContainer();
+        $container->setParameter('app.test', true);
+        $container->registerExtension(new class extends Extension {
+            public function load(array $configs, ContainerBuilder $container): void
+            {
+            }
+
+            public function getAlias(): string
+            {
+                return 'framework';
+            }
+        });
+
+        foreach ($frameworkConfigs as $config) {
+            $container->loadFromExtension('framework', $config);
+        }
+
+        $container->loadFromExtension('security', [
+            'password_hashers' => $passwordHashers,
+            'firewalls' => ['main' => ['http_basic' => true]],
+        ]);
+        $container->compile();
+
+        return $container->getDefinition('security.password_hasher_factory')->getArgument(0);
     }
 }
 

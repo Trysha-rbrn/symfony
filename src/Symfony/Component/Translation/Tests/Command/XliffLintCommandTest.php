@@ -12,9 +12,12 @@
 namespace Symfony\Component\Translation\Tests\Command;
 
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\RequiresMethod;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Console\Application;
 use Symfony\Component\Console\Command\Command;
+use Symfony\Component\Console\Completion\CompletionInput;
+use Symfony\Component\Console\Completion\CompletionSuggestions;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Tester\CommandCompletionTester;
 use Symfony\Component\Console\Tester\CommandTester;
@@ -71,6 +74,39 @@ class XliffLintCommandTest extends TestCase
 
         $this->assertEquals($mustFail ? 1 : 0, $tester->getStatusCode());
         $this->assertStringContainsString($mustFail ? '[WARNING] 0 XLIFF files have valid syntax and 1 contain errors.' : '[OK] All 1 XLIFF files contain valid syntax.', $tester->getDisplay());
+    }
+
+    public function testLintXliff2TargetLanguageMatchesFilename()
+    {
+        $filename = $this->createXliff2File('en');
+        $tester = $this->createCommandTester();
+
+        $tester->execute(['filename' => $filename], ['decorated' => false]);
+
+        $tester->assertCommandIsSuccessful();
+    }
+
+    public function testLintXliff2TargetLanguageMismatch()
+    {
+        $filename = $this->createXliff2File('fr');
+        $tester = $this->createCommandTester();
+
+        $tester->execute(['filename' => $filename], ['decorated' => false]);
+
+        $this->assertSame(1, $tester->getStatusCode());
+        $this->assertStringContainsString('There is a mismatch between the language included in the file name ("messages.en.xlf") and the "fr" value used in the "trgLang" attribute of the file.', $tester->getDisplay());
+    }
+
+    public function testLintWithoutFilename()
+    {
+        $validate = new \ReflectionMethod(XliffLintCommand::class, 'validate');
+
+        foreach ([file_get_contents($this->createFile()), file_get_contents($this->createXliff2File('fr'))] as $content) {
+            $result = $validate->invoke(new XliffLintCommand(), $content);
+
+            $this->assertTrue($result['valid']);
+            $this->assertNull($result['file']);
+        }
     }
 
     public function testLintIncorrectXmlSyntax()
@@ -134,11 +170,11 @@ class XliffLintCommandTest extends TestCase
         $expected = <<<EOF
             Or of a whole directory:
 
-              <info>php %command.full_name% dirname</info>
+              <info>%command.invocation% dirname</info>
 
             The <info>--format</info> option specifies the format of the command output:
 
-              <info>php %command.full_name% dirname --format=json</info>
+              <info>%command.invocation% dirname --format=json</info>
 
             EOF;
 
@@ -204,6 +240,17 @@ class XliffLintCommandTest extends TestCase
         $this->files[] = $filename;
 
         return $filename;
+    }
+
+    #[RequiresMethod(CompletionSuggestions::class, 'suggestPaths')]
+    public function testCompleteFilenames()
+    {
+        $command = $this->createCommand();
+        $input = CompletionInput::fromTokens(['lint:xliff'], 1);
+        $input->bind($command->getDefinition());
+        $command->complete($input, $suggestions = new CompletionSuggestions());
+
+        $this->assertSame('paths', $suggestions->getPathSuggestion());
     }
 
     private function createCommand($requireStrictFileNames = true, $application = null): Command
@@ -304,5 +351,28 @@ class XliffLintCommandTest extends TestCase
         }
 
         $this->assertSame([], $networkLoads, 'XliffLintCommand::validate() must not resolve external entities over the network.');
+    }
+
+    private function createXliff2File(string $targetLanguage): string
+    {
+        $xml = <<<XML
+            <?xml version="1.0"?>
+            <xliff xmlns="urn:oasis:names:tc:xliff:document:2.0" version="2.0" srcLang="en" trgLang="$targetLanguage">
+                <file id="messages">
+                    <unit id="hello">
+                        <segment>
+                            <source>Hello</source>
+                            <target>Bonjour</target>
+                        </segment>
+                    </unit>
+                </file>
+            </xliff>
+            XML;
+
+        $filename = sys_get_temp_dir().'/translation-xliff-lint-test/messages.en.xlf';
+        file_put_contents($filename, $xml);
+        $this->files[] = $filename;
+
+        return $filename;
     }
 }

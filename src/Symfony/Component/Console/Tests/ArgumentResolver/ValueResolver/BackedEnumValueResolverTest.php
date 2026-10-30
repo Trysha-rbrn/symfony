@@ -73,6 +73,69 @@ class BackedEnumValueResolverTest extends TestCase
         $this->assertSame([BackedEnumTestStatus::Completed], $result);
     }
 
+    public function testResolveVariadicBackedEnumArgument()
+    {
+        $resolver = new BackedEnumValueResolver();
+
+        $input = new ArrayInput(['statuses' => ['pending', 'completed']], new InputDefinition([
+            new InputArgument('statuses', InputArgument::IS_ARRAY),
+        ]));
+
+        $command = new class {
+            public function __invoke(
+                #[Argument]
+                BackedEnumTestStatus ...$statuses,
+            ) {
+            }
+        };
+        $member = new ReflectionMember((new \ReflectionMethod($command, '__invoke'))->getParameters()[0]);
+
+        $this->assertSame([BackedEnumTestStatus::Pending, BackedEnumTestStatus::Completed], iterator_to_array($resolver->resolve('statuses', $input, $member)));
+    }
+
+    public function testResolveVariadicBackedEnumOption()
+    {
+        $resolver = new BackedEnumValueResolver();
+
+        $input = new ArrayInput(['--statuses' => ['completed', 'pending']], new InputDefinition([
+            new InputOption('statuses', null, InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY),
+        ]));
+
+        $command = new class {
+            public function __invoke(
+                #[Option]
+                BackedEnumTestStatus ...$statuses,
+            ) {
+            }
+        };
+        $member = new ReflectionMember((new \ReflectionMethod($command, '__invoke'))->getParameters()[0]);
+
+        $this->assertSame([BackedEnumTestStatus::Completed, BackedEnumTestStatus::Pending], iterator_to_array($resolver->resolve('statuses', $input, $member)));
+    }
+
+    public function testVariadicBackedEnumOptionThrowsOnInvalidValue()
+    {
+        $resolver = new BackedEnumValueResolver();
+
+        $input = new ArrayInput(['--statuses' => ['pending', 'invalid']], new InputDefinition([
+            new InputOption('statuses', null, InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY),
+        ]));
+
+        $command = new class {
+            public function __invoke(
+                #[Option]
+                BackedEnumTestStatus ...$statuses,
+            ) {
+            }
+        };
+        $member = new ReflectionMember((new \ReflectionMethod($command, '__invoke'))->getParameters()[0]);
+
+        $this->expectException(InvalidOptionException::class);
+        $this->expectExceptionMessage('The value "invalid" is not valid for the "statuses" option.');
+
+        iterator_to_array($resolver->resolve('statuses', $input, $member));
+    }
+
     public function testBackedEnumArgumentThrowsOnInvalidValue()
     {
         $this->expectException(InvalidArgumentException::class);
@@ -119,6 +182,107 @@ class BackedEnumValueResolverTest extends TestCase
         $member = new ReflectionMember($parameter);
 
         iterator_to_array($resolver->resolve('status', $input, $member));
+    }
+
+    public function testResolveBackedEnumListArgument()
+    {
+        $resolver = new BackedEnumValueResolver();
+
+        $input = new ArrayInput(['statuses' => ['pending', 'completed']], new InputDefinition([
+            new InputArgument('statuses', InputArgument::IS_ARRAY),
+        ]));
+
+        $command = new class {
+            /** @param list<BackedEnumTestStatus> $statuses */
+            public function __invoke(
+                #[Argument]
+                array $statuses = [],
+            ) {
+            }
+        };
+        $reflection = new \ReflectionMethod($command, '__invoke');
+        $parameter = $reflection->getParameters()[0];
+        $member = new ReflectionMember($parameter);
+
+        $result = iterator_to_array($resolver->resolve('statuses', $input, $member));
+
+        $this->assertSame([[BackedEnumTestStatus::Pending, BackedEnumTestStatus::Completed]], $result);
+    }
+
+    public function testResolveBackedEnumListOption()
+    {
+        $resolver = new BackedEnumValueResolver();
+
+        $input = new ArrayInput(['--statuses' => ['pending', 'completed']], new InputDefinition([
+            new InputOption('statuses', null, InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY),
+        ]));
+
+        $command = new class {
+            /** @param list<BackedEnumTestStatus> $statuses */
+            public function __invoke(
+                #[Option]
+                array $statuses = [],
+            ) {
+            }
+        };
+        $reflection = new \ReflectionMethod($command, '__invoke');
+        $parameter = $reflection->getParameters()[0];
+        $member = new ReflectionMember($parameter);
+
+        $result = iterator_to_array($resolver->resolve('statuses', $input, $member));
+
+        $this->assertSame([[BackedEnumTestStatus::Pending, BackedEnumTestStatus::Completed]], $result);
+    }
+
+    public function testResolveNullableBackedEnumListOption()
+    {
+        $resolver = new BackedEnumValueResolver();
+
+        $input = new ArrayInput([], new InputDefinition([
+            new InputOption('statuses', null, InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY),
+        ]));
+
+        $command = new class {
+            /** @param list<BackedEnumTestStatus>|null $statuses */
+            public function __invoke(
+                #[Option]
+                ?array $statuses = null,
+            ) {
+            }
+        };
+        $reflection = new \ReflectionMethod($command, '__invoke');
+        $parameter = $reflection->getParameters()[0];
+        $member = new ReflectionMember($parameter);
+
+        $result = iterator_to_array($resolver->resolve('statuses', $input, $member));
+
+        $this->assertSame([null], $result);
+    }
+
+    public function testBackedEnumListOptionThrowsOnInvalidValue()
+    {
+        $this->expectException(InvalidOptionException::class);
+        $this->expectExceptionMessage('The value "invalid" is not valid for the "statuses" option. Supported values are "pending", "completed", "failed".');
+
+        $resolver = new BackedEnumValueResolver();
+
+        $input = new ArrayInput(['--statuses' => ['pending', 'invalid']], new InputDefinition([
+            new InputOption('statuses', null, InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY),
+        ]));
+
+        $command = new class {
+            /** @param list<BackedEnumTestStatus> $statuses */
+            public function __invoke(
+                #[Option]
+                array $statuses = [],
+            ) {
+            }
+        };
+        $reflection = new \ReflectionMethod($command, '__invoke');
+        $parameter = $reflection->getParameters()[0];
+        $member = new ReflectionMember($parameter);
+
+        iterator_to_array($resolver->resolve('statuses', $input, $member));
     }
 
     public function testDoesNotResolveNonEnumArgument()

@@ -4,24 +4,43 @@ CHANGELOG
 8.2
 ---
 
+ * Add `#[RecoverableAttribute]` to declare the exceptions of a controller attribute that are passed to the controller parameter typed to receive them instead of being thrown
+ * Make `#[RateLimit]`, `#[Lock]` and `#[IsSignatureValid]` recoverable, so a controller can receive a `RateLimitExceededException`, `LockConflictedException` or `SignedUriException`
+ * Add `ControllerArgumentsEvent::getControllerReflector()`
+ * Return an HTTP 204 response for controllers with a `void` return type
+ * Add `Store::clear()` to remove all the entries of the HTTP cache store
+ * Add the `lint:expressions` command to lint the expressions of controller attributes and the ones listed in the configuration
  * Log exceptions whose HTTP status code is below 500 (client errors) at the `warning` level instead of `error`
- * Add `before` and `after` to `#[AsControllerAttributeListener]`, whose `$priority` is now nullable
- * [BC BREAK] Answer a scheme redirect from `RouterListener` itself, so that no other listener runs on a request whose route is not served over the requested scheme
+ * Answer a scheme redirect from `RouterListener` itself, so that no other listener runs on a request whose route is not served over the requested scheme
  * Add the `cache_status` option to `HttpCache` to emit the RFC 9211 `Cache-Status` header
  * Add `#[AsControllerAttributeListener]` attribute to declare event listeners for controller attributes
  * Add the `$expiration` argument to `FragmentUriGenerator::__construct()` and sign fragment URIs with a 5-year expiration by default
- * Add `hasDump()` method to `Profile` to track profiles with dump
+ * Add `Profile::hasDump()` to track profiles with dump
  * Dispatch `RateLimitExceededEvent` from `RateLimitAttributeListener` when the `#[RateLimit]` attribute rejects a request
  * Seed the query bag from the `_query` route default when a route is matched
- * Deserialize the query parameter named by `#[MapQueryString(key:)]` as JSON when it holds a string, e.g. `?filter={"page":1}`
+ * Deserialize the query parameter named by `#[MapQueryString(key:)]` as JSON when it holds a string
  * Prefix the property path to each violation message reported by `RequestPayloadValueResolver`
  * Add `SourceValueResolverInterface` to let a value resolver stage a raw value for the resolvers that follow it, so `#[MapQueryParameter]` accepts any type another resolver can build
  * Deprecate the `HIncludeFragmentRenderer` class, use the `EsiFragmentRenderer` or `InlineFragmentRenderer`, or Symfony UX Turbo, instead
  * Allow union and intersection type-hints when autowiring controller arguments
  * Add the `$excludedPaths` and `$excludedHttpCodes` arguments to `ProfilerListener::__construct()` to skip profiling some requests
- * Make `#[MapRequestPayload]` deserialize any media type carrying a structured syntax suffix with the encoder of the suffix format, e.g. `application/vnd.api+json` with the `json` encoder
- * Add the `$exposeHeaders` argument to `#[RateLimit]`
+ * Make `#[MapRequestPayload]` decode any media type carrying a structured syntax suffix with the encoder of that suffix, e.g. `application/vnd.api+json` with the `json` encoder
+ * Add the `$exposeHeaders` and `$if` arguments to `#[RateLimit]`, and the `$expressionLanguage` argument to `RateLimitAttributeListener`
  * Instantiate on demand the bundles that have nothing to do when the kernel boots
+ * Add `PaymentRequiredHttpException`, `RequestTimeoutHttpException`, `ContentTooLargeHttpException`, `RangeNotSatisfiableHttpException`, `ExpectationFailedHttpException`, `FailedDependencyHttpException`, `TooEarlyHttpException`, `UnavailableForLegalReasonsHttpException` and `NotImplementedHttpException`
+ * Make `HttpClientKernel` forward the responses that carry the RFC 10036 `Incremental: ?1` header without buffering them
+ * Consume the tokens of `#[RateLimit]` before resolving the controller arguments when its key does not read them
+ * Add the `#[Lock]` attribute and `ConcurrentRequestHttpException` to reject or delay concurrent requests to a controller, with `{name}` placeholders in the key to read request attributes
+ * Apply the `#[Cache]` attribute to 308 responses
+ * Treat 308 responses like 301 ones in `ResponseCacheStrategy`
+ * Add `LockValueResolver` to inject the lock acquired by `#[Lock]` into the `LockInterface` and `SharedLockInterface` controller arguments
+ * Allow `{name}` placeholders in the key of `#[RateLimit]` to read request attributes
+ * Add the `$map` argument to `#[Serialize]` and the `$objectMapper` argument to `SerializeControllerResultAttributeListener` to map controller results with the object mapper before serializing them
+ * Add the `$stream` argument to `#[Serialize]` and the `$streamWriter` and `$typeResolver` arguments to `SerializeControllerResultAttributeListener` to stream controller results as JSON with the stream writer
+ * Add `RateLimitValueResolver` to inject the rate limit consumed by `#[RateLimit]` into the `RateLimit` controller arguments
+ * Add the `$target` argument to `#[Cache]` to set the targeted cache directives defined by RFC 9213, e.g. `CDN-Cache-Control`
+ * Add the `$logger` argument to `InlineFragmentRenderer::__construct()` to log the exception thrown by a fragment before rendering its `alt` URI
+ * Show previous exceptions in the profiler instead of cutting them
 
 8.1
 ---
@@ -41,7 +60,7 @@ CHANGELOG
  * Allow using closures with the `Cache` attribute
  * Allow setting a condition when the `Cache` attribute should be applied
  * Add `ControllerEvent::evaluate()` et al. to help with evaluating expressions or closures in controller attributes
- * Deprecate passing a non-flat list of attributes to `Controller::setController()`
+ * Deprecate passing a non-flat list of attributes to `ControllerEvent::setController()` and `ControllerArgumentsEvent::setController()`
  * Deprecate the `Symfony\Component\HttpKernel\DependencyInjection\Extension` class, use the parent `Symfony\Component\DependencyInjection\Extension\Extension` class instead
  * Allow using Expression or \Closure for `validationGroups` in `#[MapRequestPayload]` and `#[MapQueryString]`
  * Deprecate passing a `ControllerArgumentsEvent` to the `ViewEvent` constructor; pass a `ControllerArgumentsMetadata` instead

@@ -791,10 +791,11 @@ class ParserTest extends TestCase
         $this->assertSameData([['a' => new TaggedValue('text', "\n")], 'b'], $this->parser->parse("- a: !text\t|+\n\n- b\n", Yaml::PARSE_CUSTOM_TAGS));
     }
 
-    public function testEmptyBlockScalarFollowedByLessIndentedComment()
+    public function testHashLedLinesAfterMoreIndentedEmptyLinesAreBlockScalarContent()
     {
-        $this->assertSame(['k' => "\n", 'next' => 1], $this->parser->parse("k: |+\n   \n  # comment\nnext: 1\n"));
-        $this->assertSame(['k' => ''], $this->parser->parse("k: >\n   \n  # comment\n"));
+        $this->assertSame(['k' => "\n# comment\ntext", 'next' => 1], $this->parser->parse("k: |-\n     \n    # comment\n    text\nnext: 1\n"));
+        $this->assertSame(['k' => "\n# comment\n", 'next' => 1], $this->parser->parse("k: |+\n   \n  # comment\nnext: 1\n"));
+        $this->assertSame(['k' => "\n# comment\n"], $this->parser->parse("k: >\n   \n  # comment\n"));
         $this->assertSame(["\n\n# detected\n"], $this->parser->parse("- >\n \n  \n  # detected\n"));
     }
 
@@ -2027,6 +2028,78 @@ class ParserTest extends TestCase
         $this->assertSame(['foobar' => 'foo\\ bar'], $this->parser->parse($yaml));
     }
 
+    #[DataProvider('foldedQuotedStringsProvider')]
+    public function testWhiteSpaceIsFoldedInMultiLineQuotedString(string $yaml, array $expected)
+    {
+        $this->assertSame($expected, $this->parser->parse($yaml));
+    }
+
+    public static function foldedQuotedStringsProvider()
+    {
+        return [
+            'double-quoted, trailing spaces' => [
+                "key: \"foo   \n  bar\"",
+                ['key' => 'foo bar'],
+            ],
+            'double-quoted, trailing and leading tab' => [
+                "key: \"foo\t \n \tbar\"",
+                ['key' => 'foo bar'],
+            ],
+            'single-quoted, trailing spaces' => [
+                "key: 'foo   \n  bar'",
+                ['key' => 'foo bar'],
+            ],
+            'single-quoted, trailing and leading tab' => [
+                "key: 'foo\t \n \tbar'",
+                ['key' => 'foo bar'],
+            ],
+            'double-quoted, empty line' => [
+                "key: \"a  \n\n  b\"",
+                ['key' => "a\nb"],
+            ],
+            'single-quoted, empty line' => [
+                "key: 'a  \n\n  b'",
+                ['key' => "a\nb"],
+            ],
+            'double-quoted, line of spaces and tabs' => [
+                "key: \"a\n \t \n  b\"",
+                ['key' => "a\nb"],
+            ],
+            'single-quoted, line of tabs' => [
+                "key: 'a\n  \t\n  b'",
+                ['key' => "a\nb"],
+            ],
+            'double-quoted, escaped trailing space' => [
+                "key: \"foo\\ \n  bar\"",
+                ['key' => 'foo  bar'],
+            ],
+            'double-quoted, escaped trailing tab' => [
+                "key: \"foo\\\t\n  bar\"",
+                ['key' => "foo\t bar"],
+            ],
+            'double-quoted, tab escape sequence' => [
+                "key: \"foo\\t\n bar\"",
+                ['key' => "foo\t bar"],
+            ],
+            'double-quoted, escaped line break' => [
+                "key: \"foo\\\n  bar\"",
+                ['key' => 'foobar'],
+            ],
+            'double-quoted, white space before an escaped line break' => [
+                "key: \"foo  \\\n  bar\"",
+                ['key' => 'foo  bar'],
+            ],
+            'double-quoted, single line' => [
+                'key: "foo   bar"',
+                ['key' => 'foo   bar'],
+            ],
+            'single-quoted, single line' => [
+                "key: 'foo   bar'",
+                ['key' => 'foo   bar'],
+            ],
+        ];
+    }
+
     #[DataProvider('wrappedUnquotedStringsProvider')]
     public function testWrappedUnquotedStringWithMultipleSpacesInValue(string $yaml, array $expected)
     {
@@ -3128,6 +3201,13 @@ class ParserTest extends TestCase
         ], $this->parser->parse($yaml));
     }
 
+    public function testPhpConstantTagFlowMappingKeyUsesTheConstantValueAsIs()
+    {
+        $yaml = '{!php/const Symfony\Component\Yaml\Tests\B::TRUE_STRING: a, !php/const Symfony\Component\Yaml\Tests\B::ALIAS_STRING: b, !php/const Symfony\Component\Yaml\Tests\B::MERGE_KEY: {c: d}}';
+
+        $this->assertSame(['true' => 'a', '*foo' => 'b', '<<' => ['c' => 'd']], $this->parser->parse($yaml, Yaml::PARSE_CONSTANT));
+    }
+
     public function testMergeKeysWhenMappingsAreParsedAsObjects()
     {
         $yaml = <<<YAML
@@ -3163,6 +3243,43 @@ class ParserTest extends TestCase
         ];
 
         $this->assertSameData($expected, $this->parser->parse($yaml, Yaml::PARSE_OBJECT_FOR_MAP));
+    }
+
+    public function testMergeKeysInFlowMappingsWhenMappingsAreParsedAsObjects()
+    {
+        $yaml = <<<YAML
+            foo: &FOO { bar: 1 }
+            bar: &BAR { baz: 2, <<: *FOO }
+            baz: { baz_foo: 3, <<: { baz_bar: 4 } }
+            foobar: { bar: ~, <<: [*FOO, *BAR] }
+            YAML;
+        $expected = (object) [
+            'foo' => (object) [
+                'bar' => 1,
+            ],
+            'bar' => (object) [
+                'baz' => 2,
+                'bar' => 1,
+            ],
+            'baz' => (object) [
+                'baz_foo' => 3,
+                'baz_bar' => 4,
+            ],
+            'foobar' => (object) [
+                'bar' => null,
+                'baz' => 2,
+            ],
+        ];
+
+        $this->assertSameData($expected, $this->parser->parse($yaml, Yaml::PARSE_OBJECT_FOR_MAP));
+    }
+
+    public function testKeyStartingWithNulByteThrowsParseExceptionWhenMappingsAreParsedAsObjects()
+    {
+        $this->expectException(ParseException::class);
+        $this->expectExceptionMessage('Mapping keys starting with a NUL byte are not supported with the "Yaml::PARSE_OBJECT_FOR_MAP" flag at line 2 (near ""\0": 1").');
+
+        $this->parser->parse("foo: 1\n\"\\0\": 1\n", Yaml::PARSE_OBJECT_FOR_MAP);
     }
 
     public function testFilenamesAreParsedAsStringsWithoutFlag()
@@ -3231,6 +3348,27 @@ class ParserTest extends TestCase
         $this->assertSame($expected, $this->parser->parse($yaml));
     }
 
+    public function testParseQuotedMergeKeyAsRegularKey()
+    {
+        $this->assertSame([
+            'base' => ['a' => 'foo'],
+            'derived' => ['<<' => ['a' => 'foo'], 'b' => 'bar'],
+            'scalar' => ['<<' => 'foo'],
+            'tagged' => ['<<' => 'foo'],
+        ], $this->parser->parse(<<<'EOF'
+            base: &base
+                a: foo
+            derived:
+                '<<': *base
+                b: bar
+            scalar:
+                "<<": foo
+            tagged:
+                !!str <<: foo
+            EOF
+        ));
+    }
+
     public function testParseMergeKeyAliasFollowedByAComment()
     {
         $this->assertSame([
@@ -3244,6 +3382,51 @@ class ParserTest extends TestCase
                 b: bar
             EOF
         ));
+    }
+
+    public function testParseMergeKeyFollowedByATab()
+    {
+        $this->assertSame([
+            'base' => ['a' => 'foo'],
+            'derived' => ['a' => 'foo', 'b' => 'bar'],
+        ], $this->parser->parse(<<<EOF
+            base: &base
+                a: foo
+            derived:
+                <<\t: *base
+                b: bar
+            EOF
+        ));
+    }
+
+    public function testParseMergeKeyWithSequenceOfTaggedValuesThrowsParseException()
+    {
+        $this->expectException(ParseException::class);
+        $this->expectExceptionMessage('Merge items must be arrays');
+
+        $this->parser->parse("<<:\n  - !foo bar\n", Yaml::PARSE_CUSTOM_TAGS);
+    }
+
+    public function testParseMergeKeyWithSequenceStartingWithNullThrowsParseException()
+    {
+        $this->expectException(ParseException::class);
+        $this->expectExceptionMessage('Merge items must be arrays');
+
+        $this->parser->parse("<<:\n  - ~\n  - {a: b}\n");
+    }
+
+    public function testParseMergeKeyWithFlowSequenceStartingWithNullThrowsParseException()
+    {
+        $this->expectException(ParseException::class);
+        $this->expectExceptionMessage('Merge items must be arrays');
+
+        $this->parser->parse("<<: [~, {a: b}]\n");
+    }
+
+    public function testParseMergeKeyWithMappingThatHasZeroAsKey()
+    {
+        $this->assertSame([0 => 'a', 'b' => 'c'], $this->parser->parse("<<: {0: a}\nb: c\n"));
+        $this->assertSame([0 => ['a' => 'b']], $this->parser->parse("<<:\n  0: {a: b}\n"));
     }
 
     public function testParseReferencesOnMergeKeysWithMappingsParsedAsObjects()
@@ -3887,4 +4070,7 @@ class B
     public const FOO = 'foo';
     public const BAR = 'bar';
     public const BAZ = 'baz';
+    public const TRUE_STRING = 'true';
+    public const ALIAS_STRING = '*foo';
+    public const MERGE_KEY = '<<';
 }

@@ -18,6 +18,7 @@ use Jose\Component\Signature\JWSBuilder;
 use Jose\Component\Signature\Serializer\CompactSerializer;
 use PHPUnit\Framework\Attributes\AllowMockObjectsWithoutExpectations;
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\TestCase;
 use Psr\Clock\ClockInterface;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
@@ -53,6 +54,7 @@ use Symfony\Component\Security\Http\Authenticator\Passport\Badge\UserBadge;
 use Symfony\Component\Security\Http\Authenticator\Passport\SelfValidatingPassport;
 use Symfony\Component\Security\Http\Event\OidcAuthorizationRequestEvent;
 use Symfony\Component\Security\Http\HttpUtils;
+use Symfony\Component\Security\Http\OAuth2\Dpop\DpopProofFactory;
 use Symfony\Component\Security\Http\Oidc\OidcDiscovery;
 use Symfony\Component\Security\Http\SecurityRequestAttributes;
 use Symfony\Contracts\EventDispatcher\EventDispatcherInterface;
@@ -60,6 +62,14 @@ use Symfony\Contracts\EventDispatcher\EventDispatcherInterface;
 #[AllowMockObjectsWithoutExpectations]
 class OidcLoginAuthenticatorTest extends TestCase
 {
+    private const DPOP_JWK = [
+        'kty' => 'EC',
+        'crv' => 'P-256',
+        'x' => '0QEAsI1wGI-dmYatdUZoWSRWggLEpyzopuhwk-YUnA4',
+        'y' => 'KYl-qyZ26HobuYwlQh-r0iHX61thfP82qqEku7i0woo',
+        'd' => 'iA_TV2zvftni_9aFAQwFO_9aypfJFCSpcCyevDvz220',
+    ];
+
     private OidcClientInterface $oidcClient;
     private OidcDiscovery $discovery;
     private AuthenticationSuccessHandlerInterface $successHandler;
@@ -1116,6 +1126,14 @@ class OidcLoginAuthenticatorTest extends TestCase
         $this->createAuthenticator(authorizationParams: ['state' => 'fixed', 'code_challenge' => '', 'prompt' => 'consent']);
     }
 
+    public function testTheDpopKeyIsNotTakenFromTheAuthorizationParams()
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('The authorization request parameter(s) "dpop_jkt" are managed by the authenticator');
+
+        $this->createAuthenticator(authorizationParams: ['dpop_jkt' => 'another-key-thumbprint']);
+    }
+
     public function testStartDispatchesTheAuthorizationRequestEvent()
     {
         $dispatcher = new EventDispatcher();
@@ -1437,6 +1455,28 @@ class OidcLoginAuthenticatorTest extends TestCase
         $this->assertSame($clock->now()->getTimestamp() + 300, $token->getAttribute('oidc_access_token_expires_at'));
     }
 
+    #[Group('time-sensitive')]
+    public function testCreateTokenReadsTheTimeWithoutAClock()
+    {
+        $nonce = bin2hex(random_bytes(16));
+        $state = bin2hex(random_bytes(16));
+
+        $this->oidcClient->method('exchangeCode')->willReturn([
+            'access_token' => 'access-123',
+            'id_token' => $this->buildIdToken(['nonce' => $nonce]),
+            'expires_in' => 300,
+        ]);
+        $this->oidcClient->method('fetchUserInfo')->willReturn(['sub' => 'user-42']);
+
+        $authenticator = $this->createAuthenticator();
+        $passport = $authenticator->authenticate($this->createCallbackRequest($state, $nonce));
+
+        sleep(60);
+        $token = $authenticator->createToken($passport, 'main');
+
+        $this->assertSame(time() + 300, $token->getAttribute('oidc_access_token_expires_at'));
+    }
+
     public function testCreateTokenStampsTheAuthenticationTimeFromTheAuthTimeClaim()
     {
         $nonce = bin2hex(random_bytes(16));
@@ -1517,6 +1557,44 @@ class OidcLoginAuthenticatorTest extends TestCase
         $token = $authenticator->createToken($passport, 'main');
 
         $this->assertNull($token->getAttribute('oidc_acr'));
+    }
+
+    public function testCreateTokenRecordsTheSidClaim()
+    {
+        $nonce = bin2hex(random_bytes(16));
+        $state = bin2hex(random_bytes(16));
+
+        $this->oidcClient->method('exchangeCode')->willReturn([
+            'access_token' => 'access-123',
+            'id_token' => $this->buildIdToken(['nonce' => $nonce, 'sid' => 'session-42']),
+        ]);
+        $this->oidcClient->method('fetchUserInfo')->willReturn(['sub' => 'user-42']);
+
+        $authenticator = $this->createAuthenticator();
+        $passport = $authenticator->authenticate($this->createCallbackRequest($state, $nonce));
+
+        $token = $authenticator->createToken($passport, 'main');
+
+        $this->assertSame('session-42', $token->getAttribute('oidc_sid'));
+    }
+
+    public function testCreateTokenReportsAnUnusableSidClaimAsNull()
+    {
+        $nonce = bin2hex(random_bytes(16));
+        $state = bin2hex(random_bytes(16));
+
+        $this->oidcClient->method('exchangeCode')->willReturn([
+            'access_token' => 'access-123',
+            'id_token' => $this->buildIdToken(['nonce' => $nonce, 'sid' => 42]),
+        ]);
+        $this->oidcClient->method('fetchUserInfo')->willReturn(['sub' => 'user-42']);
+
+        $authenticator = $this->createAuthenticator();
+        $passport = $authenticator->authenticate($this->createCallbackRequest($state, $nonce));
+
+        $token = $authenticator->createToken($passport, 'main');
+
+        $this->assertNull($token->getAttribute('oidc_sid'));
     }
 
     public function testCreateTokenKeepsOnlyTheStringEntriesOfTheAmrClaim()
@@ -2007,11 +2085,12 @@ class OidcLoginAuthenticatorTest extends TestCase
     public function testRejectsAPublicClientWithoutPkce()
     {
         $this->oidcClient->method('getClientAuthenticationMethod')->willReturn('none');
+        $authenticator = $this->createAuthenticator(['pkce_enabled' => false], signatureVerifier: $this->createSignatureVerifier());
 
-        $this->expectException(\InvalidArgumentException::class);
+        $this->expectException(\LogicException::class);
         $this->expectExceptionMessage('PKCE cannot be disabled for a public OIDC client');
 
-        $this->createAuthenticator(['pkce_enabled' => false], signatureVerifier: $this->createSignatureVerifier());
+        $authenticator->start($this->createRequestWithSession('/protected'));
     }
 
     /**
@@ -2023,18 +2102,27 @@ class OidcLoginAuthenticatorTest extends TestCase
     public function testRejectsAPublicClientThatDoesNotVerifyTheIdTokenSignature()
     {
         $this->oidcClient->method('getClientAuthenticationMethod')->willReturn('none');
+        $authenticator = $this->createAuthenticator();
 
-        $this->expectException(\InvalidArgumentException::class);
+        $this->expectException(\LogicException::class);
         $this->expectExceptionMessage('The ID token signature must be verified for a public OIDC client');
 
-        $this->createAuthenticator();
+        $authenticator->authenticate($this->createRequestWithSession('/oidc/callback?code=code&state=state'));
     }
 
     public function testAPublicClientIsAcceptedWithPkceAndTheSignatureCheck()
     {
         $this->oidcClient->method('getClientAuthenticationMethod')->willReturn('none');
+        $authenticator = $this->createAuthenticator(signatureVerifier: $this->createSignatureVerifier());
 
-        $this->assertInstanceOf(OidcLoginAuthenticator::class, $this->createAuthenticator(signatureVerifier: $this->createSignatureVerifier()));
+        $this->assertInstanceOf(RedirectResponse::class, $authenticator->start($this->createRequestWithSession('/protected')));
+    }
+
+    public function testCreatingTheAuthenticatorDoesNotUseTheClient()
+    {
+        $this->oidcClient->expects($this->never())->method('getClientAuthenticationMethod');
+
+        $this->createAuthenticator(['pkce_enabled' => false]);
     }
 
     /**
@@ -2045,11 +2133,54 @@ class OidcLoginAuthenticatorTest extends TestCase
     public function testAConfidentialClientMayTurnBothOff()
     {
         $this->oidcClient->method('getClientAuthenticationMethod')->willReturn('client_secret_basic');
+        $authenticator = $this->createAuthenticator(['pkce_enabled' => false]);
 
-        $this->assertInstanceOf(OidcLoginAuthenticator::class, $this->createAuthenticator(['pkce_enabled' => false]));
+        $this->assertInstanceOf(RedirectResponse::class, $authenticator->start($this->createRequestWithSession('/protected')));
     }
 
-    private function createAuthenticator(array $options = [], ?UserProviderInterface $userProvider = null, array $authorizationParams = [], ?OidcSignatureVerifier $signatureVerifier = null, ?ClockInterface $clock = null, ?EventDispatcherInterface $eventDispatcher = null): OidcLoginAuthenticator
+    /**
+     * RFC 9449, Section 10: the code is bound to the key before it exists.
+     *
+     * The thumbprint names the key without carrying it, which is what lets it travel in a
+     * front channel, so that a code stolen from the redirect cannot be exchanged by whoever
+     * does not hold the key.
+     */
+    public function testStartNamesTheDpopKeyWhenTheFirewallBindsToOne()
+    {
+        $proofFactory = new DpopProofFactory(new JWK(self::DPOP_JWK), 'ES256');
+        $authenticator = $this->createAuthenticator(dpopProofFactory: $proofFactory);
+        $request = Request::create('/protected');
+        $request->setSession(new Session(new MockArraySessionStorage()));
+
+        $response = $authenticator->start($request);
+
+        $params = [];
+        parse_str(parse_url($response->getTargetUrl(), \PHP_URL_QUERY), $params);
+        $this->assertSame($proofFactory->getKeyThumbprint(), $params['dpop_jkt']);
+    }
+
+    public function testStartNamesNoDpopKeyWhenTheFirewallBindsToNone()
+    {
+        $authenticator = $this->createAuthenticator();
+        $request = Request::create('/protected');
+        $request->setSession(new Session(new MockArraySessionStorage()));
+
+        $response = $authenticator->start($request);
+
+        $params = [];
+        parse_str(parse_url($response->getTargetUrl(), \PHP_URL_QUERY), $params);
+        $this->assertArrayNotHasKey('dpop_jkt', $params);
+    }
+
+    private function createRequestWithSession(string $uri): Request
+    {
+        $request = Request::create($uri);
+        $request->setSession(new Session(new MockArraySessionStorage()));
+
+        return $request;
+    }
+
+    private function createAuthenticator(array $options = [], ?UserProviderInterface $userProvider = null, array $authorizationParams = [], ?OidcSignatureVerifier $signatureVerifier = null, ?ClockInterface $clock = null, ?EventDispatcherInterface $eventDispatcher = null, ?DpopProofFactory $dpopProofFactory = null): OidcLoginAuthenticator
     {
         return new OidcLoginAuthenticator(
             new HttpUtils(),
@@ -2063,8 +2194,9 @@ class OidcLoginAuthenticatorTest extends TestCase
             $options,
             $authorizationParams,
             $signatureVerifier,
-            $clock ?? new Clock(),
+            $clock,
             $eventDispatcher,
+            $dpopProofFactory,
         );
     }
 }

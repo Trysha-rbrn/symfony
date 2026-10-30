@@ -6,13 +6,15 @@ CHANGELOG
 
  * Add a `$cache` argument to `CompiledAssetMapperConfigReader` to keep the decoded compiled files in a cache pool
  * Add `asset_mapper.metadata_dir` option to choose where `asset-map:compile` writes its metadata
+ * Add a `$logger` argument to `ImportMapGenerator` to warn when the import map is not compiled
  * Add `AssetMapperBundle`, which provides the `asset_mapper` configuration and the services previously provided by `FrameworkBundle` under `framework.asset_mapper`
- * Add an `$entries` argument to `ImportMapGenerator` to restrict the import map to the entries reachable from the rendered entrypoints
- * Defined stable alphabetical order of importmap entries
- * Add support for adding integrity metadata to importmaps
+ * Add the `asset_mapper.importmap_entries` option and the `$entries` argument of `ImportMapGenerator` to restrict the import map to the entries reachable from the rendered entrypoints
+ * Sort importmap entries alphabetically
+ * Add the `asset_mapper.importmap_integrity_algorithms` option to add integrity metadata to importmaps
  * Add a `--no-esm` option to `importmap:require` and an `esm` option to importmap entries
- * Add `$clock`, `$minimumReleaseAge` and `$logger` arguments to `ImportMapUpdateChecker` and a `$updateChecker` argument to `ImportMapManager` to delay JavaScript package updates
+ * Add the `asset_mapper.minimum_release_age` option to delay JavaScript package updates until a version reaches a minimum age
  * Add `PackageUpdateInfo::$withheldVersion` to report a version that the minimum release age keeps out of reach
+ * Make the `asset_mapper.missing_import_mode` option default to `strict` in debug mode and to `warn` otherwise
 
 8.0
 ---

@@ -66,6 +66,53 @@ class TextPartTest extends TestCase
         yield ['encoding'];
     }
 
+    #[DataProvider('provideLegacyEncodings')]
+    public function testUnserializePayloadWithoutExplicitEncodingKeepsEncoding(?string $encoding, string $expected)
+    {
+        // payloads serialized before Symfony 8.2 have no "explicitEncoding" key
+        $original = new TextPart('content', 'utf-8', 'plain', $encoding);
+        $data = $original->__serialize();
+        unset($data['explicitEncoding']);
+        $part = (new \ReflectionClass(TextPart::class))->newInstanceWithoutConstructor();
+        $part->__unserialize($data);
+
+        $this->assertSame($expected, $part->getPreparedHeaders()->getHeaderBody('Content-Transfer-Encoding'));
+        $this->assertSame($original->bodyToString(), $part->bodyToString());
+    }
+
+    public static function provideLegacyEncodings(): iterable
+    {
+        yield 'default' => [null, 'quoted-printable'];
+        yield 'explicit default' => ['quoted-printable', 'quoted-printable'];
+        yield 'explicit other' => ['base64', 'base64'];
+    }
+
+    #[DataProvider('provideNonStringValues')]
+    public function testUnserializeRejectsNonStringValue(string $key, mixed $value)
+    {
+        $template = (new TextPart('body content'))->__serialize();
+        $template[$key] = $value;
+        $payload = \sprintf('O:%d:"%s":%d:{', \strlen(TextPart::class), TextPart::class, \count($template));
+        foreach ($template as $k => $v) {
+            $payload .= serialize($k).serialize($v);
+        }
+
+        $this->expectException(\BadMethodCallException::class);
+
+        unserialize($payload.'}');
+    }
+
+    public static function provideNonStringValues(): iterable
+    {
+        foreach (['charset', 'subtype', 'disposition', 'name', 'encoding'] as $key) {
+            yield $key.' int' => [$key, 123];
+            yield $key.' object' => [$key, new \stdClass()];
+        }
+
+        yield 'subtype null' => ['subtype', null];
+        yield 'encoding null' => ['encoding', null];
+    }
+
     public function testConstructor()
     {
         $p = new TextPart('content');

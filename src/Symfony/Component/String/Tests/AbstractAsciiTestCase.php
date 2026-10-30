@@ -134,6 +134,41 @@ abstract class AbstractAsciiTestCase extends TestCase
                 '-',
                 true,
             ],
+            [
+                "hello\nworld\n",
+                "hello world\n",
+                5,
+                "\n",
+                true,
+            ],
+            [
+                "ab cd\n",
+                "ab cd\n",
+                5,
+                "\n",
+                true,
+            ],
+            [
+                "abc\ndef\n",
+                "abcdef\n",
+                3,
+                "\n",
+                true,
+            ],
+            [
+                "abc\ndef\n\n",
+                "abcdef\n\n",
+                3,
+                "\n",
+                true,
+            ],
+            [
+                'a b ',
+                'a b ',
+                1,
+                ' ',
+                true,
+            ],
         ];
     }
 
@@ -272,6 +307,7 @@ abstract class AbstractAsciiTestCase extends TestCase
             [22, 'Lorem ipsum dolor sit amet, consectetur adipiscing elit, amet sagittis felis.', 'amet', -30],
             [null, 'abc', 'b', 10],
             [null, 'abc', 'b', -10],
+            [null, 'abc', 'b', \PHP_INT_MIN],
         ];
     }
 
@@ -499,6 +535,13 @@ abstract class AbstractAsciiTestCase extends TestCase
                 ],
                 65536,
             ],
+            [
+                'hell',
+                [
+                    static::createFromString('hell'),
+                ],
+                \PHP_INT_MAX,
+            ],
         ];
     }
 
@@ -677,6 +720,10 @@ abstract class AbstractAsciiTestCase extends TestCase
             ['S', 'Symfony is awesome', -42, 1],
             ['', 'Symfony is awesome', 42, 1],
             ['', 'Symfony is awesome', 0, -42],
+            ['is awesome', 'Symfony is awesome', 8, \PHP_INT_MAX],
+            ['Symfony is awesome', 'Symfony is awesome', \PHP_INT_MIN, null],
+            ['', 'Symfony is awesome', \PHP_INT_MAX, 1],
+            ['', 'Symfony is awesome', 0, \PHP_INT_MIN],
         ];
     }
 
@@ -703,6 +750,10 @@ abstract class AbstractAsciiTestCase extends TestCase
             ['Xymfony is awesome', -42, 1],
             ['Symfony is awesomeX', 42, 1],
             ['XSymfony is awesome', 0, -42],
+            ['Symfony X', 8, \PHP_INT_MAX],
+            ['X', \PHP_INT_MIN, null],
+            ['Symfony is awesomeX', \PHP_INT_MAX, 1],
+            ['XSymfony is awesome', 0, \PHP_INT_MIN],
         ];
     }
 
@@ -766,6 +817,11 @@ abstract class AbstractAsciiTestCase extends TestCase
     public static function provideTrim()
     {
         return [
+            ['xyz', 'abcxyzcba', 'a..c'],
+            ['abc', "\x01\x1Fabc\x00\x10", "\0..\x1F"],
+            ['abc', '[\\]^abc^]', '[..^'],
+            ['xyz', './AZ_axyz`a', '...a'],
+            ['.bxyz', '-a.bxyzc-', 'a..c-'],
             [
                 "Symfony     IS GREAT\t!!!",
                 "    Symfony     IS GREAT\t!!!\n",
@@ -790,6 +846,11 @@ abstract class AbstractAsciiTestCase extends TestCase
                 "Symfony     IS GREAT\t!!!  \n",
                 "    Symfony     IS GREAT\t!!!  \n",
                 ' ',
+            ],
+            [
+                '[+|]',
+                '[+|]',
+                '',
             ],
         ];
     }
@@ -824,6 +885,8 @@ abstract class AbstractAsciiTestCase extends TestCase
     public static function provideTrimStart()
     {
         return [
+            ['xyzcba', 'abcxyzcba', 'a..c'],
+            ['xyzb.', '.bxyzb.', '.a..c'],
             [
                 "<span>Symfony is a PHP framework</span>\n",
                 "\n\t<span>Symfony is a PHP framework</span>\n",
@@ -833,6 +896,11 @@ abstract class AbstractAsciiTestCase extends TestCase
                 "\t<span>Symfony is a PHP framework</span>\n",
                 "\n\t<span>Symfony is a PHP framework</span>\n",
                 "\n",
+            ],
+            [
+                '[+|]',
+                '[+|]',
+                '',
             ],
         ];
     }
@@ -849,6 +917,8 @@ abstract class AbstractAsciiTestCase extends TestCase
     public static function provideTrimEnd()
     {
         return [
+            ['abcxyz', 'abcxyzcba', 'a..c'],
+            ['[\\]^abc', '[\\]^abc^]', '[..^'],
             [
                 "\n\t<span>Symfony is a PHP framework</span>",
                 "\n\t<span>Symfony is a PHP framework</span>  \n",
@@ -863,6 +933,11 @@ abstract class AbstractAsciiTestCase extends TestCase
                 "\n\t<span>Symfony is a PHP framework</span>  \n",
                 "\n\t<span>Symfony is a PHP framework</span>  \n",
                 ' ',
+            ],
+            [
+                '[+|]',
+                '[+|]',
+                '',
             ],
         ];
     }
@@ -992,9 +1067,10 @@ abstract class AbstractAsciiTestCase extends TestCase
     }
 
     #[DataProvider('provideReplace')]
-    public function testReplace(string $expectedString, int $expectedCount, string $origin, string $from, string $to)
+    public function testReplace(string $expectedString, int $expectedCount, string $origin, string $from, string $to, ?int $form = null)
     {
         $origin = static::createFromString($origin);
+        $origin = $form ? $origin->normalize($form) : $origin;
         $result = $origin->replace($from, $to);
 
         $this->assertEquals(static::createFromString($expectedString), $result);
@@ -1668,6 +1744,18 @@ abstract class AbstractAsciiTestCase extends TestCase
             [6, "foo\u{001b}[0mbar"],
             [6, "foo\u{0001}bar"],
             [6, "foo\u{0001}bar", false],
+            [4, "\u{001b}]8;;http://x.y\u{001b}\\link\u{001b}]8;;\u{001b}\\"],
+            [4, "\u{001b}]8;;http://x.y\u{0007}link\u{001b}]8;;\u{0007}"],
+            [4, "\u{001b}]8;;http://x.y\u{0007}link\u{001b}]8;;\u{001b}\\"],
+            [3, "\u{001b}]0;title\u{0007}foo"],
+            [2, "\u{001b}]0;title\u{001b}\\f\u{0007}o"],
+            [3, "\u{001b}[1mfoo\u{001b}(B\u{001b}[m"],
+            [3, "\u{001b}7foo\u{001b}8"],
+            [3, "\u{001b}=foo\u{001b}>"],
+            [3, "\u{001b} F\u{001b}%Gfoo"],
+            [3, "foo\u{001b}("],
+            [3, "\u{001b}(\u{001b}[1mfoo"],
+            [3, "\u{001b}\u{001b}[1mfoo"],
             [4, '--ֿ--'],
             [4, 'café'],
             [1, 'А҈'],

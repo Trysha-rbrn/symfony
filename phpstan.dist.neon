@@ -49,11 +49,34 @@ parameters:
         -
             message: '#^PHPDoc tag @param references unknown parameter\: \$fetchSize$#'
             path: src/Symfony/Component/Messenger/*
+        # the $timeout argument is a commented-out argument of MessageExecutionStrategyInterface::wait(), which the Worker passes
+        -
+            message: '#^PHPDoc tag @param references unknown parameter\: \$timeout$#'
+            path: src/Symfony/Component/Messenger/Execution/MessageExecutionStrategyInterface.php
+        -
+            message: '#^Method Symfony\\Component\\Messenger\\Execution\\MessageExecutionStrategyInterface\:\:wait\(\) invoked with 2 parameters, 1 required\.$#'
+            path: src/Symfony/Component/Messenger/Worker.php
+        # the $triggerDeprecation argument is a commented-out argument of MessageTypeAwareSerializerInterface::getMessageType(), which the serializers pass
+        -
+            message: '#^Method Symfony\\Component\\Messenger\\Transport\\Serialization\\MessageTypeAwareSerializerInterface\:\:getMessageType\(\) invoked with 2 parameters, 1 required\.$#'
+            path: src/Symfony/Component/Messenger/Transport/Serialization/*
+        # the $context argument is a commented-out argument of WorkflowInterface::getMarking()
+        -
+            message: '#^PHPDoc tag @param references unknown parameter\: \$context$#'
+            path: src/Symfony/Component/Workflow/WorkflowInterface.php
         # the $regexp argument is a commented-out argument of the case conversion methods, documented
         # with @param so that DebugClassLoader reports the implementations that do not declare it
         -
             message: '#^PHPDoc tag @param references unknown parameter\: \$regexp$#'
             path: src/Symfony/Component/String/*
+        # reset() keeps its optional argument virtual for subclasses
+        -
+            message: '#^PHPDoc tag @param references unknown parameter\: \$shutdown$#'
+            path: src/Symfony/*
+        # The deprecated HttpKernel wrapper keeps its parent class for BC.
+        -
+            identifier: class.extendsFinalByPhpDoc
+            path: src/Symfony/Component/HttpKernel/DependencyInjection/ServicesResetter.php
         # the schema-API guards every DBAL integration carries, kept in step with Cache, Lock and
         # Messenger; they go away together, once doctrine/dbal ^4.5 and doctrine/orm >= 3.6.8 are the minimum
         -

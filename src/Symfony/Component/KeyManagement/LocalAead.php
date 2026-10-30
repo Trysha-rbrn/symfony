@@ -34,11 +34,11 @@ trait LocalAead
      * @throws LogicException   If the data key is not of the length the format calls for
      * @throws RuntimeException If the cipher rejects the inputs
      */
-    private static function seal(EnvelopeFormat $format, #[\SensitiveParameter] string $dataKey, #[\SensitiveParameter] string $plaintext, string $iv, string $aad): array
+    private static function seal(EnvelopeFormat $format, #[\SensitiveParameter] string $dataKey, #[\SensitiveParameter] string $plaintext, string $iv, string $aad, string ...$fields): array
     {
         self::checkKeyLength($format, $dataKey);
         $tag = '';
-        $ciphertext = openssl_encrypt($plaintext, $format->cipher(), $dataKey, \OPENSSL_RAW_DATA, $iv, $tag, $aad, $format->tagBytes());
+        $ciphertext = openssl_encrypt($plaintext, $format->cipher(), $dataKey, \OPENSSL_RAW_DATA, $iv, $tag, self::bind($format, $aad, ...$fields), $format->tagBytes());
 
         if (false === $ciphertext) {
             throw new RuntimeException('Local AEAD encryption failed: '.(openssl_error_string() ?: 'unknown error'));
@@ -54,13 +54,30 @@ trait LocalAead
     private static function open(Envelope $envelope, #[\SensitiveParameter] string $dataKey, string $aad): string
     {
         self::checkKeyLength($envelope->format, $dataKey);
-        $plaintext = openssl_decrypt($envelope->ciphertext, $envelope->format->cipher(), $dataKey, \OPENSSL_RAW_DATA, $envelope->iv, $envelope->tag, $aad);
+        $fields = null !== $envelope->reference ? [$envelope->reference] : [$envelope->keyId, $envelope->wrappedDek];
+        $plaintext = openssl_decrypt($envelope->ciphertext, $envelope->format->cipher(), $dataKey, \OPENSSL_RAW_DATA, $envelope->iv, $envelope->tag, self::bind($envelope->format, $aad, ...$fields));
 
         if (false === $plaintext) {
             throw new DecryptionFailedException();
         }
 
         return $plaintext;
+    }
+
+    /**
+     * Authenticates the envelope header before the caller's AAD.
+     *
+     * Length prefixes keep the header fields and the caller's bytes separate.
+     * Stored envelopes bind the reference, so rewrapping a stored key leaves its payloads readable.
+     */
+    private static function bind(EnvelopeFormat $format, string $aad, string ...$fields): string
+    {
+        $header = \chr($format->id());
+        foreach ($fields as $field) {
+            $header .= pack('n', \strlen($field)).$field;
+        }
+
+        return $header.$aad;
     }
 
     /**

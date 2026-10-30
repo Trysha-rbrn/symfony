@@ -173,8 +173,7 @@ final class JsonCrawler implements JsonCrawlerInterface
 
                     foreach ($recursiveResults as $recursiveValue) {
                         if (\is_array($recursiveValue) && !array_is_list($recursiveValue) || $recursiveValue instanceof \stdClass) {
-                            $bracketResults = $this->evaluateToken($bracketToken, $recursiveValue);
-                            $next = array_merge($next, $bracketResults);
+                            array_push($next, ...$this->evaluateToken($bracketToken, $recursiveValue));
                         }
                     }
                 }
@@ -182,7 +181,7 @@ final class JsonCrawler implements JsonCrawlerInterface
                 ++$i;
             } else {
                 foreach ($current as $value) {
-                    $next = array_merge($next, $this->evaluateToken($token, $value));
+                    array_push($next, ...$this->evaluateToken($token, $value));
                 }
             }
 
@@ -241,7 +240,7 @@ final class JsonCrawler implements JsonCrawlerInterface
 
             $index = \count($value) + (int) $expr;
 
-            return isset($value[$index]) ? [$value[$index]] : [];
+            return \array_key_exists($index, $value) ? [$value[$index]] : [];
         }
 
         // single positive index
@@ -257,7 +256,7 @@ final class JsonCrawler implements JsonCrawlerInterface
 
             $index = (int) $expr;
 
-            return isset($value[$index]) ? [$value[$index]] : [];
+            return \array_key_exists($index, $value) ? [$value[$index]] : [];
         }
 
         // start and end index
@@ -279,7 +278,7 @@ final class JsonCrawler implements JsonCrawlerInterface
                 if ($index < 0) {
                     $index = \count($value) + $index;
                 }
-                if (isset($value[$index])) {
+                if (\array_key_exists($index, $value)) {
                     $result[] = $value[$index];
                 }
             }
@@ -288,10 +287,6 @@ final class JsonCrawler implements JsonCrawlerInterface
         }
 
         if (preg_match('/^(-?\d*+)\s*+:\s*+(-?\d*+)(?:\s*+:\s*+(-?\d*+))?$/', $expr, $matches)) {
-            if (!\is_array($value) || !array_is_list($value)) {
-                return [];
-            }
-
             $startStr = trim($matches[1]);
             $endStr = trim($matches[2]);
             $stepStr = trim($matches[3] ?? '1');
@@ -316,6 +311,10 @@ final class JsonCrawler implements JsonCrawlerInterface
                 throw new JsonCrawlerException($expr, 'slice selector integer overflow');
             }
 
+            if (!\is_array($value) || !array_is_list($value)) {
+                return [];
+            }
+
             $length = \count($value);
             $start = '' !== $startStr ? (int) $startStr : null;
             $end = '' !== $endStr ? (int) $endStr : null;
@@ -336,7 +335,7 @@ final class JsonCrawler implements JsonCrawlerInterface
                     return [];
                 }
 
-                $start = max(0, min($start, $length - 1));
+                $start = max(0 < $step ? 0 : -1, min($start, $length - 1));
             }
 
             if (null === $end) {
@@ -354,7 +353,7 @@ final class JsonCrawler implements JsonCrawlerInterface
 
             $result = [];
             for ($i = $start; $step > 0 ? $i < $end : $i > $end; $i += $step) {
-                if (isset($value[$i])) {
+                if (\array_key_exists($i, $value)) {
                     $result[] = $value[$i];
                 }
             }
@@ -794,7 +793,7 @@ final class JsonCrawler implements JsonCrawlerInterface
             },
             'count' => $nodelistSize,
             'match' => match (true) {
-                \is_string($value) && \is_string($argList[1] ?? null) => $this->safeRegexMatch(\sprintf('/^%s$/u', $this->transformJsonPathRegex($argList[1])), $value),
+                \is_string($value) && \is_string($argList[1] ?? null) => $this->safeRegexMatch(\sprintf('/\A(?:%s)\z/u', $this->transformJsonPathRegex($argList[1])), $value),
                 default => false,
             },
             'search' => match (true) {
@@ -806,20 +805,17 @@ final class JsonCrawler implements JsonCrawlerInterface
         };
     }
 
-    private function evaluateRecursive(mixed $value): array
+    private function evaluateRecursive(mixed $value, array &$result = []): array
     {
         if (!$this->isArrayOrObject($value)) {
-            return [];
+            return $result;
         }
-
-        $result = [];
 
         $result[] = $value;
 
         foreach ($value as $item) {
             if ($this->isArrayOrObject($item)) {
-                $childResults = $this->evaluateRecursive($item);
-                $result = array_merge($result, $childResults);
+                $this->evaluateRecursive($item, $result);
             }
         }
 
@@ -1219,6 +1215,8 @@ final class JsonCrawler implements JsonCrawlerInterface
                 case ']': $inCharClass = false;
                     break;
                 case '.': $inCharClass || $char = '[^\r\n]';
+                    break;
+                case '/': $char = '\/';
                     break;
             }
 

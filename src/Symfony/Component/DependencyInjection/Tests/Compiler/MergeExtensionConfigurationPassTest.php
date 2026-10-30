@@ -17,6 +17,7 @@ use PHPUnit\Framework\TestCase;
 use Symfony\Component\Config\Definition\Builder\TreeBuilder;
 use Symfony\Component\Config\Definition\ConfigurationInterface;
 use Symfony\Component\Config\Definition\Exception\InvalidTypeException;
+use Symfony\Component\Config\FileLocator;
 use Symfony\Component\Config\Resource\FileResource;
 use Symfony\Component\DependencyInjection\Compiler\MergeExtensionConfigurationContainerBuilder;
 use Symfony\Component\DependencyInjection\Compiler\MergeExtensionConfigurationPass;
@@ -27,7 +28,10 @@ use Symfony\Component\DependencyInjection\Exception\ParameterNotFoundException;
 use Symfony\Component\DependencyInjection\Exception\RuntimeException;
 use Symfony\Component\DependencyInjection\Extension\Extension;
 use Symfony\Component\DependencyInjection\Extension\ExtensionInterface;
+use Symfony\Component\DependencyInjection\Loader\Configurator\ContainerConfigurator;
+use Symfony\Component\DependencyInjection\Loader\PhpFileLoader;
 use Symfony\Component\DependencyInjection\Loader\UndefinedExtensionHandler;
+use Symfony\Component\DependencyInjection\Loader\YamlFileLoader;
 use Symfony\Component\DependencyInjection\ParameterBag\ParameterBag;
 use Symfony\Component\ExpressionLanguage\ExpressionFunctionProviderInterface;
 
@@ -104,6 +108,51 @@ class MergeExtensionConfigurationPassTest extends TestCase
 
         $this->assertSame(['BAZ', 'FOO'], array_keys($container->getParameterBag()->getEnvPlaceholders()));
         $this->assertSame(['BAZ' => 1, 'FOO' => 0], $container->getEnvCounters());
+    }
+
+    public function testEnvOfExtensionDefinitionReplacedByUserDefinitionIsCounted()
+    {
+        $container = new ContainerBuilder();
+        $container->registerExtension(new FooExtension());
+        $container->prependExtensionConfig('foo', ['bar' => '%env(FOO)%']);
+        $container->register('foo.bar', \ArrayObject::class);
+
+        (new MergeExtensionConfigurationPass())->process($container);
+
+        $this->assertSame(\ArrayObject::class, $container->getDefinition('foo.bar')->getClass());
+        $this->assertSame(['FOO' => 1], $container->getEnvCounters());
+    }
+
+    public function testEnvOfExtensionDefinitionReplacedByUserAliasIsCounted()
+    {
+        $container = new ContainerBuilder();
+        $container->registerExtension(new FooExtension());
+        $container->prependExtensionConfig('foo', ['bar' => '%env(FOO)%']);
+        $container->register('mock', \ArrayObject::class);
+        $container->setAlias('foo.bar', 'mock');
+
+        (new MergeExtensionConfigurationPass())->process($container);
+
+        $this->assertFalse($container->hasDefinition('foo.bar'));
+        $this->assertSame(['FOO' => 1], $container->getEnvCounters());
+    }
+
+    public function testUnserializableExtensionDefinitionReplacedByUserDefinition()
+    {
+        $extension = $this->createStub(ExtensionInterface::class);
+        $extension->method('getAlias')->willReturn('closure_argument');
+        $extension->method('load')->willReturnCallback(static function (array $configs, ContainerBuilder $container) {
+            $container->register('closure_argument', \stdClass::class)->setArguments([static fn () => null]);
+        });
+
+        $container = new ContainerBuilder();
+        $container->registerExtension($extension);
+        $container->prependExtensionConfig('closure_argument', []);
+        $container->register('closure_argument', \ArrayObject::class);
+
+        (new MergeExtensionConfigurationPass())->process($container);
+
+        $this->assertSame(\ArrayObject::class, $container->getDefinition('closure_argument')->getClass());
     }
 
     public function testEnvOverriddenInPreviousExtensionIsTrackedWhenReused()
@@ -208,6 +257,73 @@ class MergeExtensionConfigurationPassTest extends TestCase
         $this->assertSame([['own' => 'first'], []], $container->getParameter('aliasing.configs'));
         $this->assertSame([['value' => 'forwarded first'], ['value' => 'forwarded second'], ['value' => 'explicit']], $container->getParameter('target.configs'));
         $this->assertSame([['own' => 'first'], []], $container->getExtensionConfig('aliasing'));
+    }
+
+    public function testExtensionAliasesAreMergedInLoadOrder()
+    {
+        $container = new ContainerBuilder();
+        $container->registerExtension(new AliasingExtension());
+        $container->registerExtension(new TargetExtension());
+        $container->loadFromExtension('target', ['value' => 'first']);
+        $container->loadFromExtension('aliasing', ['target' => ['value' => 'second'], 'shorthand' => 'third']);
+        $container->loadFromExtension('target', ['value' => 'fourth']);
+        $container->loadFromExtension('aliasing', ['target' => ['value' => 'fifth']]);
+
+        (new MergeExtensionConfigurationPass())->process($container);
+
+        $this->assertSame([['value' => 'first'], ['value' => 'second'], ['value' => 'third'], ['value' => 'fourth'], ['value' => 'fifth']], $container->getParameter('target.configs'));
+    }
+
+    public function testExtensionAliasesKeepPrependedConfigsFirst()
+    {
+        $container = new ContainerBuilder();
+        $container->registerExtension(new AliasingExtension());
+        $container->registerExtension(new TargetExtension());
+        $container->loadFromExtension('target', ['value' => 'loaded first']);
+        $container->loadFromExtension('aliasing', ['target' => ['value' => 'loaded second']]);
+        $container->prependExtensionConfig('aliasing', ['target' => ['value' => 'prepended first']]);
+        $container->prependExtensionConfig('target', ['value' => 'prepended second']);
+
+        (new MergeExtensionConfigurationPass())->process($container);
+
+        $this->assertSame([['value' => 'prepended second'], ['value' => 'prepended first'], ['value' => 'loaded first'], ['value' => 'loaded second']], $container->getParameter('target.configs'));
+    }
+
+    public function testExtensionAliasesKeepPrependedValuesThatAreNotArraysFirst()
+    {
+        $container = new ContainerBuilder();
+        $container->registerExtension(new AliasingExtension());
+        $container->registerExtension(new TargetExtension());
+        $container->loadFromExtension('aliasing', ['target' => ['value' => 'loaded']]);
+
+        $instanceof = [];
+        $configurator = new ContainerConfigurator($container, new PhpFileLoader($container, new FileLocator()), $instanceof, __FILE__, __FILE__);
+        $configurator->extension('target', 'prepended with the DSL', true);
+
+        $loader = new YamlFileLoader($container, new FileLocator(\dirname(__DIR__).'/Fixtures/yaml'), prepend: true);
+        $loader->load('scalar_target_config.yml');
+
+        (new MergeExtensionConfigurationPass())->process($container);
+
+        $this->assertSame(['prepended from a file', 'prepended with the DSL', ['value' => 'loaded']], $container->getParameter('target.configs'));
+    }
+
+    public function testExtensionAliasesKeepTheLoadOrderOfMergedConfigs()
+    {
+        $container = new ContainerBuilder();
+        $container->registerExtension(new AliasingExtension());
+        $container->registerExtension(new TargetExtension());
+        $container->loadFromExtension('aliasing', ['target' => ['value' => 'first']]);
+
+        $other = new ContainerBuilder();
+        $other->prependExtensionConfig('target', ['value' => 'merged']);
+        $container->merge($other);
+
+        $container->loadFromExtension('aliasing', ['target' => ['value' => 'last']]);
+
+        (new MergeExtensionConfigurationPass())->process($container);
+
+        $this->assertSame([['value' => 'first'], ['value' => 'merged'], ['value' => 'last']], $container->getParameter('target.configs'));
     }
 
     public function testExtensionAliasesAreForwardedWhenTheExtensionIsItsOwnConfiguration()
@@ -446,6 +562,10 @@ class FooExtension extends Extension
         if (isset($config['baz'])) {
             $container->getParameterBag()->get('env(BOZ)');
             $container->resolveEnvPlaceholders($config['baz']);
+        }
+
+        if (isset($config['bar'])) {
+            $container->register('foo.bar', \stdClass::class)->setArguments([$config['bar']]);
         }
 
         $container->setParameter('foo.param', 'ccc');

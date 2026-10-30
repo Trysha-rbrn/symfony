@@ -42,6 +42,7 @@ final class ObjectNormalizer extends AbstractObjectNormalizer
     private static $isReadableCache = [];
     private static $isWritableCache = [];
     private static array $constructorParametersCache = [];
+    private static array $acceptsArrayCache = [];
 
     protected PropertyAccessorInterface $propertyAccessor;
     protected $propertyInfoExtractor;
@@ -81,16 +82,20 @@ final class ObjectNormalizer extends AbstractObjectNormalizer
         // methods
         $class = ($this->objectClassResolver)($object);
         $reflClass = new \ReflectionClass($class);
+        $attributesMetadata = $this->classMetadataFactory?->getMetadataFor($class)->getAttributesMetadata() ?? [];
+        $groups = $this->getGroups($context);
 
         foreach ($reflClass->getMethods(\ReflectionMethod::IS_PUBLIC) as $reflMethod) {
             $name = $reflMethod->name;
-            // getProperty() is only advertised through @method on PropertyInfoExtractorInterface, so an
-            // extractor predating it keeps the previous resolution instead of fataling
-            $attributeName = $this->propertyInfoExtractor instanceof PropertyNameExtractorInterface
-                ? $this->propertyInfoExtractor->getPropertyName($class, $name)
-                : $this->getAttributeNameFromAccessor($reflClass, $reflMethod, false);
+            $attributeName = $this->getAttributeNameFromAccessor($reflClass, $reflMethod, false);
+            $propertyMetadata = $attributesMetadata[$name] ?? null;
 
-            if ($this->hasPropertyForAccessor($reflMethod->getDeclaringClass(), $name) && (null === $attributeName || $this->hasAttributeNameCollision($reflClass, $attributeName, $name))) {
+            // getPropertyName() also maps setters, adders and removers and keeps acronyms like "URL", so only the method that reads a declared property can rename the attribute
+            if ($this->propertyInfoExtractor instanceof PropertyNameExtractorInterface && null !== ($propertyName = $this->propertyInfoExtractor->getPropertyName($class, $name)) && $this->hasPropertyForAccessor($reflClass, $propertyName) && $name === $this->writeInfoExtractor->getReadInfo($class, $propertyName)?->getName()) {
+                $attributeName = $propertyName;
+            }
+
+            if ($this->hasPropertyForAccessor($reflMethod->getDeclaringClass(), $name) && (null === $attributeName || $this->hasAttributeNameCollision($reflClass, $attributeName, $name) || null !== $propertyMetadata?->getSerializedName($groups) || null !== $propertyMetadata?->getSerializedPath($groups))) {
                 $attributeName = $name;
             }
 
@@ -131,6 +136,14 @@ final class ObjectNormalizer extends AbstractObjectNormalizer
         }
     }
 
+    protected function acceptsArrayForAttribute(string $class, string $attribute, array $context): bool
+    {
+        // attributes are written once the object exists, so the constructor is not a write target
+        $context = ['enable_constructor_extraction' => false] + array_intersect_key($context, ['enable_getter_setter_extraction' => true, 'enable_magic_methods_extraction' => true, 'enable_adder_remover_extraction' => true]);
+
+        return self::$acceptsArrayCache[$class.'::'.$attribute.hash('xxh128', serialize($context))] ??= $this->writeTargetAcceptsArray($class, $attribute, $context);
+    }
+
     protected function isAllowedAttribute($classOrObject, string $attribute, ?string $format = null, array $context = []): bool
     {
         if (!parent::isAllowedAttribute($classOrObject, $attribute, $format, $context)) {
@@ -145,20 +158,29 @@ final class ObjectNormalizer extends AbstractObjectNormalizer
 
         if ($context['_read_attributes'] ?? true) {
             $context = array_intersect_key($context, ['enable_getter_setter_extraction' => true, 'enable_magic_methods_extraction' => true]);
-            $cacheKey = $class.$attribute.hash('xxh128', serialize($context));
+            $cacheKey = $class.'::'.$attribute.hash('xxh128', serialize($context));
 
-            return self::$isReadableCache[$cacheKey] ??= $this->propertyInfoExtractor->isReadable($class, $attribute, $context) || $this->hasAttributeAccessorMethod($class, $attribute) || (\is_object($classOrObject) && $this->propertyAccessor->isReadable($classOrObject, $attribute));
+            return self::$isReadableCache[$cacheKey] ??= $this->isPropertyPath($attribute) || $this->propertyInfoExtractor->isReadable($class, $attribute, $context) || $this->hasAttributeAccessorMethod($class, $attribute) || (\is_object($classOrObject) && $this->propertyAccessor->isReadable($classOrObject, $attribute));
+        }
+
+        if ($ignoredAttributes = $context[self::IGNORED_ATTRIBUTES] ?? $this->defaultContext[self::IGNORED_ATTRIBUTES]) {
+            $foldedAttribute = strtolower(str_replace(['_', ' '], '', $attribute));
+            foreach ($ignoredAttributes as $ignoredAttribute) {
+                if ($foldedAttribute === strtolower(str_replace(['_', ' '], '', $ignoredAttribute)) && $this->isWrittenByMethod($class, $attribute, $context)) {
+                    return false;
+                }
+            }
         }
 
         $context = array_intersect_key($context, ['enable_getter_setter_extraction' => true, 'enable_magic_methods_extraction' => true, 'enable_constructor_extraction' => true, 'enable_adder_remover_extraction' => true]);
-        $cacheKey = $class.$attribute.hash('xxh128', serialize($context));
+        $cacheKey = $class.'::'.$attribute.hash('xxh128', serialize($context));
 
         if (isset(self::$isWritableCache[$cacheKey])) {
             return self::$isWritableCache[$cacheKey];
         }
 
         // constructor parameters can be set when instantiating, even when property info reports them as not writable
-        if (str_contains($attribute, '.') || str_contains($attribute, '[')
+        if ($this->isPropertyPath($attribute)
             || (($context['enable_constructor_extraction'] ?? true) && $this->isConstructorParameter($class, $attribute))
             || $this->propertyInfoExtractor->isWritable($class, $attribute, $context)
         ) {
@@ -198,5 +220,45 @@ final class ObjectNormalizer extends AbstractObjectNormalizer
         }
 
         return isset(self::$constructorParametersCache[$class][$attribute]);
+    }
+
+    private function writeTargetAcceptsArray(string $class, string $attribute, array $context): bool
+    {
+        $writeInfo = $this->writeInfoExtractor->getWriteInfo($class, $attribute, $context);
+
+        // adders take the elements one by one, and magic or unknown targets keep receiving an array
+        $type = match ($writeInfo?->getType()) {
+            PropertyWriteInfo::TYPE_PROPERTY => (new \ReflectionProperty($class, $writeInfo->getName()))->getType(),
+            PropertyWriteInfo::TYPE_METHOD => ((new \ReflectionMethod($class, $writeInfo->getName()))->getParameters()[0] ?? null)?->getType(),
+            default => null,
+        };
+
+        if (null === $type) {
+            return true;
+        }
+
+        foreach ($type instanceof \ReflectionUnionType ? $type->getTypes() : [$type] as $t) {
+            if ($t instanceof \ReflectionNamedType && $t->isBuiltin() && \in_array($t->getName(), ['array', 'iterable', 'mixed'], true)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function isWrittenByMethod(string $class, string $attribute, array $context): bool
+    {
+        $writeInfo = $this->writeInfoExtractor->getWriteInfo($class, $attribute, ['enable_constructor_extraction' => false] + $context);
+
+        return match ($writeInfo?->getType()) {
+            PropertyWriteInfo::TYPE_METHOD => method_exists($class, $writeInfo->getName()),
+            PropertyWriteInfo::TYPE_ADDER_AND_REMOVER => true,
+            default => false,
+        };
+    }
+
+    private function isPropertyPath(string $attribute): bool
+    {
+        return str_contains($attribute, '.') || str_contains($attribute, '[');
     }
 }

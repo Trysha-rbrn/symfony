@@ -14,6 +14,8 @@ namespace Symfony\Component\VarDumper\Cloner;
 /**
  * Represents the main properties of a PHP variable.
  *
+ * Stub classes meant to be extended should not declare private properties: they are not serialized with child classes.
+ *
  * @author Nicolas Grekas <p@tchwork.com>
  */
 class Stub
@@ -50,10 +52,10 @@ class Stub
         static $noDefault = new \stdClass();
 
         if (self::class === static::class) {
+            $defaults = self::$propertyDefaults[self::class] ??= get_class_vars(self::class);
             $data = [];
             foreach ($this as $k => $v) {
-                $default = self::$propertyDefaults[$this::class][$k] ??= ($p = new \ReflectionProperty($this, $k))->hasDefaultValue() ? $p->getDefaultValue() : ($p->hasType() ? $noDefault : null);
-                if ($noDefault === $default || $default !== $v) {
+                if (($defaults[$k] ?? null) !== $v) {
                     $data[$k] = $v;
                 }
             }

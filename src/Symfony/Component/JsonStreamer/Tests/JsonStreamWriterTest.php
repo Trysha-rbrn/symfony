@@ -17,6 +17,7 @@ use PHPUnit\Framework\TestCase;
 use Symfony\Component\DependencyInjection\Container;
 use Symfony\Component\JsonStreamer\Exception\NotEncodableValueException;
 use Symfony\Component\JsonStreamer\JsonStreamWriter;
+use Symfony\Component\JsonStreamer\StreamerDumper;
 use Symfony\Component\JsonStreamer\Tests\Fixtures\Enum\DummyBackedEnum;
 use Symfony\Component\JsonStreamer\Tests\Fixtures\Mapping\SyntheticPropertyMetadataLoader;
 use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\ClassicDummy;
@@ -29,16 +30,20 @@ use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\DummyWithDollarNamedProp
 use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\DummyWithGenerics;
 use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\DummyWithGmpNumber;
 use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\DummyWithList;
+use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\DummyWithMixedNullableProperties;
 use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\DummyWithNameAttributes;
 use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\DummyWithNestedArray;
 use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\DummyWithNestedDictDummies;
 use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\DummyWithNestedList;
 use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\DummyWithNestedListDummies;
 use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\DummyWithNullableProperties;
+use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\DummyWithNullableRepeatedDummies;
+use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\DummyWithNumericStreamedNames;
 use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\DummyWithPhpDoc;
 use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\DummyWithQuotes;
 use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\DummyWithSelfReferencingDummy;
 use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\DummyWithSpecialCharacterNamedProperties;
+use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\DummyWithStaticProperty;
 use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\DummyWithSyntheticProperties;
 use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\DummyWithUids;
 use Symfony\Component\JsonStreamer\Tests\Fixtures\Model\DummyWithUnionProperties;
@@ -254,6 +259,11 @@ class JsonStreamWriterTest extends TestCase
         $this->assertWritten('{"id":10,"name":"dummy name"}', $dummy, Type::object(ClassicDummy::class));
     }
 
+    public function testWriteObjectWithStaticProperty()
+    {
+        $this->assertWritten('{"id":1}', new DummyWithStaticProperty(), Type::object(DummyWithStaticProperty::class));
+    }
+
     public function testWriteObjectWithGenerics()
     {
         $nestedDummy = new DummyWithNameAttributes();
@@ -273,6 +283,11 @@ class JsonStreamWriterTest extends TestCase
         $dummy->name = 'dummy name';
 
         $this->assertWritten('{"@id":10,"name":"dummy name"}', $dummy, Type::object(DummyWithNameAttributes::class));
+    }
+
+    public function testWriteObjectWithNumericStreamedNames()
+    {
+        $this->assertWritten('{"0":1,"1":2,"12":"three"}', new DummyWithNumericStreamedNames(), Type::object(DummyWithNumericStreamedNames::class));
     }
 
     public function testWriteObjectWithValueTransformer()
@@ -366,6 +381,23 @@ class JsonStreamWriterTest extends TestCase
         $this->assertWritten('{"arrayOfDummies":{"key":{"@id":1,"name":"dummy"}},"array":[]}', $dummy, Type::object(DummyWithPhpDoc::class));
     }
 
+    public function testWriteObjectWithNullableRepeatedObjects()
+    {
+        $dummy = new DummyWithNullableRepeatedDummies();
+        $dummy->first = new ClassicDummy();
+        $dummy->second = new ClassicDummy();
+        $dummy->second->id = 2;
+
+        $this->assertWritten('{"first":{"id":1,"name":"dummy"},"second":{"id":2,"name":"dummy"}}', $dummy, Type::object(DummyWithNullableRepeatedDummies::class));
+
+        $dummy->first = null;
+        $this->assertWritten('{"first":null,"second":{"id":2,"name":"dummy"}}', $dummy, Type::object(DummyWithNullableRepeatedDummies::class), ['include_null_properties' => true]);
+
+        $dummy->first = new ClassicDummy();
+        $dummy->second = null;
+        $this->assertWritten('{"first":{"id":1,"name":"dummy"}}', $dummy, Type::object(DummyWithNullableRepeatedDummies::class));
+    }
+
     public function testWriteObjectWithNullableProperties()
     {
         $dummy = new DummyWithNullableProperties();
@@ -382,6 +414,76 @@ class JsonStreamWriterTest extends TestCase
 
         $this->assertWritten('{"enum":1}', $dummy, Type::object(DummyWithNullableProperties::class));
         $this->assertWritten('{"name":null,"enum":1}', $dummy, Type::object(DummyWithNullableProperties::class), options: ['include_null_properties' => true]);
+    }
+
+    public function testWriteObjectWithMixedNullableProperties()
+    {
+        $dummy = new DummyWithMixedNullableProperties();
+        $type = Type::object(DummyWithMixedNullableProperties::class);
+
+        $this->assertWritten('{"id":1}', $dummy, $type);
+        $this->assertWritten('{"first":null,"id":1,"last":null}', $dummy, $type, ['include_null_properties' => true]);
+
+        $dummy->first = 'first';
+
+        $this->assertWritten('{"first":"first","id":1}', $dummy, $type);
+        $this->assertWritten('{"first":"first","id":1,"last":null}', $dummy, $type, ['include_null_properties' => true]);
+
+        $dummy->first = null;
+        $dummy->last = 'last';
+
+        $this->assertWritten('{"id":1,"last":"last"}', $dummy, $type);
+        $this->assertWritten('{"first":null,"id":1,"last":"last"}', $dummy, $type, ['include_null_properties' => true]);
+
+        $dummy->first = 'first';
+
+        $this->assertWritten('{"first":"first","id":1,"last":"last"}', $dummy, $type);
+    }
+
+    public function testWriteInBoundedChunks()
+    {
+        $dummies = [];
+        for ($i = 0; $i < 10_000; ++$i) {
+            $dummy = new ClassicDummy();
+            $dummy->id = $i;
+            $dummies[] = $dummy;
+        }
+
+        $writer = JsonStreamWriter::create([], $this->streamWritersDir);
+        $chunks = iterator_to_array($writer->write($dummies, Type::list(Type::object(ClassicDummy::class))), false);
+
+        $this->assertSame(json_encode($dummies), implode('', $chunks));
+        $this->assertLessThan(\count($dummies) / 100, \count($chunks));
+
+        $itemMaxLength = \strlen(json_encode(end($dummies))) + 1;
+        foreach (\array_slice($chunks, 0, -1) as $chunk) {
+            $this->assertGreaterThanOrEqual(8192, \strlen($chunk));
+            $this->assertLessThan(8192 + $itemMaxLength, \strlen($chunk));
+        }
+    }
+
+    public function testWriteRecursiveObjectInBoundedChunks()
+    {
+        $dummy = new SelfReferencingDummyList();
+        $current = $dummy;
+        for ($i = 0; $i < 3; ++$i) {
+            $current->items = ['a' => new SelfReferencingDummyList(), 'b' => $next = new SelfReferencingDummyList()];
+            $current = $next;
+        }
+
+        for ($i = 0; $i < 10_000; ++$i) {
+            $current->items["item$i"] = new SelfReferencingDummyList();
+        }
+
+        $writer = JsonStreamWriter::create([], $this->streamWritersDir);
+        $chunks = iterator_to_array($writer->write($dummy, Type::object(SelfReferencingDummyList::class)), false);
+
+        $this->assertSame(json_encode($dummy, \JSON_FORCE_OBJECT), implode('', $chunks));
+        $this->assertLessThan(10_000 / 100, \count($chunks));
+
+        foreach (\array_slice($chunks, 0, -1) as $chunk) {
+            $this->assertGreaterThanOrEqual(8192, \strlen($chunk));
+        }
     }
 
     public function testWriteObjectWithDateTimes()
@@ -592,24 +694,64 @@ class JsonStreamWriterTest extends TestCase
 
     public function testThrowWhenEncodeError()
     {
-        $writer = JsonStreamWriter::create(streamWritersDir: $this->streamWritersDir);
+        $writer = JsonStreamWriter::create([], $this->streamWritersDir);
 
-        $this->expectException(NotEncodableValueException::class);
-        $this->expectExceptionMessage('Cannot encode "int" to JSON: Inf and NaN cannot be JSON encoded.');
+        try {
+            (string) $writer->write(\INF, Type::int());
+        } catch (NotEncodableValueException $e) {
+            $this->assertInstanceOf(\JsonException::class, $e->getPrevious());
+            $this->assertSame(\JSON_ERROR_INF_OR_NAN, $e->getPrevious()->getCode());
+            $this->assertSame('Inf and NaN cannot be JSON encoded', $e->getPrevious()->getMessage());
+            $this->assertSame('Cannot encode "int" to JSON: '.$e->getPrevious()->getMessage(), $e->getMessage());
 
-        (string) $writer->write(\INF, Type::int());
+            return;
+        }
+
+        $this->fail('An encoding exception should have been thrown.');
     }
 
     #[DataProvider('throwWhenEncodeErrorWithSpecialCharactersInTypeDataProvider')]
     public function testThrowWhenEncodeErrorWithSpecialCharactersInType(string $key)
     {
-        $writer = JsonStreamWriter::create(streamWritersDir: $this->streamWritersDir);
+        $writer = JsonStreamWriter::create([], $this->streamWritersDir);
         $type = Type::arrayShape([$key => Type::float()]);
 
-        $this->expectException(NotEncodableValueException::class);
-        $this->expectExceptionMessage(\sprintf('Cannot encode "%s" to JSON: Inf and NaN cannot be JSON encoded.', $type));
+        try {
+            (string) $writer->write([$key => \INF], $type);
+        } catch (NotEncodableValueException $e) {
+            $this->assertSame('Cannot encode "'.$type.'" to JSON: Inf and NaN cannot be JSON encoded', $e->getMessage());
 
-        (string) $writer->write([$key => \INF], $type);
+            return;
+        }
+
+        $this->fail('An encoding exception should have been thrown.');
+    }
+
+    public function testPreserveEncodingError()
+    {
+        $writer = JsonStreamWriter::create([], $this->streamWritersDir);
+        $exception = new \JsonException('Encoding failed: "%s".');
+        $data = new class($exception) implements \JsonSerializable {
+            public function __construct(private \JsonException $exception)
+            {
+            }
+
+            public function jsonSerialize(): mixed
+            {
+                throw $this->exception;
+            }
+        };
+
+        try {
+            (string) $writer->write($data, Type::mixed());
+        } catch (NotEncodableValueException $e) {
+            $this->assertSame($exception, $e->getPrevious());
+            $this->assertSame('Cannot encode "mixed" to JSON: Encoding failed: "%s".', $e->getMessage());
+
+            return;
+        }
+
+        $this->fail('An encoding exception should have been thrown.');
     }
 
     /**
@@ -641,11 +783,23 @@ class JsonStreamWriterTest extends TestCase
         }
 
         file_put_contents(
-            \sprintf('%s%s%s.json.php', $this->streamWritersDir, \DIRECTORY_SEPARATOR, hash('xxh128', (string) Type::bool())),
+            \sprintf('%s%s%s.json.php', $this->streamWritersDir, \DIRECTORY_SEPARATOR, hash('xxh128', StreamerDumper::FORMAT_VERSION.Type::bool())),
             '<?php return static function ($data): \Traversable { yield "CACHED"; };'
         );
 
         $this->assertSame('CACHED', (string) $writer->write(true, Type::bool()));
+    }
+
+    public function testIgnoreStreamWritersGeneratedByPreviousVersions()
+    {
+        mkdir($this->streamWritersDir, recursive: true);
+
+        file_put_contents(
+            \sprintf('%s%s%s.json.php', $this->streamWritersDir, \DIRECTORY_SEPARATOR, hash('xxh128', (string) Type::bool())),
+            '<?php return static function ($data): \Traversable { yield "STALE"; };'
+        );
+
+        $this->assertWritten('true', true, Type::bool());
     }
 
     /**

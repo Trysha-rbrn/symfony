@@ -4,32 +4,74 @@ CHANGELOG
 8.2
 ---
 
- * `messenger:consume` and `messenger:failed:retry` add the listeners of a run to a `ScopedEventDispatcher` instead of to the event dispatcher of the application
+ * Pass serializable router context parameters, including `_locale`, to async Messenger handlers using `RouterContextMiddleware`
+ * Add `#[AsMessageMiddleware]` and the `messenger.middleware` tag to add a middleware to a bus, placed with `before` and `after`
+ * Add `before` and `after` to `#[AsMessageHandler]` and the `messenger.message_handler` tag to order handlers
+ * [BC BREAK] Make `AsMessageHandler::$priority` nullable, defaulting to `null`
+ * Add the `messages` option of buses and the `$messageTypes` argument of `MessageBus`, to restrict the types of the messages the application can dispatch on a bus
+ * Add the `unwrap_exceptions` option of buses and the `$unwrapExceptions` argument of `MessageBus`, to throw the exception of the failing handler instead of `HandlerFailedException` when the application dispatches a message
+ * Add `InteropSerializer`, the `messenger.transport.interop_serializer` service, and `StampHeaderMapperInterface`, `IdentityStampHeaderMapper` and the `messenger.stamp_header_mapper` tag to exchange messages and their stamps with other applications
+ * Add `RedispatchStamp` to make a worker send a received message to its senders instead of handling it
+ * Deprecate `RedispatchMessageHandler`, dispatch the message wrapped in the `RedispatchMessage` with a `TransportNamesStamp` instead
+ * Add the listeners of a `messenger:consume` or `messenger:failed:retry` run to a `ScopedEventDispatcher` instead of to the event dispatcher of the application
  * Add `FailedMessageRepository` and `FailedMessageFilter` to list, inspect, remove and redispatch failed messages outside the console
  * Add `MessengerBundle`, which provides the `messenger` configuration and the services previously provided by `FrameworkBundle` under `framework.messenger`
- * Add claim check support with `ClaimCheckSerializer` and PSR-6 cache pools
- * Add routing and failure transport information and a `--message` option to the `debug:messenger` command
+ * Add `ClaimCheckSerializer` and the `claim_check` transport option to offload the bodies of large messages to a PSR-6 cache pool
+ * Add routing and failure transport information and the `--message` and `--middleware` options to the `debug:messenger` command
  * Add `HandlerStartingEvent`, `HandlerSuccessEvent` and `HandlerFailureEvent`, dispatched around each handler call
  * Add `$serializedTypeNameAliases` parameter to `#[AsMessage]` to accept alternate serialized type names when decoding
  * Add `--failed-after` and `--failed-before` options to the `messenger:failed:retry`, `messenger:failed:remove` and `messenger:failed:show` commands, and a `--class-filter` option to `messenger:failed:retry`
- * `RedispatchMessage` now dispatches to the senders configured for the message (routing config or `#[AsMessage]`) when `$transportNames` is empty, instead of sending to no sender at all
+ * Add a `$clock` argument to `FailedMessagesRetryCommand`, `FailedMessagesShowCommand` and `FailedMessagesRemoveCommand`
+ * Make `RedispatchMessage` dispatch to the senders configured for the message when `$transportNames` is empty, instead of to no sender at all
  * Add a `--concurrency` option to the `messenger:consume` command to process messages in parallel
  * Add a `--redispatch` option to the `messenger:failed:retry` command to send messages back to their transport instead of handling them in the command
- * Allow prioritizing receivers so that `messenger:consume --all` consumes receivers in a predefined order
+ * Add the `priority` option of transports to order the receivers `messenger:consume --all` consumes
  * Add an optional `extra` key to the encoded envelope passed to `SerializerInterface::decode()`, holding metadata added by the receiving transport
- * Add an optional `LoggingMiddleware` logging the processing time and memory usage of each message
+ * Add `LoggingMiddleware` to log the processing time and memory usage of each message
  * Add the `messenger:show` command to list and inspect pending messages of a transport
  * Make the `messenger:consume` and `messenger:failed:retry` commands exit immediately when a second `SIGINT` is received
  * Add a `transport` option to `#[AsMessageHandler]` and to the `messenger.message_handler` tag to route the handled messages to that transport and bind the handler to it
- * Add `OutboxStamp` and `OutboxSender` to store messages in an outbox transport and forward them to their target transport when the outbox is consumed
- * Add the `outbox` option to transports
+ * Add `OutboxStamp`, `OutboxSender` and the `outbox` option of transports to store messages in an outbox transport and forward them to their target transport when the outbox is consumed
  * Add `StopWorkerOnIdleListener` to stop the worker as soon as no message is available
  * Make `InMemoryTransport` implement `ListableReceiverInterface` and `MessageCountAwareInterface`
- * Add `retry` and `failure_transport` options to the `sync://` transport
- * Add `$retryStrategy`, `$failureSender`, `$eventDispatcher` and `$logger` arguments to `SyncTransport`
- * Add `$retryStrategyLocator`, `$failureSenderLocator`, `$eventDispatcher` and `$logger` arguments to `SyncTransportFactory`
- * Add `SyncMessageFailedEvent` and `SyncMessageRetryingEvent`, dispatched by the sync transport
+ * Add the `retry` and `failure_transport` options to the `sync://` transport, and `SyncMessageFailedEvent` and `SyncMessageRetryingEvent`, dispatched by that transport
+ * Add the `$retryStrategy`, `$failureSender`, `$eventDispatcher` and `$logger` arguments to `SyncTransport`, and the `$retryStrategyLocator`, `$failureSenderLocator`, `$eventDispatcher` and `$logger` arguments to `SyncTransportFactory`
  * Add the `messenger.serializer.symfony_serializer.service` option
+ * Add the `messenger.reject_redelivered_messages` option to allow disabling `RejectRedeliveredMessageMiddleware`
+ * Add `PropagatedStampInterface` and `FlowContextMiddleware` to copy stamps onto the messages dispatched while handling the message carrying them
+ * Allow handler methods to declare `Envelope` or stamp-typed arguments after the message
+ * Add `CorrelationStamp`, `MessageIdStamp` and `CausationStamp`, added by `FlowContextMiddleware` when the `messenger.identity_stamps` option is enabled
+ * Add the `sign` option of transports and the `$acceptUnverified` argument of `SigningSerializer` to sign every message of a transport
+ * Deprecate passing a list of message types to `SigningSerializer`, pass the algorithm instead to sign every message
+ * Deprecate signing only the messages whose handlers have the `sign` option, set the `sign` option of their transports instead
+ * Deprecate `MessageTypeAwareSerializerInterface` and the `getMessageType()` method of `PhpSerializer` and `Serializer`
+ * Make `SigningSerializer` sign the messages it did not verify as unverified, and refuse such a message when its type requires a signature
+ * Make `SigningSerializer` sign every header written by the serializer it decorates, except `Content-Type`, and pass only the signed headers to that serializer
+ * Add `TrustStamp`, for transports that yield messages created in the same process to have `SigningSerializer` sign them as verified and `SendMessageMiddleware` honor their `RedispatchStamp`
+ * Add argument `$timeout` to `MessageExecutionStrategyInterface::wait()`
+ * Make `HandleMessageMiddleware` refuse to call the handlers that require a signature for an envelope marked untrusted
+ * Sign messages with a serializer created for each transport instead of decorating the serializer services: encoding with `messenger.default_serializer` or another serializer service does not sign anymore
+ * Add `ChainStamp` and `ChainMiddleware` to dispatch messages one after another, with `MessageStampNormalizer` to carry the messages held by stamps with the Symfony serializer
+ * Add `chain` to the default bus middleware, between `send_message` and `handle_message`
+ * Add `DispatchOnFailureStamp`, `FailedMessageStamp`, `DispatchOnFailureMiddleware` and `DispatchOnFailureListener` to dispatch a message when another one fails for good
+ * Add `dispatch_on_failure` to the default bus middleware, between `flow_context` and `dispatch_after_current_bus`
+ * Accept a list of keys in `SigningSerializer::__construct()` to rotate them
+ * Add the `messenger.serializer.signing_secret` option
+ * Add `BatchDispatcher` to dispatch several messages and send them to their transports in batches
+ * Add `BatchSenderInterface` for the senders that send several messages at once, and `BatchSendFailedException` to tell which messages of a batch were sent
+ * Add an optional `receivers` argument to the `messenger:stop-workers` command to stop only the workers that consume these transports
+ * Add the invokable `WorkerRestarter` service to stop the workers of some or all transports from code
+ * Add the `messenger.deduplication.lock_factory` option to take the deduplication locks from another lock factory than `lock.factory`
+ * Add `SenderStampInterface` for the non-sendable stamps that an outbox keeps for the sender of the messages it forwards
+ * Add a `--stop-when-empty` option to the `messenger:consume` command and a `stop_when_empty` option to `Worker::run()` to handle the pending messages and exit instead of waiting for new ones
+ * Add `InboxInterface`, `InboxMiddleware` and the `inbox` option of transports to skip the handlers of the messages that the inbox of their transport recorded already
+ * Add the `cooldown_strategy` option of transports, `CooldownStrategyInterface`, `CooldownStatus`, `MultiplierCooldownStrategy` and `WorkerTransportCoolingDownEvent` to stop consuming a transport for a while after messages received from it fail or fetching from it fails
+ * Add the `$cooldownStrategies` argument to `Worker` and the `$cooldownStrategyLocator` argument to `ConsumeMessagesCommand`
+ * Log the names of the consumed transports when a worker starts
+ * Display the stamps of failed messages with `-vv` in the `messenger:failed:show`, `messenger:failed:retry` and `messenger:failed:remove` commands
+ * Close the transports that implement `CloseableTransportInterface` when the kernel shuts down
+ * Add the `$deferFlush` argument and the `deferFlush()` method to `AckStamp` and `Acknowledger`, to flush a full batch in a dispatch of its own
+ * Make `BatchHandlerTrait` leave a full batch to the worker, which flushes it in a dispatch of its own right after the dispatch of the message that filled it
 
 8.1
 ---

@@ -1,0 +1,36 @@
+<?php
+
+return [
+    'Names' => [
+        'Afahresch', 'Abchahsesch', 'Aschenehsesch', 4 => 'Adangmesch', 'Adygehjsch', 'Avästahnesch', 'Tonehsesch Arahbesch', 'Afrikaans', 'Afrehihlesch', 'Aghehmesch', 'Aijnu', 'Akahnesch', 'Akahdesch', 15 => 'Ale’uhtesch', 18 => 'Amhahresch', 'Arrajonehsesch', 'Ahl Änglesch',
+        22 => 'Anjikahnesch', 25 => 'Arahbesch', 29 => 'Arrappaho', 'Aljehresch Arahbesch', 33 => 'Marokahnesch Arahbesch', 'Äjiptesch Arahbesch', 'Aßamehsesch', 'Pare', 'Amärrekahnesche Blendeschprohch', 'Astuhrejahnesch', 40 => 'Avahresch', 42 => 'Awahdesch', 'Aimahresch', 'Asserbaidschahnesch',
+        'Baschkihresch', 'Beluhtschesch', 'Balinehsesch', 'Bairesch', 'Basaa-Schprohche', 53 => 'Wiißrußesch', 55 => 'Bemba', 57 => 'Bena', 60 => 'Bulljahresch', 63 => 'Bhohdschpuresch', 'Bislahmesch', 66 => 'Edo', 72 => 'Bambara',
+        'Bängjahlesch', 'Tibehtesch', 'Bischnuprejahnesch', 77 => 'Bettohnesch', 'Brahjesch', 'Brahuijesch', 'Boddo', 'Boßnesch', 83 => 'Burejahtesch', 'Bujinehsesch', 86 => 'Bilihnesch', 88 => 'Kattalahnesch', 94 => 'Tschätschehnesch', 'Zebuwahnesch', 'Kihja-Schprohch',
+        'Chamorru', 100 => 'Trukehsesch', 'Mahresch', 103 => 'Tschoktoh', 105 => 'Tschärrokeh', 'Tschäjänn', 108 => 'Zäntrahl-Kurrdesch', 110 => 'Korsesch', 'Koptesch', 122 => 'Tschäschesch', 'Kaschuhbesch', 125 => 'Kerscheßlahwesch', 'Tschowaschesch',
+        'Wallihsesch', 'Dähnesch', 'Dakohtesch', 'Darjihnesch', 'Dawedahnesch', 'Deutsch', 135 => 'Dohjribesch', 137 => 'Djerma', 139 => 'Niddersorbesch', 141 => 'Du’ala', 'Meddelnehderlängsch', 'Divehjesch', 'Jola-Fonyisch', 146 => 'Butahnesch', 'Dassajahnesch',
+        'Kîembu', 'Ewe', 'Äffiksch', 'Emilijahnesch', 'Ahl Äjiptesch', 'Ekajukesch', 'Jrihschesch', 156 => 'Änglesch', 'Meddelänglesch', 'Esperanto', 'Schpahnesch', 'Zäntrahl-Juppik', 'Äßnesch', 'Baskesch', 'Ewonndo', 165 => 'Pärsesch', 168 => 'Fulfulde',
+        'Finnesch', 'Fillipihnesch', 172 => 'Fihdschesch', 'Färröhresch', 'Fohnesch', 'Franzühsesch', 182 => 'Frijauhlesch', 'Wäßfrihsesch', 'Ihresch', 'Jah', 192 => 'Ji’is-Ahl-Ättejohpesch', 'Jillbättehsesch', 'Jallihzesch', 197 => 'Juwarahnesch', 200 => 'Jorontalohsch',
+        204 => 'Schwitzerdütsch', 'Gutscharatesch', 209 => 'Mangx', 211 => 'Haußa', 214 => 'Hauajahnesch', 216 => 'Hebrähjesch', 'Hinndi', 219 => 'Hiligaynon', 221 => 'Hmong', 224 => 'Krowatesch', 226 => 'Bovversorrbesch',
+        228 => 'Ha’iihtesch', 'Unnjarresch', 'Hupa', 232 => 'Armehnesch', 'Herrehro', 'de Interlingua', 'Ibahnesch', 'Ibibio', 'Indonehsesch', 239 => 'Igbo', 243 => 'Ilokahnesch', 'Engjuschesch', 'Ihdo', 'Ißlänndesch', 248 => 'Etalljähnesch',
+        'Inuktitut', 'Ingjrijahnesch', 'Japahnesch', 'Jamaikahnesch-Änglesch', 'Lodschbahn', 'Njomba', 256 => 'Jühdesch-Pärsesch', 258 => 'Jüttesch', 'Javahnesch', 'Je’orjesch', 262 => 'Kabyhlesch', 265 => 'Kamba vun Kehnija', 267 => 'Kabadihnesch', 270 => 'Chimakonde',
+        'Kapvärdesch', 274 => 'Koro vun de Älfebeijnköß', 277 => 'Khasi', 279 => 'Kojra Tschihni', 281 => 'Rekohjo', 283 => 'Oschivambo', 'Kassakkesch', 'Kako', 'Jröhnländesch', 'Kaländjihnesch', 'Khmer', 'Kimbundu', 'Kannada', 'Korrejaanesch',
+        293 => 'Kon’kahnesch', 295 => 'Kpäle', 'Kanuhresch', 'Karatschaj-Balkahresch-Törkesch', 300 => 'Karehlesch', 'Korochesch', 'Kaschmihresch', 304 => 'Bafijahnesch', 'Kölsch', 'Kurrdesch', 'Kumykesch', 309 => 'Kohmesch', 'Kornesch', 313 => 'Kirjihsesch',
+        'Lateijnesch', 'Ladihnesch', 'Lango', 'de Landa-Schprooche', 319 => 'Luxemborjesch', 'Lesjesch', 322 => 'Lugannda', 'Lemburjesch', 327 => 'Lakota', 330 => 'Lingjalla', 'Lahootesch', 334 => 'Silohzi', 'Nood-Luhresch', 337 => 'Littouesch',
+        339 => 'Kiluba', 'Tschiluba', 342 => 'Schilunnda', 'Luo', 345 => 'Luhjesch', 'Lättesch', 357 => 'Mokschah', 362 => 'Madajaßkesch', 366 => 'Maschallehsesch', 368 => 'Ma’ohresch', 372 => 'Mazedohnesch', 'Mallajalam',
+        'Mongjohlesch', 376 => 'Meitei-Manipuhresch', 380 => 'Marrahtesch', 383 => 'Mallaijesch', 'Maltehsesch', 'Mundang', 'Krihk', 'Mirandehsesch', 391 => 'Burmehsesch', 393 => 'Ärsjahnesch', 395 => 'Nauruhesch', 397 => 'Napolletahnesch',
+        399 => 'Norrwehjesch Bokmål', 'Nood-Ndebele', 402 => 'Nepallehsesch', 'Newahresch', 'Ndongjahnesch', 408 => 'Holländesch', 'Gyele', 'Neu Norrwehjesch', 'Njijembohn', 413 => 'Norrwehjesch', 'Nojal', 419 => 'Nood-Sohto', 421 => 'Navvacho',
+        423 => 'Schi-Schewa', 436 => 'Oriija', 'Oßeetesch', 440 => 'Panschaabesch', 455 => 'Pollnesch', 462 => 'Paschtuunesch', 'Pochtojesesch', 'Kättschowa', 'K’ische’', 474 => 'Rätoromaanesch', 'K-Rundesch', 'Rumänesch', 'Kirombo',
+        480 => 'Rußßesch', 483 => 'Arromahnesch', 'Kinja-Ruandesch', 486 => 'Sanskrit', 488 => 'Jackutesch', 494 => 'Njambaij', 499 => 'Sinndi', 502 => 'Nood-Lappländesch', 507 => 'Kojraboro Senni', 'Sangjo', 511 => 'Särbokowatesch',
+        'Taschelhittesch', 515 => 'Singjaleesesch', 520 => 'ẞlovakesch', 522 => 'ẞloveenesch', 526 => 'Sammohanesch', 528 => 'Lule-Läppländesch', 'Inahri Lappländesch', 531 => 'Schi-Schona', 533 => 'Somahlesch', 535 => 'Albahnesch', 'Särbesch',
+        539 => 'Si-Swatesch', 541 => 'Söd-Sooto', 544 => 'Sindanehsesch', 549 => 'Schwehdesch', 'Suahehlesch', 'Kommohresch', 553 => 'Sührejakkesch', 555 => 'Tamihlesch', 558 => 'Telluhju', 562 => 'Tetumsch', 'Tadschihkesch',
+        565 => 'Tailändesch', 567 => 'Tijrenejahnesch', 'Tigre', 570 => 'Törkmehnesch', 573 => 'Tajalloch', 'Klingjohnesch', 578 => 'Se-Zwahnesch', 'Tongjahnesch', 582 => 'Tok Pisin', 'Törkesch', 587 => 'Xi-Zongjahnesch', 590 => 'Tattahresch',
+        596 => 'Tasawaq', 'Tahihtesch', 'Tuvinijahnesch', 'Tamasicht ussem meddlere Atlas', 'Udmuchtesch', 'Uj’juhresch', 603 => 'Ukrainesch', 'Umbundesch', 'Urdu/Hindi', 'Ußbehkesch', 608 => 'Wenda', 611 => 'Vijätnammehsesch', 615 => 'Volapük', 619 => 'Walohnesch',
+        'Walserdütsch', 'Welahmo', 'Waray-Waray', 625 => 'Woloff', 627 => 'Kalmükkesch', 629 => 'Isi-Khohsa', 636 => 'Jämmbah', 'Jiddesch', 'Joruhba', 640 => 'Kanton-Schinehsesch', 647 => 'Schinehsesch (Mandarin)', 'Suhlu', 'Suhñi', 'Sahsajesch',
+    ],
+    'LocalizedNames' => [
+        'ar_001' => 'Schtandatt Arahbesch', 'az_Arab' => 'Södasserbaidschahnesch', 'de_AT' => 'Deutsch uß Öhßterich', 'de_CH' => 'Deutsch uß de Schweijz', 'en_AU' => 'Änglesch uß Außtrahlije', 'en_CA' => 'Änglesch uß Kanada', 'en_GB' => 'Änglesch uß Jruhßbrettannije', 'en_US' => 'Amärrekahnesch Änglesch', 'es_419' => 'Schpahnesch uß Latting-Ammärrika', 'es_ES' => 'Schpahnesch en Schpahneje',
+        'es_MX' => 'Schpahnesch en Mäxikoh', 'fr_CA' => 'Franzühsesch uß Kanada', 'fr_CH' => 'Franzühsesch uß de Schweijz', 'nds_NL' => 'Nehdersaksesch en de Nederläng', 'nl_BE' => 'Flähmesch', 'pt_BR' => 'Brasilljaanesch Pochtojesesch', 'pt_PT' => 'Pochtojesesch uß Pochtojall', 'zh_Hans' => 'Schinehsesch (eijfache Schreff)', 'zh_Hant' => 'Schinehsesch (tradizjonälle Schreff)',
+    ],
+    'Pattern' => '{0} en {1}',
+    'Separator' => '{0} uß {1}',
+];

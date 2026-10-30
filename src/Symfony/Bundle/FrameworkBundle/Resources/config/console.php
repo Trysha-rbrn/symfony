@@ -19,6 +19,7 @@ use Symfony\Bundle\FrameworkBundle\Command\ConfigDebugCommand;
 use Symfony\Bundle\FrameworkBundle\Command\ConfigDumpReferenceCommand;
 use Symfony\Bundle\FrameworkBundle\Command\ContainerDebugCommand;
 use Symfony\Bundle\FrameworkBundle\Command\ContainerLintCommand;
+use Symfony\Bundle\FrameworkBundle\Command\DebugAutoconfigurationCommand;
 use Symfony\Bundle\FrameworkBundle\Command\DebugAutowiringCommand;
 use Symfony\Bundle\FrameworkBundle\Command\EventDispatcherDebugCommand;
 use Symfony\Bundle\FrameworkBundle\Command\RouterDebugCommand;
@@ -32,11 +33,13 @@ use Symfony\Bundle\FrameworkBundle\Command\SecretsSetCommand;
 use Symfony\Bundle\FrameworkBundle\Command\YamlLintCommand;
 use Symfony\Bundle\FrameworkBundle\Command\YamlLintSchemaResolver;
 use Symfony\Bundle\FrameworkBundle\Console\Application;
+use Symfony\Bundle\FrameworkBundle\EventListener\ConsoleLocaleListener;
 use Symfony\Bundle\FrameworkBundle\EventListener\SuggestMissingPackageSubscriber;
 use Symfony\Component\Console\EventListener\ValidateQuestionInputListener;
 use Symfony\Component\Console\Messenger\RunCommandMessageHandler;
 use Symfony\Component\ErrorHandler\Command\ErrorDumpCommand;
 use Symfony\Component\Form\Command\DebugCommand;
+use Symfony\Component\HttpKernel\Command\ExpressionLintCommand;
 use Symfony\Component\Serializer\Command\DebugCommand as SerializerDebugCommand;
 use Symfony\Component\Translation\Command\XliffLintCommand;
 use Symfony\Component\Validator\Command\DebugCommand as ValidatorDebugCommand;
@@ -55,6 +58,13 @@ return static function (ContainerConfigurator $container) {
             ])
             ->tag('kernel.event_subscriber')
             ->tag('container.remove_if_missing', ['service' => 'validator'])
+
+        ->set('.console.locale_listener', ConsoleLocaleListener::class)
+            ->args([
+                param('kernel.default_locale'),
+                service('request_stack'),
+            ])
+            ->tag('kernel.event_subscriber')
 
         ->set('console.command.about', AboutCommand::class)
             ->tag('console.command')
@@ -92,6 +102,16 @@ return static function (ContainerConfigurator $container) {
             ->tag('console.command')
 
         ->set('console.command.container_lint', ContainerLintCommand::class)
+            ->tag('console.command')
+
+        ->set('console.command.expression_lint', ExpressionLintCommand::class)
+            ->args([
+                abstract_arg('expression languages, set in RegisterCompiledExpressionLanguagesPass'),
+                service('expression_language.collector'),
+            ])
+            ->tag('console.command')
+
+        ->set('console.command.debug_autoconfiguration', DebugAutoconfigurationCommand::class)
             ->tag('console.command')
 
         ->set('console.command.debug_autowiring', DebugAutowiringCommand::class)

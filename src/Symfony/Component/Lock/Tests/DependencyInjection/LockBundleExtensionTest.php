@@ -113,6 +113,14 @@ class LockBundleExtensionTest extends TestCase
         $storeDef = $container->getDefinition($container->getDefinition('lock.garply.factory')->getArgument(0));
         $this->assertSame('null', $storeDef->getArgument(0));
 
+        $this->assertTrue($container->hasDefinition('lock.waldo.factory'));
+        $storeId = (string) $container->getDefinition('lock.waldo.factory')->getArgument(0);
+        $storeDef = $container->getDefinition($storeId);
+        $this->assertSame('.lock.flock+remove.store', $storeId);
+        $this->assertSame(FlockStore::class, $storeDef->getClass());
+        $this->assertEquals([$container->getDefinition('.lock.flock.store')->getArgument(0), true], $storeDef->getArguments());
+        $this->assertTrue($storeDef->hasTag('lock.store'));
+
         $this->assertFalse($container->hasAlias('lock.factory'));
     }
 
@@ -153,6 +161,15 @@ class LockBundleExtensionTest extends TestCase
         $connection = $storeDef->getArgument(0);
         $this->assertInstanceOf(Reference::class, $connection);
         $this->assertSame('my_service', (string) $connection);
+    }
+
+    public function testLockFactoriesAreTagged()
+    {
+        $container = $this->createContainerFromFile('lock_named');
+
+        foreach (['foo', 'bar', 'baz', 'qux', 'corge', 'grault', 'garply'] as $name) {
+            $this->assertSame([['name' => $name]], $container->getDefinition('lock.'.$name.'.factory')->getTag('lock.factory'));
+        }
     }
 
     public function testLockDisabled()

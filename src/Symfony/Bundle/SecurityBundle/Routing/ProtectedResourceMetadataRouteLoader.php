@@ -21,6 +21,8 @@ use Symfony\Component\Routing\RouteCollection;
  * resource identifier.
  *
  * @author Florent Morselli <florent.morselli@spomky-labs.com>
+ *
+ * @internal
  */
 final class ProtectedResourceMetadataRouteLoader
 {
@@ -51,7 +53,7 @@ final class ProtectedResourceMetadataRouteLoader
             $collection->add('_oauth_protected_resource_metadata_'.$firewallName, (new Route($path, [
                 '_controller' => 'security.authenticator.access_token.protected_resource_metadata_controller',
                 'firewallName' => $firewallName,
-            ]))->setMethods(['GET']));
+            ]))->setMethods(['GET', 'OPTIONS']));
         }
 
         return $collection;

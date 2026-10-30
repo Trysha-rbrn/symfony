@@ -19,13 +19,21 @@ use MongoDB\Client;
 use MongoDB\Collection;
 use MongoDB\DeleteResult;
 use MongoDB\Driver\CursorInterface;
+use MongoDB\Driver\Exception\BulkWriteException;
 use MongoDB\Driver\Exception\RuntimeException;
+use MongoDB\Driver\Session;
 use MongoDB\Driver\WriteConcern;
+use MongoDB\Driver\WriteConcernError;
+use MongoDB\Driver\WriteError;
+use MongoDB\Driver\WriteResult;
+use MongoDB\InsertManyResult;
 use MongoDB\InsertOneResult;
 use MongoDB\Model\BSONDocument;
 use MongoDB\Operation\FindOneAndUpdate;
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\TestCase;
+use Symfony\Bridge\PhpUnit\ClockMock;
 use Symfony\Component\Clock\MockClock;
 use Symfony\Component\Messenger\Bridge\MongoDb\Transport\Connection;
 use Symfony\Component\Messenger\Exception\InvalidArgumentException;
@@ -54,11 +62,11 @@ class ConnectionTest extends TestCase
             ->with('some_db', 'some_collection')
             ->willReturn($collection);
 
-        $this->assertInstanceOf(Connection::class, Connection::fromDsn('mongodb://localhost:27017', ['database' => 'some_db', 'collection_name' => 'some_collection'], $client));
+        $this->assertInstanceOf(Connection::class, Connection::fromDsn('mongodb://localhost:27017', ['database' => 'some_db', 'collection' => 'some_collection'], $client));
     }
 
     /**
-     * @param array{database: string, collection_name: string, queue_name: string, redeliver_timeout: int} $expectedConfiguration
+     * @param array{database: string, collection: string, queue_name: string, redeliver_timeout: int} $expectedConfiguration
      */
     #[DataProvider('buildConfigurationProvider')]
     public function testBuildConfiguration(string $dsn, array $options, array $expectedConfiguration, string $expectedUri)
@@ -73,7 +81,7 @@ class ConnectionTest extends TestCase
     {
         $defaultConfiguration = [
             'database' => 'db',
-            'collection_name' => 'messenger_messages',
+            'collection' => 'messenger_messages',
             'queue_name' => 'default',
             'redeliver_timeout' => 3600,
         ];
@@ -85,10 +93,75 @@ class ConnectionTest extends TestCase
             'mongodb://localhost:27017/db',
         ];
 
-        yield 'settings from the DSN query string are extracted' => [
-            'mongodb://localhost:27017/db?collection_name=my_collection&queue_name=my_queue&redeliver_timeout=100',
+        foreach (['%61pp' => 'app', '%2561pp' => '%61pp', '0' => '0', '%30' => '0'] as $path => $database) {
+            yield 'database path '.$path => [
+                'mongodb://localhost/'.$path,
+                [],
+                ['database' => $database] + $defaultConfiguration,
+                'mongodb://localhost/'.$path,
+            ];
+        }
+
+        yield 'multiple hosts with ports' => [
+            'mongodb://host1:27017,host2:27017/db',
             [],
-            ['database' => 'db', 'collection_name' => 'my_collection', 'queue_name' => 'my_queue', 'redeliver_timeout' => 100] + $defaultConfiguration,
+            $defaultConfiguration,
+            'mongodb://host1:27017,host2:27017/db',
+        ];
+
+        yield 'multiple hosts without ports' => [
+            'mongodb://host1,host2/db',
+            [],
+            $defaultConfiguration,
+            'mongodb://host1,host2/db',
+        ];
+
+        yield 'multiple hosts with credentials and URI options' => [
+            'mongodb://user:pass@host1:27017,host2:27017/db?retryWrites=true',
+            [],
+            $defaultConfiguration,
+            'mongodb://user:pass@host1:27017,host2:27017/db?retryWrites=true',
+        ];
+
+        yield 'percent-encoded database in the path' => [
+            'mongodb://localhost/my%2Ddb',
+            [],
+            ['database' => 'my-db'] + $defaultConfiguration,
+            'mongodb://localhost/my%2Ddb',
+        ];
+
+        yield 'database named zero' => [
+            'mongodb://localhost/0',
+            [],
+            ['database' => '0'] + $defaultConfiguration,
+            'mongodb://localhost/0',
+        ];
+
+        yield 'question mark in a value' => [
+            'mongodb://localhost/app?collection=c&appName=a?b',
+            [],
+            ['database' => 'app', 'collection' => 'c'] + $defaultConfiguration,
+            'mongodb://localhost/app?appName=a?b',
+        ];
+
+        yield 'database from the path takes precedence over the query' => [
+            'mongodb://localhost/path_db?database=query_db',
+            [],
+            ['database' => 'path_db'] + $defaultConfiguration,
+            'mongodb://localhost/path_db',
+        ];
+
+        yield 'fragment is kept in the URI' => [
+            'mongodb://localhost/app#frag',
+            [],
+            ['database' => 'app'] + $defaultConfiguration,
+            'mongodb://localhost/app#frag',
+        ];
+
+        yield 'settings from the DSN query string are extracted' => [
+            'mongodb://localhost:27017/db?collection=my_collection&queue_name=my_queue&redeliver_timeout=100',
+            [],
+            ['database' => 'db', 'collection' => 'my_collection', 'queue_name' => 'my_queue', 'redeliver_timeout' => 100] + $defaultConfiguration,
             'mongodb://localhost:27017/db',
         ];
 
@@ -104,6 +177,48 @@ class ConnectionTest extends TestCase
             ['database' => 'other_db', 'queue_name' => 'from_options'],
             ['database' => 'other_db', 'queue_name' => 'from_options'] + $defaultConfiguration,
             'mongodb://localhost:27017/db',
+        ];
+
+        yield 'bare DSN uses the defaults' => [
+            'mongodb://localhost',
+            [],
+            ['database' => 'app'] + $defaultConfiguration,
+            'mongodb://localhost',
+        ];
+
+        yield 'transport options are removed from the middle' => [
+            'mongodb://localhost/db?retryWrites=true&queue_name=my_queue&w=majority',
+            [],
+            ['queue_name' => 'my_queue'] + $defaultConfiguration,
+            'mongodb://localhost/db?retryWrites=true&w=majority',
+        ];
+
+        yield 'repeated transport options are all removed' => [
+            'mongodb://localhost/db?queue_name=a&queue_name=b&w=1',
+            [],
+            ['queue_name' => 'b'] + $defaultConfiguration,
+            'mongodb://localhost/db?w=1',
+        ];
+
+        yield 'repeated URI options are kept in order' => [
+            'mongodb://localhost/db?readPreferenceTags=dc:ny&queue_name=q&readPreferenceTags=dc:sf',
+            [],
+            ['queue_name' => 'q'] + $defaultConfiguration,
+            'mongodb://localhost/db?readPreferenceTags=dc:ny&readPreferenceTags=dc:sf',
+        ];
+
+        yield 'encoded ampersand in a value is kept' => [
+            'mongodb://localhost/db?appName=my%26app&queue_name=q&w=majority',
+            [],
+            ['queue_name' => 'q'] + $defaultConfiguration,
+            'mongodb://localhost/db?appName=my%26app&w=majority',
+        ];
+
+        yield 'equals sign in a value is kept' => [
+            'mongodb://localhost/db?appName=a=b&queue_name=q',
+            [],
+            ['queue_name' => 'q'] + $defaultConfiguration,
+            'mongodb://localhost/db?appName=a=b',
         ];
     }
 
@@ -124,16 +239,40 @@ class ConnectionTest extends TestCase
             'The given MongoDB Messenger DSN is invalid. Expecting "mongodb://" or "mongodb+srv://".',
         ];
 
-        yield 'missing database' => [
-            'mongodb://localhost:27017',
+        yield 'last host without port' => [
+            'mongodb://host1:27017,host2/db',
             [],
-            'The MongoDB Messenger transport requires a "database", provide it in the DSN path or as an option.',
+            'The given MongoDB DSN is invalid. When it lists several hosts, add the port of the last one too.',
+        ];
+
+        yield 'question mark in user information' => [
+            'mongodb://user:p?ss@localhost/app',
+            [],
+            'The given MongoDB DSN is invalid.',
+        ];
+
+        yield 'empty collection in the DSN' => [
+            'mongodb://localhost/app?collection=',
+            [],
+            'The "collection" DSN option must not be empty.',
+        ];
+
+        yield 'empty database in the DSN' => [
+            'mongodb://localhost/app?database=',
+            [],
+            'The "database" DSN option must not be empty.',
+        ];
+
+        yield 'empty collection option' => [
+            'mongodb://localhost/app',
+            ['collection' => ''],
+            'The "collection" option must not be empty.',
         ];
 
         yield 'unknown option' => [
             'mongodb://localhost:27017/db',
             ['foo' => 'bar'],
-            'Unknown option found: [foo]. Allowed options are [database, collection_name, queue_name, redeliver_timeout].',
+            'Unknown option found: [foo]. Allowed options are [database, collection, queue_name, redeliver_timeout].',
         ];
 
         yield 'invalid redeliver_timeout' => [
@@ -162,7 +301,7 @@ class ConnectionTest extends TestCase
                         ]],
                     ],
                     'availableAt' => ['$lte' => new UTCDateTime($clock->now())],
-                    'queueName' => 'foobar',
+                    'queueName' => ['$in' => ['foobar']],
                 ]),
                 $this->equalTo([
                     '$set' => [
@@ -180,6 +319,84 @@ class ConnectionTest extends TestCase
             ->willReturn($document);
 
         $this->assertSame($document, $connection->get());
+    }
+
+    public function testGetClaimsAcrossSeveralQueuesWithASingleRequest()
+    {
+        $collection = $this->createMock(Collection::class);
+
+        $clock = new MockClock();
+        $connection = new Connection($collection, 'foobar', 100, $clock);
+        $document = $this->createDocumentDeliveredTo($connection->getUniqueId());
+
+        $collection->expects($this->once())
+            ->method('findOneAndUpdate')
+            ->with(
+                $this->equalTo([
+                    '$or' => [
+                        ['deliveredAt' => null],
+                        ['deliveredAt' => [
+                            '$lt' => new UTCDateTime($clock->now()->modify('-100 seconds')),
+                        ]],
+                    ],
+                    'availableAt' => ['$lte' => new UTCDateTime($clock->now())],
+                    'queueName' => ['$in' => ['foo', 'bar']],
+                ]),
+                $this->equalTo([
+                    '$set' => [
+                        'deliveredTo' => $connection->getUniqueId(),
+                        'deliveredAt' => new UTCDateTime($clock->now()),
+                    ],
+                ]),
+                $this->equalTo([
+                    'writeConcern' => new WriteConcern(WriteConcern::MAJORITY),
+                    'returnDocument' => FindOneAndUpdate::RETURN_DOCUMENT_AFTER,
+                    'sort' => ['availableAt' => 1],
+                    'typeMap' => ['root' => BSONDocument::class],
+                ])
+            )
+            ->willReturn($document);
+
+        $this->assertSame($document, $connection->get(['foo', 'bar']));
+    }
+
+    public function testGetSupportsASingleQueue()
+    {
+        $collection = $this->createMock(Collection::class);
+
+        $clock = new MockClock();
+        $connection = new Connection($collection, 'default', 100, $clock);
+        $document = $this->createDocumentDeliveredTo($connection->getUniqueId());
+
+        $collection->expects($this->once())
+            ->method('findOneAndUpdate')
+            ->with(
+                $this->equalTo([
+                    '$or' => [
+                        ['deliveredAt' => null],
+                        ['deliveredAt' => [
+                            '$lt' => new UTCDateTime($clock->now()->modify('-100 seconds')),
+                        ]],
+                    ],
+                    'availableAt' => ['$lte' => new UTCDateTime($clock->now())],
+                    'queueName' => ['$in' => ['foobar']],
+                ]),
+                $this->anything(),
+                $this->anything()
+            )
+            ->willReturn($document);
+
+        $this->assertSame($document, $connection->get(['foobar']));
+    }
+
+    public function testGetThrowsWhenNoQueueIsGiven()
+    {
+        $connection = new Connection($this->createStub(Collection::class), 'foobar', 100);
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('At least one queue name is required.');
+
+        $connection->get([]);
     }
 
     public function testGetWrapsMongoExceptions()
@@ -250,6 +467,30 @@ class ConnectionTest extends TestCase
         $this->assertSame($objectId, $connection->send('serializedEnvelope', ['type' => 'foo']));
     }
 
+    #[Group('time-sensitive')]
+    public function testSendReadsTheTimeWithoutAClock()
+    {
+        ClockMock::withClockMock((new \DateTimeImmutable('2024-05-02 12:00:00'))->getTimestamp());
+
+        $insertOneResult = $this->createStub(InsertOneResult::class);
+        $insertOneResult->method('getInsertedId')->willReturn(new ObjectId());
+
+        $collection = $this->createMock(Collection::class);
+        $collection->expects($this->once())
+            ->method('insertOne')
+            ->with(
+                $this->callback(static function ($document): bool {
+                    self::assertEquals(new UTCDateTime(new \DateTimeImmutable('2024-05-02 12:00:00')), $document->createdAt);
+
+                    return true;
+                }),
+                $this->anything(),
+            )
+            ->willReturn($insertOneResult);
+
+        (new Connection($collection, 'foobar'))->send('serializedEnvelope');
+    }
+
     public function testSendWithDelay()
     {
         $insertOneResult = $this->createStub(InsertOneResult::class);
@@ -278,6 +519,31 @@ class ConnectionTest extends TestCase
         $this->assertSame($objectId, $connection->send('serializedEnvelope', [], 100_000));
     }
 
+    public function testSendWithAnExplicitQueue()
+    {
+        $insertOneResult = $this->createStub(InsertOneResult::class);
+        $insertOneResult->method('getInsertedId')
+            ->willReturn(new ObjectId());
+
+        $clock = new MockClock();
+        $collection = $this->createMock(Collection::class);
+        $collection->expects($this->once())
+            ->method('insertOne')
+            ->with(
+                $this->callback(static function (BSONDocument $document): bool {
+                    self::assertSame('bar', $document->queueName);
+
+                    return true;
+                }),
+                ['writeConcern' => new WriteConcern(WriteConcern::MAJORITY)]
+            )
+            ->willReturn($insertOneResult);
+
+        $connection = new Connection($collection, 'foobar', 3_600, $clock);
+
+        $connection->send('serializedEnvelope', [], 0, null, 'bar');
+    }
+
     public function testSendWrapsMongoExceptions()
     {
         $collection = $this->createStub(Collection::class);
@@ -290,6 +556,175 @@ class ConnectionTest extends TestCase
         $this->expectExceptionMessage('Foo bar baz');
 
         $connection->send('body');
+    }
+
+    public function testSendBatch()
+    {
+        $clock = new MockClock();
+        $collection = $this->createMock(Collection::class);
+        $collection->expects($this->once())
+            ->method('insertMany')
+            ->with(
+                $this->callback(static function (array $documents) use (&$inserted, $clock): bool {
+                    self::assertTrue(array_is_list($documents));
+                    self::assertCount(2, $documents);
+                    self::assertInstanceOf(ObjectId::class, $documents[0]->_id);
+                    self::assertSame('first', $documents[0]->body);
+                    self::assertEquals(new BSONDocument(['type' => 'foo']), $documents[0]->headers);
+                    self::assertSame('foobar', $documents[0]->queueName);
+                    self::assertEquals(new UTCDateTime($clock->now()), $documents[0]->createdAt);
+                    self::assertEquals(new UTCDateTime($clock->now()), $documents[0]->availableAt);
+                    self::assertInstanceOf(ObjectId::class, $documents[1]->_id);
+                    self::assertSame('second', $documents[1]->body);
+                    self::assertSame('bar', $documents[1]->queueName);
+                    self::assertEquals(new UTCDateTime($clock->now()->modify('+100 seconds')), $documents[1]->availableAt);
+                    $inserted = $documents;
+
+                    return true;
+                }),
+                ['ordered' => false, 'writeConcern' => new WriteConcern(WriteConcern::MAJORITY)]
+            )
+            ->willReturn($this->createStub(InsertManyResult::class));
+
+        $connection = new Connection($collection, 'foobar', 3_600, $clock);
+
+        [$ids, $exceptions] = $connection->sendBatch([
+            'a' => ['first', ['type' => 'foo'], 0, null, null],
+            'b' => ['second', [], 100_000, null, 'bar'],
+        ]);
+
+        $this->assertSame(['a' => $inserted[0]->_id, 'b' => $inserted[1]->_id], $ids);
+        $this->assertSame([], $exceptions);
+    }
+
+    public function testSendBatchInsertsTheMessagesOfEachSessionWithTheirOwnRequest()
+    {
+        $session = $this->createSession();
+        $otherSession = $this->createSession();
+        $requests = [];
+
+        $collection = $this->createMock(Collection::class);
+        $collection->expects($this->exactly(4))
+            ->method('insertMany')
+            ->willReturnCallback(function (array $documents, array $options) use (&$requests) {
+                $requests[] = [array_map(static fn (BSONDocument $document) => $document->body, $documents), $options['session'] ?? null];
+
+                return $this->createStub(InsertManyResult::class);
+            });
+
+        $connection = new Connection($collection, 'foobar', 3_600);
+
+        [$ids, $exceptions] = $connection->sendBatch([
+            ['a', [], 0, null, null],
+            ['b', [], 0, $session, null],
+            ['c', [], 0, $session, null],
+            ['d', [], 0, $otherSession, null],
+            ['e', [], 0, null, null],
+        ]);
+
+        $this->assertSame([[['a'], null], [['b', 'c'], $session], [['d'], $otherSession], [['e'], null]], $requests);
+        $this->assertSame([0, 1, 2, 3, 4], array_keys($ids));
+        $this->assertSame([], $exceptions);
+    }
+
+    public function testSendBatchReportsTheMessagesTheServerRejected()
+    {
+        $collection = $this->createMock(Collection::class);
+        $collection->expects($this->exactly(2))
+            ->method('insertMany')
+            ->willReturnOnConsecutiveCalls($this->throwException($this->createBulkWriteException(2, false, [1 => 'E11000 duplicate key error'])), $this->createStub(InsertManyResult::class));
+
+        $connection = new Connection($collection, 'foobar', 3_600);
+
+        [$ids, $exceptions] = $connection->sendBatch([
+            'a' => ['a', [], 0, null, null],
+            'b' => ['b', [], 0, null, null],
+            'c' => ['c', [], 0, null, null],
+            'd' => ['d', [], 0, $this->createSession(), null],
+        ]);
+
+        $this->assertSame(['a', 'c', 'd'], array_keys($ids));
+        $this->assertSame(['b'], array_keys($exceptions));
+        $this->assertInstanceOf(TransportException::class, $exceptions['b']);
+        $this->assertSame('E11000 duplicate key error', $exceptions['b']->getMessage());
+    }
+
+    public function testSendBatchReportsTheMessagesNotSentAfterAnErrorStoppedTheInsert()
+    {
+        $collection = $this->createMock(Collection::class);
+        $collection->expects($this->once())
+            ->method('insertMany')
+            ->willThrowException($bulkWriteException = $this->createBulkWriteException(1, false, [1 => 'E11000 duplicate key error']));
+
+        $connection = new Connection($collection, 'foobar', 3_600);
+
+        [$ids, $exceptions] = $connection->sendBatch([
+            'a' => ['a', [], 0, null, null],
+            'b' => ['b', [], 0, null, null],
+            'c' => ['c', [], 0, null, null],
+            'd' => ['d', [], 0, $this->createSession(), null],
+        ]);
+
+        $this->assertSame(['a'], array_keys($ids));
+        $this->assertSame(['b', 'c', 'd'], array_keys($exceptions));
+        $this->assertSame('E11000 duplicate key error', $exceptions['b']->getMessage());
+        $this->assertSame('Write failed.', $exceptions['c']->getMessage());
+        $this->assertSame($bulkWriteException, $exceptions['c']->getPrevious());
+        $this->assertSame($exceptions['c'], $exceptions['d']);
+    }
+
+    public function testSendBatchReportsAllMessagesOfARequestThatFailedItsWriteConcernAsNotInserted()
+    {
+        $collection = $this->createStub(Collection::class);
+        $collection->method('insertMany')
+            ->willThrowException($this->createBulkWriteException(2, true));
+
+        $connection = new Connection($collection, 'foobar', 3_600);
+
+        [$ids, $exceptions] = $connection->sendBatch([['a', [], 0, null, null], ['b', [], 0, null, null]]);
+
+        $this->assertSame([], $ids);
+        $this->assertSame([0, 1], array_keys($exceptions));
+    }
+
+    public function testSendBatchStopsAtTheFirstFailedRequest()
+    {
+        $session = $this->createSession();
+
+        $collection = $this->createMock(Collection::class);
+        $collection->expects($this->exactly(2))
+            ->method('insertMany')
+            ->willReturnOnConsecutiveCalls($this->createStub(InsertManyResult::class), $this->throwException(new RuntimeException('Foo bar baz')));
+
+        $connection = new Connection($collection, 'foobar', 3_600);
+
+        [$ids, $exceptions] = $connection->sendBatch([
+            'a' => ['a', [], 0, null, null],
+            'b' => ['b', [], 0, $session, null],
+            'c' => ['c', [], 0, $session, null],
+            'd' => ['d', [], 0, null, null],
+        ]);
+
+        $this->assertSame(['a'], array_keys($ids));
+        $this->assertSame(['b', 'c', 'd'], array_keys($exceptions));
+        $this->assertSame('Foo bar baz', $exceptions['d']->getMessage());
+    }
+
+    public function testSendBatchWrapsMongoExceptions()
+    {
+        $collection = $this->createStub(Collection::class);
+        $collection->method('insertMany')
+            ->willThrowException(new RuntimeException('Foo bar baz'));
+
+        $connection = new Connection($collection, 'queueName', 100);
+
+        [$ids, $exceptions] = $connection->sendBatch(['a' => ['a', [], 0, null, null], 'b' => ['b', [], 0, null, null]]);
+
+        $this->assertSame([], $ids);
+        $this->assertSame(['a', 'b'], array_keys($exceptions));
+        $this->assertInstanceOf(TransportException::class, $exceptions['a']);
+        $this->assertSame('Foo bar baz', $exceptions['a']->getMessage());
+        $this->assertSame($exceptions['a'], $exceptions['b']);
     }
 
     /**
@@ -344,12 +779,13 @@ class ConnectionTest extends TestCase
         $deleteResult = $this->createStub(DeleteResult::class);
         $deleteResult->method('getDeletedCount')
             ->willReturn($deletedCount);
+
+        $connection = new Connection($collection, 'queueName', 100);
+
         $collection->expects($this->once())
             ->method('deleteOne')
             ->with($this->equalTo(['_id' => $objectId]), $this->anything())
             ->willReturn($deleteResult);
-
-        $connection = new Connection($collection, 'queueName', 100);
 
         $this->assertSame($expectedResult, $connection->reject((string) $objectId));
     }
@@ -437,5 +873,23 @@ class ConnectionTest extends TestCase
         $document->deliveredTo = $deliveredTo;
 
         return $document;
+    }
+
+    private function createSession(): Session
+    {
+        if (\extension_loaded('mongodb')) {
+            $this->markTestSkipped('The driver creates sessions only when connected to a server.');
+        }
+
+        return new Session();
+    }
+
+    private function createBulkWriteException(int $insertedCount, bool $writeConcernError = false, array $writeErrors = []): BulkWriteException
+    {
+        if (\extension_loaded('mongodb')) {
+            $this->markTestSkipped('The driver creates write results only when connected to a server.');
+        }
+
+        return new BulkWriteException('Write failed.', new WriteResult($insertedCount, $writeConcernError ? new WriteConcernError() : null, array_map(static fn (int $index, string $message) => new WriteError($index, $message), array_keys($writeErrors), $writeErrors)));
     }
 }

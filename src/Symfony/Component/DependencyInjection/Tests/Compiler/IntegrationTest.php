@@ -21,13 +21,17 @@ use Symfony\Component\DependencyInjection\Alias;
 use Symfony\Component\DependencyInjection\Argument\BoundArgument;
 use Symfony\Component\DependencyInjection\Argument\ServiceLocatorArgument;
 use Symfony\Component\DependencyInjection\Argument\TaggedIteratorArgument;
+use Symfony\Component\DependencyInjection\Attribute\AutowireCallable;
+use Symfony\Component\DependencyInjection\Attribute\AutowireMethodOf;
 use Symfony\Component\DependencyInjection\ChildDefinition;
 use Symfony\Component\DependencyInjection\Compiler\CompilerPassInterface;
 use Symfony\Component\DependencyInjection\Compiler\RegisterAutoconfigureAttributesPass;
 use Symfony\Component\DependencyInjection\Compiler\ResolveInstanceofConditionalsPass;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Definition;
+use Symfony\Component\DependencyInjection\Dumper\PhpDumper;
 use Symfony\Component\DependencyInjection\Exception\InvalidArgumentException;
+use Symfony\Component\DependencyInjection\Exception\RuntimeException;
 use Symfony\Component\DependencyInjection\Loader\YamlFileLoader;
 use Symfony\Component\DependencyInjection\Reference;
 use Symfony\Component\DependencyInjection\ServiceLocator;
@@ -60,6 +64,16 @@ use Symfony\Component\DependencyInjection\Tests\Fixtures\NestedAutowireLocatorCo
 use Symfony\Component\DependencyInjection\Tests\Fixtures\PrivateConstructorResourceTaggedWithCallable;
 use Symfony\Component\DependencyInjection\Tests\Fixtures\PrivateConstructorResourceTaggedWithClosure;
 use Symfony\Component\DependencyInjection\Tests\Fixtures\PrivateConstructorTaggedWithCallable;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\RegisterCallableServicesPass\ClosureConsumer;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\RegisterCallableServicesPass\DecoratingLoaders;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\RegisterCallableServicesPass\ExporterConsumer;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\RegisterCallableServicesPass\ExporterInterface;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\RegisterCallableServicesPass\Exporters;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\RegisterCallableServicesPass\IncompleteDecorator;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\RegisterCallableServicesPass\IteratorConsumer;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\RegisterCallableServicesPass\Loaders;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\RegisterCallableServicesPass\LocatorConsumer;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\RegisterCallableServicesPass\PdfExporter;
 use Symfony\Component\DependencyInjection\Tests\Fixtures\ResourceTaggedWithCallableInterface;
 use Symfony\Component\DependencyInjection\Tests\Fixtures\ResourceTaggedWithClosureInterface;
 use Symfony\Component\DependencyInjection\Tests\Fixtures\ResourceTaggedWithClosureMarkerInterface;
@@ -1633,6 +1647,184 @@ class IntegrationTest extends TestCase
 
         self::assertSame(['test' => [['attribute' => 'static']]], $collector->collectedTags);
     }
+
+    public function testAClosureServiceCanBeInjected()
+    {
+        $container = new ContainerBuilder();
+        $container->register('app.loaders', Loaders::class)->setAutoconfigured(true);
+        $container->register(ClosureConsumer::class)
+            ->setAutowired(true)
+            ->setPublic(true)
+        ;
+
+        $container->compile();
+
+        try {
+            $consumer = $container->get(ClosureConsumer::class);
+
+            $this->assertSame(0, Loaders::$instantiations);
+
+            $this->assertTrue($consumer->loadAdults(20));
+            $this->assertFalse($consumer->loadAdults(10));
+            $this->assertSame(1, Loaders::$instantiations);
+        } finally {
+            Loaders::$instantiations = 0;
+        }
+    }
+
+    public function testClosureServicesAreCollectedByALocator()
+    {
+        $container = new ContainerBuilder();
+        $container->register('app.loaders', Loaders::class)->setAutoconfigured(true);
+        $container->register(LocatorConsumer::class)
+            ->setAutowired(true)
+            ->setPublic(true)
+        ;
+
+        $container->compile();
+
+        try {
+            $loaders = $container->get(LocatorConsumer::class)->getLoaders();
+
+            $this->assertSame(0, Loaders::$instantiations);
+
+            $this->assertTrue($loaders->get('adult')(20));
+            $this->assertTrue($loaders->get('minor')(10));
+
+            // a method declaring the tag twice is reachable under either key
+            $this->assertTrue($loaders->get('young')(10));
+            $this->assertSame(1, Loaders::$instantiations);
+        } finally {
+            Loaders::$instantiations = 0;
+        }
+    }
+
+    public function testClosureServicesAreCollectedByAnIterator()
+    {
+        $container = new ContainerBuilder();
+        $container->register('app.loaders', Loaders::class)->setAutoconfigured(true);
+        $container->register(IteratorConsumer::class)
+            ->setAutowired(true)
+            ->setPublic(true)
+        ;
+
+        $container->compile();
+
+        try {
+            $loaders = iterator_to_array($container->get(IteratorConsumer::class)->getLoaders());
+
+            // two services, although one of them declares the tag twice
+            $this->assertCount(2, $loaders);
+            $this->assertContainsOnlyInstancesOf(\Closure::class, $loaders);
+            $this->assertSame(0, Loaders::$instantiations);
+        } finally {
+            Loaders::$instantiations = 0;
+        }
+    }
+
+    public function testAClosureServiceCanBeAnAdapter()
+    {
+        $container = new ContainerBuilder();
+        $container->register('app.exporters', Exporters::class)->setAutoconfigured(true);
+        $container->register(PdfExporter::class)->addTag('app.exporter', ['format' => 'pdf']);
+        $container->register(ExporterConsumer::class)
+            ->setAutowired(true)
+            ->setPublic(true)
+        ;
+
+        $container->compile();
+
+        try {
+            $consumer = $container->get(ExporterConsumer::class);
+            $exporters = iterator_to_array($consumer->exporters);
+            ksort($exporters);
+
+            $this->assertSame(['csv', 'pdf', 'tsv'], array_keys($exporters));
+            $this->assertContainsOnlyInstancesOf(ExporterInterface::class, $exporters);
+            $this->assertSame(0, Exporters::$instantiations);
+
+            $this->assertSame('pdf:1', $exporters['pdf']->export([1]));
+            $this->assertSame('tsv:2', $exporters['tsv']->export([1, 2]));
+            $this->assertSame('csv:3', $consumer->csvExporter->export([1, 2, 3]));
+            $this->assertSame('html:4', ($consumer->htmlExporter)([1, 2, 3, 4]));
+            $this->assertSame(1, Exporters::$instantiations);
+        } finally {
+            Exporters::$instantiations = 0;
+        }
+    }
+
+    public function testAClosureServiceCallsTheDecoratorOfItsOwner()
+    {
+        $container = new ContainerBuilder();
+        $container->register('app.loaders', Loaders::class)->setAutoconfigured(true);
+        $container->register('app.decorating_loaders', DecoratingLoaders::class)
+            ->setDecoratedService('app.loaders')
+            ->setArguments([new Reference('app.decorating_loaders.inner')])
+        ;
+        $container->register(LocatorConsumer::class)
+            ->setAutowired(true)
+            ->setPublic(true)
+        ;
+
+        $container->compile();
+
+        try {
+            $loaders = $container->get(LocatorConsumer::class)->getLoaders();
+
+            // the closure holds the "app.loaders" id, which decoration now points at the decorator
+            $this->assertFalse($loaders->get('adult')(20));
+            $this->assertSame(1, Loaders::$instantiations);
+        } finally {
+            Loaders::$instantiations = 0;
+        }
+    }
+
+    public function testAutowireCallablesAreLazyByDefault()
+    {
+        $container = new ContainerBuilder();
+        foreach (['callable', 'method', 'eager_callable'] as $id) {
+            $container->register($id, AutowireCallableTarget::class)->setPublic(true);
+        }
+        $container->register(AutowireCallableConsumer::class)->setAutowired(true)->setPublic(true);
+        $container->compile();
+
+        eval('?>'.(new PhpDumper($container))->dump(['class' => 'Symfony_DI_Integration_AutowireCallable_Lazy']));
+
+        foreach ([$container, new \Symfony_DI_Integration_AutowireCallable_Lazy()] as $container) {
+            $consumer = $container->get(AutowireCallableConsumer::class);
+
+            self::assertFalse($container->initialized('callable'));
+            self::assertFalse($container->initialized('method'));
+            self::assertTrue($container->initialized('eager_callable'));
+            self::assertSame('callable', ($consumer->callable)());
+            self::assertSame('formatted', ($consumer->format)());
+            self::assertSame('callable', ($consumer->eagerCallable)());
+            self::assertTrue($container->initialized('callable'));
+            self::assertTrue($container->initialized('method'));
+        }
+    }
+
+    public function testAClosureServiceFailsWhenTheDecoratorDropsTheMethod()
+    {
+        $container = new ContainerBuilder();
+        $container->register('app.loaders', Loaders::class)->setAutoconfigured(true);
+        $container->register('app.incomplete_decorator', IncompleteDecorator::class)
+            ->setDecoratedService('app.loaders')
+            ->setArguments([new Reference('app.incomplete_decorator.inner')])
+        ;
+        $container->register(LocatorConsumer::class)
+            ->setAutowired(true)
+            ->setPublic(true)
+        ;
+
+        $container->compile();
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Cannot create lazy closure for service "app.loaders::loadAdults" because method "Symfony\Component\DependencyInjection\Tests\Fixtures\RegisterCallableServicesPass\IncompleteDecorator::loadAdults()" does not exist.');
+
+        // the container no longer dumps, the adapter cannot be written for a method the decorator lacks
+        (new PhpDumper($container))->dump();
+    }
 }
 
 class ServiceSubscriberStub implements ServiceSubscriberInterface
@@ -1703,5 +1895,31 @@ final class TagCollector implements CompilerPassInterface
     public function process(ContainerBuilder $container): void
     {
         $this->collectedTags = $container->findTaggedServiceIds('app.custom_tag');
+    }
+}
+
+class AutowireCallableTarget
+{
+    public function __invoke(): string
+    {
+        return 'callable';
+    }
+
+    public function format(): string
+    {
+        return 'formatted';
+    }
+}
+
+class AutowireCallableConsumer
+{
+    public function __construct(
+        #[AutowireCallable(service: 'callable')]
+        public \Closure $callable,
+        #[AutowireMethodOf('method')]
+        public \Closure $format,
+        #[AutowireCallable(service: 'eager_callable', lazy: false)]
+        public \Closure $eagerCallable,
+    ) {
     }
 }

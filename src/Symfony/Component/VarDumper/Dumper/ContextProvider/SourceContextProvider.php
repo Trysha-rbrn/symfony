@@ -66,7 +66,7 @@ final class SourceContextProvider implements ContextProviderInterface
                             $file = method_exists($template, 'getSourceContext') ? $template->getSourceContext()->getPath() : null;
 
                             if ($src) {
-                                $src = explode("\n", $src);
+                                $src = explode("\n", str_replace(["\r\n", "\r"], "\n", $src));
                                 $fileExcerpt = [];
 
                                 for ($i = max($line - 3, 1), $max = min($line + 3, \count($src)); $i <= $max; ++$i) {
@@ -107,6 +107,11 @@ final class SourceContextProvider implements ContextProviderInterface
 
     private function htmlEncode(string $s): string
     {
+        // skip HtmlDumper for printable ASCII contents (same output but much faster)
+        if (preg_match('/^[\x20-\x7E]*+$/D', $s)) {
+            return htmlspecialchars($s, \ENT_QUOTES, 'UTF-8');
+        }
+
         $html = '';
 
         $dumper = new HtmlDumper(static function ($line) use (&$html) { $html .= $line; }, $this->charset);

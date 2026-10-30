@@ -12,11 +12,13 @@
 namespace Symfony\Component\HttpKernel\EventListener;
 
 use Symfony\Component\EventDispatcher\EventSubscriberInterface;
+use Symfony\Component\ExpressionLanguage\ConstantFunctionProvider;
 use Symfony\Component\ExpressionLanguage\Expression;
 use Symfony\Component\ExpressionLanguage\ExpressionLanguage;
 use Symfony\Component\HttpFoundation\HeaderBag;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpFoundation\TargetedCacheControl;
 use Symfony\Component\HttpKernel\Attribute\Cache;
 use Symfony\Component\HttpKernel\Event\ControllerArgumentsEvent;
 use Symfony\Component\HttpKernel\Event\ControllerAttributeEvent;
@@ -54,7 +56,7 @@ class CacheAttributeListener implements EventSubscriberInterface
             $response = $kernelEvent->getResponse();
 
             // http://tools.ietf.org/html/draft-ietf-httpbis-p4-conditional-12#section-3.1
-            if (!\in_array($response->getStatusCode(), [200, 203, 300, 301, 302, 304, 404, 410], true)) {
+            if (!\in_array($response->getStatusCode(), [200, 203, 300, 301, 302, 304, 308, 404, 410], true)) {
                 return;
             }
 
@@ -101,7 +103,7 @@ class CacheAttributeListener implements EventSubscriberInterface
         $response = $event->getResponse();
 
         // http://tools.ietf.org/html/draft-ietf-httpbis-p4-conditional-12#section-3.1
-        if (!\in_array($response->getStatusCode(), [200, 203, 300, 301, 302, 304, 404, 410], true)) {
+        if (!\in_array($response->getStatusCode(), [200, 203, 300, 301, 302, 304, 308, 404, 410], true)) {
             return;
         }
 
@@ -161,7 +163,7 @@ class CacheAttributeListener implements EventSubscriberInterface
         }
 
         if ($response?->isNotModified($request)) {
-            $event->setController(static fn () => $response);
+            $event->setController(static fn () => $response, $event->getAttributes('*'));
             $event->stopPropagation();
         }
     }
@@ -169,6 +171,14 @@ class CacheAttributeListener implements EventSubscriberInterface
     private function processAttributeAfterController(Cache $cache, Request $request, Response $response, ?bool &$hasVary = null, ?callable &$hasCacheControlDirective = null): void
     {
         if (!$cache->if) {
+            return;
+        }
+
+        if ($cache->target) {
+            foreach ((array) $cache->target as $target) {
+                $this->processTargetedAttributeAfterController($cache, $response->cacheControl($target));
+            }
+
             return;
         }
 
@@ -246,6 +256,33 @@ class CacheAttributeListener implements EventSubscriberInterface
         }
     }
 
+    private function processTargetedAttributeAfterController(Cache $cache, TargetedCacheControl $cacheControl): void
+    {
+        if ($cache->mustRevalidate) {
+            $cacheControl->set('must-revalidate');
+        }
+
+        if (null !== $cache->maxage && !$cacheControl->has('max-age')) {
+            $cacheControl->setMaxAge($this->toSeconds($cache->maxage));
+        }
+
+        if (null !== $cache->staleWhileRevalidate && !$cacheControl->has('stale-while-revalidate')) {
+            $cacheControl->setStaleWhileRevalidate($this->toSeconds($cache->staleWhileRevalidate));
+        }
+
+        if (null !== $cache->staleIfError && !$cacheControl->has('stale-if-error')) {
+            $cacheControl->setStaleIfError($this->toSeconds($cache->staleIfError));
+        }
+
+        if (\is_bool($cache->public) && !$cacheControl->has('public') && !$cacheControl->has('private')) {
+            $cache->public ? $cacheControl->setPublic() : $cacheControl->setPrivate();
+        }
+
+        if (null !== $cache->noStore) {
+            $cacheControl->setNoStore($cache->noStore);
+        }
+    }
+
     private function getVariables(Cache $cache, Request $request, ControllerArgumentsEvent $event): ?array
     {
         if (\is_bool($cache->if) && null === $cache->lastModified && null === $cache->etag) {
@@ -281,7 +318,7 @@ class CacheAttributeListener implements EventSubscriberInterface
     private function getExpressionLanguage(): ExpressionLanguage
     {
         return $this->expressionLanguage ??= class_exists(ExpressionLanguage::class)
-            ? new ExpressionLanguage()
+            ? new ExpressionLanguage(null, class_exists(ConstantFunctionProvider::class) ? [new ConstantFunctionProvider(['*', '*::*'])] : [])
             : throw new \LogicException('Unable to use expressions as the Symfony ExpressionLanguage component is not installed. Try running "composer require symfony/expression-language".');
     }
 

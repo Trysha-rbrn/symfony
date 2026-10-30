@@ -11,8 +11,10 @@
 
 namespace Symfony\Component\DependencyInjection\Tests;
 
+use PHPUnit\Framework\Attributes\TestWith;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\DependencyInjection\Compiler\CompilerPassInterface;
+use Symfony\Component\DependencyInjection\Container;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\ContainerInterface;
 use Symfony\Component\DependencyInjection\Kernel\AbstractBundle;
@@ -21,7 +23,10 @@ use Symfony\Component\DependencyInjection\Kernel\BundleInterface;
 use Symfony\Component\DependencyInjection\Kernel\KernelTrait;
 use Symfony\Component\DependencyInjection\Kernel\RequiredBundle;
 use Symfony\Component\DependencyInjection\Loader\Configurator\ContainerConfigurator;
+use Symfony\Component\DependencyInjection\Reference;
 use Symfony\Component\Filesystem\Filesystem;
+use Symfony\Contracts\Service\ResetInterface;
+use Symfony\Contracts\Service\ShutdownInterface;
 
 class AbstractKernelTest extends TestCase
 {
@@ -193,6 +198,91 @@ class AbstractKernelTest extends TestCase
         $kernel->boot();
     }
 
+    public function testShutdownDestroysServicesThatReferenceTheContainer()
+    {
+        $kernel = new ContainerReferencingKernel('test', true, $this->varDir);
+        $kernel->boot();
+        $kernel->getContainer()->get('container_referencing');
+        ContainerReferencingService::$destructed = false;
+
+        $gcEnabled = gc_enabled();
+        gc_disable();
+
+        try {
+            $kernel->shutdown();
+
+            $this->assertTrue(ContainerReferencingService::$destructed);
+        } finally {
+            if ($gcEnabled) {
+                gc_enable();
+            }
+        }
+    }
+
+    public function testShutdownDoesNotCollectCycles()
+    {
+        $kernel = new SelfReferencingKernel('test', true, $this->varDir);
+        $kernel->boot();
+        $kernel->getContainer()->get('self_referencing');
+        SelfReferencingService::$destructed = false;
+
+        $gcEnabled = gc_enabled();
+        gc_disable();
+
+        try {
+            $kernel->shutdown();
+
+            $this->assertFalse(SelfReferencingService::$destructed);
+
+            gc_collect_cycles();
+
+            $this->assertTrue(SelfReferencingService::$destructed);
+        } finally {
+            if ($gcEnabled) {
+                gc_enable();
+            }
+        }
+    }
+
+    public function testShutdownDestroysServicesWhileTheContainerIsStillReferenced()
+    {
+        $kernel = new ContainerReferencingKernel('test', true, $this->varDir);
+        $kernel->boot();
+        $container = $kernel->getContainer();
+        $container->get('container_referencing');
+        ContainerReferencingService::$destructed = false;
+
+        $gcEnabled = gc_enabled();
+        gc_disable();
+
+        try {
+            $kernel->shutdown();
+
+            $this->assertTrue(ContainerReferencingService::$destructed);
+            $this->assertFalse($container->initialized('container_referencing'));
+        } finally {
+            if ($gcEnabled) {
+                gc_enable();
+            }
+        }
+    }
+
+    #[TestWith([ResettableKernelContainer::class, false])]
+    #[TestWith([ShutdownAwareKernelContainer::class, true])]
+    #[TestWith([Container::class, true])]
+    public function testShutdownPassesFlagOnlyToSupportedContainers(string $containerClass, bool $shutdownAware)
+    {
+        $container = $this->createMock($containerClass);
+        $container->expects($this->once())->method('reset')->willReturnCallback(static function (...$arguments) use ($shutdownAware) {
+            self::assertSame($shutdownAware ? [true] : [], $arguments);
+        });
+        $kernel = $this->createKernel();
+        $kernel->boot();
+        (new \ReflectionProperty(AbstractKernel::class, 'container'))->setValue($kernel, $container);
+
+        $kernel->shutdown();
+    }
+
     public function testShutdownCallsShutdownOnBundles()
     {
         $bundle = $this->createMock(BundleInterface::class);
@@ -341,6 +431,52 @@ class AbstractKernelTest extends TestCase
         $kernel->boot();
 
         $this->assertCount(1, $kernel->getBundles(), 'Bundle cache should be used in debug mode when cache is newer than bundles.php');
+    }
+
+    public function testBundleCacheIsNotUsedInDebugWhenTheContainerIsStale()
+    {
+        // a project of its own, as the freshness of a container is remembered for the whole process
+        $dir = $this->varDir.'/stale_container';
+        @mkdir($dir.'/config', 0o777, true);
+        file_put_contents($dir.'/config/bundles.php', '<?php return ['.TestAbstractBundle::class.'::class => [\'all\' => true]];');
+        touch($dir.'/config/bundles.php', time() - 10);
+        file_put_contents($dir.'/config/services.yaml', '');
+
+        $kernel = new TestKernel('test', true, $dir);
+        $kernel->boot();
+
+        $this->assertCount(1, $kernel->getBundles());
+        $kernel->shutdown();
+
+        // the cached list misses a bundle, as when the class of an optional required bundle appeared since it was dumped
+        file_put_contents($kernel->getBuildDir().'/'.$kernel->getTestContainerClass().'.bundles.php', '<?php return [[], []];');
+        touch($dir.'/config/services.yaml', time() + 10);
+
+        $kernel = new TestKernel('test', true, $dir);
+        $kernel->boot();
+
+        $this->assertCount(1, $kernel->getBundles());
+    }
+
+    public function testBootThrowsAgainWhenRebuildingStaleContainerFails()
+    {
+        $dir = $this->varDir.'/failing_rebuild';
+
+        $kernel = new BuildCallbackKernel('test', true, $dir);
+        $kernel->boot();
+        $this->assertTrue(unlink($kernel->getBuildDir().'/'.$kernel->getTestContainerClass().'.php.meta'));
+
+        $kernel = new BuildCallbackKernel('test', true, $dir, static function () { throw new \RuntimeException('Container build failed'); });
+
+        try {
+            $kernel->boot();
+        } catch (\RuntimeException) {
+        }
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Container build failed');
+
+        $kernel->boot();
     }
 
     public function testBundleCacheIsUsedInNoDebug()
@@ -642,6 +778,21 @@ class BuildHookKernel extends TestKernel
     }
 }
 
+class BuildCallbackKernel extends TestKernel
+{
+    public function __construct(string $env, bool $debug, string $dir, private ?\Closure $buildCallback = null)
+    {
+        parent::__construct($env, $debug, $dir);
+    }
+
+    protected function build(ContainerBuilder $container): void
+    {
+        if ($this->buildCallback) {
+            ($this->buildCallback)($container);
+        }
+    }
+}
+
 class PercentProjectDirKernel extends TestKernel
 {
     protected function build(ContainerBuilder $container): void
@@ -655,6 +806,56 @@ class ConfigureContainerKernel extends TestKernel
     private function configureContainer(ContainerConfigurator $container): void
     {
         $container->parameters()->set('configured', true);
+    }
+}
+
+class ContainerReferencingKernel extends TestKernel
+{
+    protected function build(ContainerBuilder $container): void
+    {
+        $container->register('container_referencing', ContainerReferencingService::class)
+            ->setPublic(true)
+            ->addArgument(new Reference('service_container'));
+    }
+}
+
+class ContainerReferencingService
+{
+    public static bool $destructed = false;
+
+    public function __construct(
+        private ContainerInterface $container,
+    ) {
+    }
+
+    public function __destruct()
+    {
+        self::$destructed = true;
+    }
+}
+
+class SelfReferencingKernel extends TestKernel
+{
+    protected function build(ContainerBuilder $container): void
+    {
+        $container->register('self_referencing', SelfReferencingService::class)->setPublic(true);
+    }
+}
+
+class SelfReferencingService
+{
+    public static bool $destructed = false;
+
+    public self $self;
+
+    public function __construct()
+    {
+        $this->self = $this;
+    }
+
+    public function __destruct()
+    {
+        self::$destructed = true;
     }
 }
 
@@ -818,4 +1019,12 @@ class RequiredBundleKernel extends TestKernel
     {
         return $this->bundlesDefinition;
     }
+}
+
+interface ResettableKernelContainer extends ContainerInterface, ResetInterface
+{
+}
+
+interface ShutdownAwareKernelContainer extends ContainerInterface, ShutdownInterface
+{
 }

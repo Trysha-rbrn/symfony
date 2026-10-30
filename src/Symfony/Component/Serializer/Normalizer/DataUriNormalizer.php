@@ -96,6 +96,12 @@ final class DataUriNormalizer implements NormalizerInterface, DenormalizerInterf
                         throw new InvalidArgumentException(\sprintf('Cannot denormalize to a "%s" without the HttpFoundation component installed. Try running "composer require symfony/http-foundation".', File::class));
                     }
 
+                    // \SplFileInfo trims trailing slashes, but they are part of the data
+                    if (str_ends_with($data, '/') && false !== $content = @file_get_contents($data)) {
+                        $mediaType = preg_replace('/;base64$/i', '', substr($data, 0, strpos($data, ',')));
+                        $data = $mediaType.','.rawurlencode($content);
+                    }
+
                     return new File($data, false);
 
                 case 'SplFileObject':
@@ -119,11 +125,19 @@ final class DataUriNormalizer implements NormalizerInterface, DenormalizerInterf
      */
     private function getMimeType(\SplFileInfo $object): string
     {
-        if ($object instanceof File) {
-            return $object->getMimeType();
-        }
+        try {
+            if ($object instanceof File) {
+                return $object->getMimeType();
+            }
 
-        return $this->mimeTypeGuesser?->guessMimeType($object->getPathname()) ?: 'application/octet-stream';
+            return $this->mimeTypeGuesser?->guessMimeType($object->getPathname()) ?: 'application/octet-stream';
+        } catch (\LogicException $e) {
+            if (!preg_match('{^data:(?://)?([^,]*?)(?:;base64)?,}', $object->getPathname(), $m)) {
+                throw $e;
+            }
+
+            return $m[1] ?: 'text/plain';
+        }
     }
 
     /**

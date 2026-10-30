@@ -11,9 +11,11 @@
 
 namespace Symfony\Component\Messenger\Tests\DependencyInjection;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\IgnoreDeprecations;
 use PHPUnit\Framework\TestCase;
+use Symfony\Bridge\Doctrine\SchemaListener\MessengerInboxDoctrineSchemaListener;
 use Symfony\Bridge\PhpUnit\ExpectUserDeprecationMessageTrait;
 use Symfony\Component\Config\FileLocator;
 use Symfony\Component\DependencyInjection\Argument\ServiceClosureArgument;
@@ -25,6 +27,7 @@ use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\ContainerInterface;
 use Symfony\Component\DependencyInjection\Loader\ClosureLoader;
 use Symfony\Component\DependencyInjection\Loader\PhpFileLoader;
+use Symfony\Component\DependencyInjection\Parameter;
 use Symfony\Component\DependencyInjection\ParameterBag\EnvPlaceholderParameterBag;
 use Symfony\Component\DependencyInjection\Reference;
 use Symfony\Component\Messenger\Attribute\AsMessage;
@@ -33,20 +36,38 @@ use Symfony\Component\Messenger\Bridge\AmazonSqs\Transport\AmazonSqsTransportFac
 use Symfony\Component\Messenger\Bridge\AmpSql\Transport\AmpSqlTransportFactory;
 use Symfony\Component\Messenger\Bridge\Amqp\Transport\AmqpTransportFactory;
 use Symfony\Component\Messenger\Bridge\Beanstalkd\Transport\BeanstalkdTransportFactory;
+use Symfony\Component\Messenger\Bridge\Doctrine\Inbox\DoctrineInbox;
 use Symfony\Component\Messenger\Bridge\MongoDb\Transport\MongoDbTransportFactory;
 use Symfony\Component\Messenger\Bridge\Redis\Transport\RedisTransportFactory;
 use Symfony\Component\Messenger\DependencyInjection\MessengerPass;
+use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Failure\FailedMessageRepository;
+use Symfony\Component\Messenger\Message\RedispatchMessage;
 use Symfony\Component\Messenger\MessageBusInterface;
 use Symfony\Component\Messenger\MessengerBundle;
+use Symfony\Component\Messenger\Middleware\FlowContextMiddleware;
+use Symfony\Component\Messenger\Middleware\InboxMiddleware;
+use Symfony\Component\Messenger\Middleware\StackMiddleware;
+use Symfony\Component\Messenger\Stamp\MessageIdStamp;
 use Symfony\Component\Messenger\Tests\Fixtures\DummyMessage;
 use Symfony\Component\Messenger\Transport\Sender\OutboxSender;
 use Symfony\Component\Messenger\Transport\Serialization\ClaimCheckSerializer;
+use Symfony\Component\Messenger\Transport\Serialization\IdentityStampHeaderMapper;
+use Symfony\Component\Messenger\Transport\Serialization\InteropSerializer;
+use Symfony\Component\Messenger\Transport\Serialization\SigningSerializer;
+use Symfony\Component\Messenger\Transport\Serialization\StampHeaderMapperInterface;
 use Symfony\Component\Messenger\Transport\TransportFactory;
+use Symfony\Component\Uid\Uuid;
+use Symfony\Component\Uid\UuidV7;
 
 class MessengerBundleExtensionTest extends TestCase
 {
     use ExpectUserDeprecationMessageTrait;
+
+    private const DEDUPLICATION_SERVICES = [
+        'messenger.middleware.deduplicate_middleware',
+        'messenger.failure.release_deduplication_lock_on_failure_listener',
+    ];
 
     public function testMessengerServicesRemovedWhenDisabled()
     {
@@ -67,6 +88,7 @@ class MessengerBundleExtensionTest extends TestCase
         $this->assertFalse($container->hasDefinition('console.command.messenger_failed_messages_show'));
         $this->assertFalse($container->hasDefinition('console.command.messenger_failed_messages_remove'));
         $this->assertFalse($container->hasDefinition('serializer.normalizer.flatten_exception'));
+        $this->assertFalse($container->hasDefinition('serializer.normalizer.message_stamp'));
     }
 
     public function testMessenger()
@@ -121,6 +143,8 @@ class MessengerBundleExtensionTest extends TestCase
         $syncFactoryArguments = $container->getDefinition('messenger.transport.sync.factory')->getArguments();
         $this->assertEquals(new Reference('messenger.retry_strategy_locator'), $syncFactoryArguments[1]);
         $this->assertSame([], $container->getDefinition((string) $syncFactoryArguments[2])->getArgument(0));
+
+        $this->assertEquals(new Reference('clock'), $container->getDefinition('messenger.transport.mongodb.factory')->getArgument(0));
     }
 
     public function testMessengerAsMessageAttributeIsForwardedToTheTag()
@@ -151,7 +175,48 @@ class MessengerBundleExtensionTest extends TestCase
         $definition = new ChildDefinition('');
         $configurators[0]($definition, new AsMessageHandler(transport: 'async'), new \ReflectionClass(DummyMessage::class));
 
-        $this->assertSame([['bus' => null, 'handles' => null, 'method' => null, 'priority' => 0, 'sign' => false, 'transport' => 'async', 'from_transport' => null]], $definition->getTag('messenger.message_handler'));
+        $this->assertSame([['bus' => null, 'handles' => null, 'method' => null, 'priority' => null, 'sign' => false, 'transport' => 'async', 'before' => null, 'after' => null, 'from_transport' => null]], $definition->getTag('messenger.message_handler'));
+    }
+
+    public function testMessengerAsMessageHandlerBeforeAndAfterAreForwardedToTheTag()
+    {
+        $container = $this->createContainerFromFile('messenger', false);
+        $container->compile();
+
+        $definition = new ChildDefinition('');
+        $container->getAttributeAutoconfigurators()[AsMessageHandler::class][0]($definition, new AsMessageHandler(before: 'a', after: ['b', 'c::handle']), new \ReflectionClass(DummyMessage::class));
+
+        $this->assertSame('a', $definition->getTag('messenger.message_handler')[0]['before']);
+        $this->assertSame(['b', 'c::handle'], $definition->getTag('messenger.message_handler')[0]['after']);
+    }
+
+    public function testMessengerChainMiddleware()
+    {
+        $container = $this->createContainerFromFile('messenger', false);
+        $container->addCompilerPass(new MessengerPass());
+        $container->compile();
+
+        $this->assertSame('messenger.routable_message_bus', (string) $container->getDefinition('messenger.middleware.chain')->getArgument(0));
+        $this->assertSame('messenger.senders_locator', (string) $container->getDefinition('messenger.middleware.chain')->getArgument(1));
+        $this->assertContains('messenger.middleware.chain', $this->getBusMiddlewareIds($container, 'messenger.bus.default'));
+        $this->assertTrue($container->getDefinition('serializer.normalizer.message_stamp')->hasTag('serializer.normalizer'));
+    }
+
+    public function testMessengerDispatchOnFailure()
+    {
+        $container = $this->createContainerFromFile('messenger', false);
+        $container->addCompilerPass(new MessengerPass());
+        $container->compile();
+
+        $middleware = $container->getDefinition('messenger.middleware.dispatch_on_failure');
+        $this->assertSame('messenger.routable_message_bus', (string) $middleware->getArgument(0));
+        $this->assertEquals(new Reference('logger', ContainerInterface::IGNORE_ON_INVALID_REFERENCE), $middleware->getArgument(1));
+        $this->assertContains('messenger.middleware.dispatch_on_failure', $this->getBusMiddlewareIds($container, 'messenger.bus.default'));
+
+        $listener = $container->getDefinition('messenger.failure.dispatch_on_failure_listener');
+        $this->assertEquals(new Reference('messenger.routable_message_bus'), $listener->getArgument(0));
+        $this->assertEquals(new Reference('logger', ContainerInterface::IGNORE_ON_INVALID_REFERENCE), $listener->getArgument(1));
+        $this->assertTrue($listener->hasTag('kernel.event_subscriber'));
     }
 
     public function testMessengerRejectRedeliveredMessagesEnabledByDefault()
@@ -185,6 +250,85 @@ class MessengerBundleExtensionTest extends TestCase
 
         $this->assertNotContains('messenger.middleware.reject_redelivered_message_middleware', $this->getBusMiddlewareIds($container, 'messenger.bus.default'));
         $this->assertContains('messenger.middleware.reject_redelivered_message_middleware', $this->getBusMiddlewareIds($container, 'messenger.bus.commands'));
+    }
+
+    public function testMessengerIdentityStampsAreDisabledByDefault()
+    {
+        $container = $this->createContainerFromFile('messenger', false);
+        $container->compile();
+
+        $this->assertFalse($container->getDefinition('messenger.middleware.flow_context')->getArgument(0));
+        $this->assertFalse($container->hasDefinition('messenger.message_id_generator'));
+    }
+
+    public function testMessengerIdentityStampsAreEnabledOnTheFlowContextMiddleware()
+    {
+        $container = $this->createContainerFromFile('messenger_identity_stamps', false);
+        $container->compile();
+
+        $this->assertTrue($container->getDefinition('messenger.middleware.flow_context')->getArgument(0));
+    }
+
+    public function testMessengerFlowContextMiddlewareRunsBetweenDecodingFailedMessagesAndDispatchAfterCurrentBus()
+    {
+        $container = $this->createContainerFromFile('messenger', false);
+        $container->compile();
+
+        $middleware = array_values($container->getParameter('messenger.bus.default.middleware'));
+        $position = array_search(['id' => 'flow_context'], $middleware, true);
+
+        $this->assertNotFalse($position, 'The flow_context middleware is listed.');
+        $this->assertSame(['id' => 'decode_failed_message_middleware'], $middleware[$position - 1]);
+        $this->assertGreaterThan($position, array_search(['id' => 'dispatch_after_current_bus'], $middleware, true));
+        $this->assertSame(FlowContextMiddleware::class, $container->getDefinition('messenger.middleware.flow_context')->getClass());
+    }
+
+    public function testMessengerDispatchOnFailureMiddlewareRunsBetweenFlowContextAndDispatchAfterCurrentBus()
+    {
+        $container = $this->createContainerFromFile('messenger', false);
+        $container->compile();
+
+        $middleware = array_values($container->getParameter('messenger.bus.default.middleware'));
+        $position = array_search(['id' => 'dispatch_on_failure'], $middleware, true);
+
+        $this->assertNotFalse($position, 'The dispatch_on_failure middleware is listed.');
+        $this->assertSame(['id' => 'flow_context'], $middleware[$position - 1]);
+        $this->assertSame(['id' => 'dispatch_after_current_bus'], $middleware[$position + 1]);
+    }
+
+    public function testMessengerIdentityStampsUseUuidV7WhenTheUidComponentIsInstalled()
+    {
+        if (!class_exists(Uuid::class)) {
+            $this->markTestSkipped('The Uid component is not installed.');
+        }
+
+        $container = $this->createContainerFromFile('messenger_identity_stamps', false);
+        $container->register('foo', \stdClass::class)
+            ->setPublic(true)
+            ->setProperty('middleware', new Reference('messenger.middleware.flow_context'));
+        $container->compile();
+
+        $envelope = $container->get('foo')->middleware->handle(new Envelope(new \stdClass()), new StackMiddleware());
+
+        $this->assertInstanceOf(UuidV7::class, Uuid::fromString($envelope->last(MessageIdStamp::class)->getId()));
+    }
+
+    public function testMessengerFlowContextMiddlewareReferencesTheMessageIdGeneratorOptionally()
+    {
+        $container = $this->createContainerFromFile('messenger_identity_stamps', false);
+        $container->compile();
+
+        $this->assertEquals(new Reference('messenger.message_id_generator', ContainerInterface::NULL_ON_INVALID_REFERENCE), $container->getDefinition('messenger.middleware.flow_context')->getArgument(1));
+    }
+
+    public function testMessengerFlowContextMiddlewareIsSharedByAllBuses()
+    {
+        $container = $this->createContainerFromFile('messenger_reject_redelivered_messages_disabled_explicit_bus', false);
+        $container->addCompilerPass(new MessengerPass());
+        $container->compile();
+
+        $this->assertContains('messenger.middleware.flow_context', $this->getBusMiddlewareIds($container, 'messenger.bus.default'));
+        $this->assertContains('messenger.middleware.flow_context', $this->getBusMiddlewareIds($container, 'messenger.bus.commands'));
     }
 
     public function testMessengerMultipleFailureTransports()
@@ -248,6 +392,15 @@ class MessengerBundleExtensionTest extends TestCase
             ['failure_transport_global', 'failure_transport_1', 'failure_transport_3'],
             array_keys($locator->getArgument(0))
         );
+    }
+
+    public function testFailedMessagesCommandsGetTheClock()
+    {
+        $container = $this->createContainerFromFile('messenger_multiple_failure_transports_global');
+
+        $this->assertEquals(new Reference('clock'), $container->getDefinition('console.command.messenger_failed_messages_retry')->getArgument(7));
+        $this->assertEquals(new Reference('clock'), $container->getDefinition('console.command.messenger_failed_messages_show')->getArgument(3));
+        $this->assertEquals(new Reference('clock'), $container->getDefinition('console.command.messenger_failed_messages_remove')->getArgument(3));
     }
 
     public function testTheFailedMessageRepositoryIsRemovedWithoutAnyFailureTransport()
@@ -324,7 +477,8 @@ class MessengerBundleExtensionTest extends TestCase
             'priority' => 0,
         ]], $container->getDefinition('messenger.transport.default')->getTag('messenger.receiver'));
         $transportArguments = $container->getDefinition('messenger.transport.default')->getArguments();
-        $this->assertEquals(new Reference('messenger.default_serializer'), $transportArguments[2]);
+        $this->assertEquals(new Reference('.messenger.transport.default.signing_serializer'), $transportArguments[2]);
+        $this->assertEquals(new Reference('messenger.default_serializer'), $container->getDefinition('.messenger.transport.default.signing_serializer')->getArgument(0));
 
         $this->assertTrue($container->hasDefinition('messenger.transport.customised'));
         $transportFactory = $container->getDefinition('messenger.transport.customised')->getFactory();
@@ -342,7 +496,8 @@ class MessengerBundleExtensionTest extends TestCase
         $this->assertCount(3, $transportArguments);
         $this->assertSame('amqp://localhost/%2f/messages?exchange_name=exchange_name', $transportArguments[0]);
         $this->assertEquals(['queue' => ['name' => 'Queue'], 'transport_name' => 'customised'], $transportArguments[1]);
-        $this->assertEquals(new Reference('messenger.transport.native_php_serializer'), $transportArguments[2]);
+        $this->assertEquals(new Reference('.messenger.transport.customised.signing_serializer'), $transportArguments[2]);
+        $this->assertEquals(new Reference('messenger.transport.native_php_serializer'), $container->getDefinition('.messenger.transport.customised.signing_serializer')->getArgument(0));
 
         $this->assertTrue($container->hasDefinition('messenger.transport.amqp.factory'));
 
@@ -379,6 +534,12 @@ class MessengerBundleExtensionTest extends TestCase
         $this->assertSame(3, $container->getDefinition('messenger.retry.multiplier_retry_strategy.customised')->getArgument(2));
         $this->assertSame(100, $container->getDefinition('messenger.retry.multiplier_retry_strategy.customised')->getArgument(3));
 
+        $cooldownStrategy = $container->getDefinition('messenger.cooldown.multiplier_cooldown_strategy.customised');
+        $this->assertSame([3, 500, 3, 30000, 0.1], \array_slice($cooldownStrategy->getArguments(), 0, 5));
+        $this->assertEquals(new Reference('logger', ContainerInterface::IGNORE_ON_INVALID_REFERENCE), $cooldownStrategy->getArgument(5));
+        $this->assertSame([['channel' => 'messenger']], $cooldownStrategy->getTag('monolog.logger'));
+        $this->assertEquals(['customised' => new Reference('messenger.cooldown.multiplier_cooldown_strategy.customised')], $container->getDefinition('messenger.cooldown_strategy_locator')->getArgument(0));
+
         $failureTransportsByTransportNameServiceLocator = $container->getDefinition('messenger.failure.send_failed_message_to_failure_transport_listener')->getArgument(0);
         $failureTransports = $container->getDefinition((string) $failureTransportsByTransportNameServiceLocator)->getArgument(0);
         $expectedTransportsByFailureTransports = [
@@ -412,6 +573,90 @@ class MessengerBundleExtensionTest extends TestCase
         $this->assertEquals($expectedRateLimitersByRateLimitedTransports, $rateLimitedTransports);
     }
 
+    public function testEachTransportGetsItsConfiguredCooldownStrategy()
+    {
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('messenger', [
+                'transports' => [
+                    'api' => [
+                        'dsn' => 'in-memory://',
+                        'cooldown_strategy' => 'app.cooldown_strategy',
+                    ],
+                    'orders' => [
+                        'dsn' => 'in-memory://',
+                        'outbox' => 'in-memory://',
+                        'cooldown_strategy' => null,
+                    ],
+                ],
+            ]);
+        });
+
+        // like the rate limiter, the cooldown strategy paces the consumption of its own transport, so the outbox does not inherit it
+        $this->assertEquals([
+            'api' => new Reference('app.cooldown_strategy'),
+            'orders' => new Reference('messenger.cooldown.multiplier_cooldown_strategy.orders'),
+        ], $container->getDefinition('messenger.cooldown_strategy_locator')->getArgument(0));
+        $this->assertSame([5, 1000, 2, 60000, 0.1], \array_slice($container->getDefinition('messenger.cooldown.multiplier_cooldown_strategy.orders')->getArguments(), 0, 5));
+        $this->assertEquals(new Reference('messenger.cooldown_strategy_locator'), $container->getDefinition('console.command.messenger_consume_messages')->getArgument(10));
+    }
+
+    public function testCooldownStrategyCanBeTurnedOffByALaterConfiguration()
+    {
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('messenger', [
+                'transports' => [
+                    'api' => [
+                        'dsn' => 'in-memory://',
+                        'cooldown_strategy' => ['failure_threshold' => 3],
+                    ],
+                ],
+            ]);
+            $container->loadFromExtension('messenger', [
+                'transports' => [
+                    'api' => ['cooldown_strategy' => false],
+                ],
+            ]);
+        });
+
+        $this->assertSame([], $container->getDefinition('messenger.cooldown_strategy_locator')->getArgument(0));
+        $this->assertFalse($container->hasDefinition('messenger.cooldown.multiplier_cooldown_strategy.api'));
+    }
+
+    public function testMessengerTransportCooldownStrategyServiceCannotBeUsedWithOtherOptions()
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('The "service" cannot be used along with the other "cooldown_strategy" options.');
+
+        $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('messenger', [
+                'transports' => [
+                    'api' => [
+                        'dsn' => 'in-memory://',
+                        'cooldown_strategy' => ['service' => 'app.cooldown_strategy', 'failure_threshold' => 3],
+                    ],
+                ],
+            ]);
+        });
+    }
+
+    public function testMessengerTransportsThatCanBeInMemoryKeepTheirStateUntilTheEndOfATest()
+    {
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('messenger', [
+                'transports' => [
+                    'memory' => 'in-memory://',
+                    'env' => '%env(MESSENGER_TRANSPORT_DSN)%',
+                    'amqp' => 'amqp://localhost/%2f/messages',
+                    'sync' => 'sync://',
+                ],
+            ]);
+        });
+
+        foreach (['memory' => true, 'env' => true, 'amqp' => false, 'sync' => false] as $name => $kept) {
+            $this->assertSame($kept ? [['keep' => true]] : [], $container->getDefinition('messenger.transport.'.$name)->getTag('kernel.test_state'), $name);
+        }
+    }
+
     public function testMessengerClaimCheckSerializer()
     {
         $container = $this->createContainerFromFile('messenger_claim_check');
@@ -421,17 +666,167 @@ class MessengerBundleExtensionTest extends TestCase
 
         $serializer = $container->getDefinition('.messenger.transport.async.claim_check_serializer');
         $this->assertSame(ClaimCheckSerializer::class, $serializer->getClass());
-        $this->assertSame('messenger.default_serializer', (string) $serializer->getArgument(0));
+        $this->assertSame('.messenger.transport.async.signing_serializer', (string) $serializer->getArgument(0));
         $this->assertSame('app.claim_check_pool', (string) $serializer->getArgument(1));
         $this->assertSame(200000, $serializer->getArgument(2));
 
+        $this->assertSame('messenger.default_serializer', (string) $container->getDefinition('.messenger.transport.async.signing_serializer')->getArgument(0));
+
         $serializers = $container->getDefinition('messenger.transport.serializer_locator')->getArgument(0);
         $this->assertSame('.messenger.transport.async.claim_check_serializer', (string) $serializers['async']);
+    }
 
-        // signing must decorate the inner serializer, never the claim check wrapper
-        $eligible = $container->getDefinition('messenger.signing_serializer')->getArgument(2)['*'];
-        $this->assertContains('messenger.default_serializer', $eligible);
-        $this->assertNotContains('.messenger.transport.async.claim_check_serializer', $eligible);
+    public function testMessengerTransportsThatSignEveryMessage()
+    {
+        $container = $this->createContainerFromFile('messenger_sign');
+
+        foreach (['async' => ['messenger.default_serializer', true, false], 'failed' => ['messenger.transport.symfony_serializer', true, true], 'plain' => ['messenger.default_serializer', false, null]] as $name => [$innerId, $signAll, $acceptUnverified]) {
+            $serializer = $container->getDefinition('.messenger.transport.'.$name.'.signing_serializer');
+            $this->assertSame(SigningSerializer::class, $serializer->getClass());
+            $this->assertSame($innerId, (string) $serializer->getArgument(0));
+            $this->assertSame($signAll ? null : [SigningSerializer::class, 'forMessageTypes'], $serializer->getFactory());
+            $this->assertSame($acceptUnverified, $signAll ? $serializer->getArgument(3) : null);
+        }
+
+        $tags = $container->findTaggedServiceIds('messenger.receiver');
+        $this->assertTrue($tags['messenger.transport.async'][0]['sign'] ?? false);
+        $this->assertTrue($tags['messenger.transport.failed'][0]['sign'] ?? false);
+        $this->assertArrayNotHasKey('sign', $tags['messenger.transport.plain'][0]);
+
+        $serializers = $container->getDefinition('messenger.transport.serializer_locator')->getArgument(0);
+        $this->assertSame('.messenger.transport.async.claim_check_serializer', (string) $serializers['async']);
+        $this->assertSame('.messenger.transport.async.signing_serializer', (string) $container->getDefinition('.messenger.transport.async.claim_check_serializer')->getArgument(0));
+        $this->assertSame('.messenger.transport.failed.signing_serializer', (string) $serializers['failed']);
+        $this->assertSame('.messenger.transport.failed.signing_serializer', (string) $container->getDefinition('messenger.transport.failed')->getArgument(2));
+        $this->assertSame('.messenger.transport.plain.signing_serializer', (string) $serializers['plain']);
+        $this->assertSame('.messenger.transport.plain.signing_serializer', (string) $container->getDefinition('messenger.transport.plain')->getArgument(2));
+    }
+
+    #[DataProvider('provideFailureTransportsThatSignEveryMessage')]
+    public function testMessengerFailureTransportThatSignsEveryMessageAcceptsTheUnverifiedMessagesOfTheTransportsItServes(array $config)
+    {
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) use ($config) {
+            $container->loadFromExtension('messenger', $config);
+        });
+
+        $failed = $container->getDefinition('.messenger.transport.failed.signing_serializer');
+        $this->assertNull($failed->getFactory());
+        $this->assertTrue($failed->getArgument(3));
+    }
+
+    public static function provideFailureTransportsThatSignEveryMessage(): iterable
+    {
+        yield 'global' => [[
+            'failure_transport' => 'failed',
+            'transports' => [
+                'async' => ['dsn' => 'in-memory:///', 'sign' => true],
+                'plain' => 'in-memory:///',
+                'failed' => ['dsn' => 'in-memory:///', 'sign' => true],
+            ],
+        ]];
+
+        yield 'per transport' => [[
+            'transports' => [
+                'plain' => ['dsn' => 'in-memory:///', 'failure_transport' => 'failed'],
+                'failed' => ['dsn' => 'in-memory:///', 'sign' => true],
+            ],
+        ]];
+    }
+
+    public function testMessengerTransportsThatSignEveryMessageAcceptUnverifiedMessagesWhenUsedAsFailureTransports()
+    {
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('messenger', [
+                'failure_transport' => 'failed',
+                'transports' => [
+                    'async' => ['dsn' => 'in-memory:///', 'sign' => true, 'failure_transport' => 'failed_async'],
+                    'plain' => ['dsn' => 'in-memory:///', 'sign' => true],
+                    'failed' => ['dsn' => 'in-memory:///', 'sign' => true],
+                    'failed_async' => ['dsn' => 'in-memory:///', 'sign' => true],
+                ],
+            ]);
+        });
+
+        foreach (['async' => false, 'plain' => false, 'failed' => true, 'failed_async' => true] as $name => $acceptUnverified) {
+            $this->assertSame($acceptUnverified, $container->getDefinition('.messenger.transport.'.$name.'.signing_serializer')->getArgument(3));
+        }
+    }
+
+    #[DataProvider('provideTransportsThatSignEveryMessageWithAFailureTransportThatDoesNot')]
+    public function testMessengerTransportThatSignsEveryMessageNeedsAFailureTransportThatDoesToo(array $config)
+    {
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage('Invalid Messenger configuration: the "async" transport signs every message, so its failure transport "failed" must sign every message too.');
+
+        $this->createContainerFromClosure(static function (ContainerBuilder $container) use ($config) {
+            $container->loadFromExtension('messenger', $config);
+        });
+    }
+
+    public static function provideTransportsThatSignEveryMessageWithAFailureTransportThatDoesNot(): iterable
+    {
+        yield 'global' => [[
+            'failure_transport' => 'failed',
+            'transports' => [
+                'async' => ['dsn' => 'in-memory:///', 'sign' => true],
+                'failed' => 'in-memory:///',
+            ],
+        ]];
+
+        yield 'per transport' => [[
+            'transports' => [
+                'async' => ['dsn' => 'in-memory:///', 'sign' => true, 'failure_transport' => 'failed'],
+                'failed' => 'in-memory:///',
+            ],
+        ]];
+    }
+
+    public function testMessengerTransportThatSignsEveryMessageCanHaveAFailureTransportOfItsOwn()
+    {
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('messenger', [
+                'failure_transport' => 'failed',
+                'transports' => [
+                    'async' => ['dsn' => 'in-memory:///', 'sign' => true, 'failure_transport' => 'failed_signed'],
+                    'plain' => 'in-memory:///',
+                    'failed' => 'in-memory:///',
+                    'failed_signed' => ['dsn' => 'in-memory:///', 'sign' => true, 'failure_transport' => 'failed_signed'],
+                ],
+            ]);
+        });
+
+        $failedSigned = $container->getDefinition('.messenger.transport.failed_signed.signing_serializer');
+        $this->assertNull($failedSigned->getFactory());
+        $this->assertTrue($failedSigned->getArgument(3));
+    }
+
+    public function testMessengerOutboxOfATransportThatSignsEveryMessageMustSignToo()
+    {
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage('Invalid Messenger configuration: the "orders" transport signs every message, so its outbox "outbox" must sign every message too.');
+
+        $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('messenger', [
+                'transports' => [
+                    'orders' => ['dsn' => 'in-memory:///', 'sign' => true, 'outbox' => 'outbox'],
+                    'outbox' => 'in-memory:///',
+                ],
+            ]);
+        });
+    }
+
+    public function testMessengerOutboxThatSignsEveryMessageCanServeATransportThatDoesNot()
+    {
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('messenger', [
+                'transports' => [
+                    'orders' => ['dsn' => 'in-memory:///', 'outbox' => 'outbox'],
+                    'outbox' => ['dsn' => 'in-memory:///', 'sign' => true],
+                ],
+            ]);
+        });
+
+        $this->assertTrue($container->hasDefinition('.messenger.transport.orders.outbox_sender'));
     }
 
     public function testMessengerOutbox()
@@ -440,7 +835,7 @@ class MessengerBundleExtensionTest extends TestCase
 
         $outboxSender = $container->getDefinition('.messenger.transport.orders.outbox_sender');
         $this->assertSame(OutboxSender::class, $outboxSender->getClass());
-        $this->assertEquals([new Reference('messenger.transport.orders'), new Reference('messenger.transport.outbox'), 'orders'], $outboxSender->getArguments());
+        $this->assertEquals([new Reference('messenger.transport.orders'), new Reference('messenger.transport.outbox'), 'orders', 'outbox', 'failed'], $outboxSender->getArguments());
 
         $sendersLocatorId = (string) $container->getDefinition('messenger.senders_locator')->getArgument(1);
         $senders = $container->getDefinition($sendersLocatorId)->getArgument(0);
@@ -456,10 +851,162 @@ class MessengerBundleExtensionTest extends TestCase
         $this->assertEquals([['alias' => 'orders', 'is_failure_transport' => false, 'priority' => 0]], $transport->getTag('messenger.receiver'));
     }
 
-    public function testMessengerOutboxMustBeAConfiguredTransport()
+    public function testMessengerInbox()
+    {
+        $container = $this->createContainerFromFile('messenger_inbox');
+
+        $ordersInbox = $container->getDefinition('.messenger.transport.orders.inbox');
+        $this->assertSame(DoctrineInbox::class, $ordersInbox->getClass());
+        $this->assertEquals([new Reference('database_connection'), 'messenger_inbox', 604800], $ordersInbox->getArguments());
+
+        $invoicesInbox = $container->getDefinition('.messenger.transport.invoices.inbox');
+        $this->assertEquals([new Reference('doctrine.dbal.billing_connection'), 'billing_inbox', 86400], $invoicesInbox->getArguments());
+
+        $inboxMiddleware = $container->getDefinition('messenger.middleware.inbox');
+        $this->assertSame(InboxMiddleware::class, $inboxMiddleware->getClass());
+        $inboxes = $container->getDefinition((string) $inboxMiddleware->getArgument(0))->getArgument(0);
+        $this->assertEquals(['orders', 'invoices'], array_keys($inboxes));
+        $this->assertEquals(new Reference('.messenger.transport.orders.inbox'), $inboxes['orders']->getValues()[0]);
+        $this->assertSame(['failed', 'failed_invoices'], $inboxMiddleware->getArgument(1));
+
+        $this->assertEquals([new Reference('messenger.senders_locator'), new Reference('messenger.middleware.inbox')], $container->getDefinition('messenger.middleware.dispatch_after_current_bus')->getArguments());
+        $this->assertSame((string) $inboxMiddleware->getArgument(0), (string) $container->getDefinition('console.command.messenger_setup_transports')->getArgument(2));
+
+        $middleware = array_column($container->getParameter('messenger.bus.default.middleware'), 'id');
+        $this->assertSame(['send_message', 'inbox', 'chain', 'handle_message'], \array_slice($middleware, -4));
+    }
+
+    public function testMessengerInboxDoctrineSchemaListener()
+    {
+        if (!class_exists(MessengerInboxDoctrineSchemaListener::class)) {
+            $this->markTestSkipped('This test requires symfony/doctrine-bridge 8.2 or higher.');
+        }
+
+        $container = $this->createContainerFromFile('messenger_inbox');
+
+        $schemaListener = $container->getDefinition('messenger.inbox.doctrine_schema_listener');
+        $this->assertSame(MessengerInboxDoctrineSchemaListener::class, $schemaListener->getClass());
+        $this->assertEquals([new Reference('.messenger.transport.orders.inbox'), new Reference('.messenger.transport.invoices.inbox')], $schemaListener->getArgument(0)->getValues());
+        $this->assertSame([['event' => 'postGenerateSchema']], $schemaListener->getTag('doctrine.event_listener'));
+    }
+
+    public function testMessengerInboxNeedsIdentityStamps()
     {
         $this->expectException(\LogicException::class);
-        $this->expectExceptionMessage('Invalid Messenger configuration: the outbox "missing" of the "orders" transport is not a configured transport.');
+        $this->expectExceptionMessage('Invalid Messenger configuration: the inbox of the "orders" transport records messages by id, enable the "identity_stamps" option.');
+
+        $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('messenger', [
+                'transports' => [
+                    'orders' => ['dsn' => 'in-memory:///', 'inbox' => true],
+                ],
+            ]);
+        });
+    }
+
+    public function testMessengerWithoutInbox()
+    {
+        $container = $this->createContainerFromFile('messenger_outbox');
+
+        $this->assertFalse($container->hasDefinition('messenger.middleware.inbox'));
+        $this->assertFalse($container->hasDefinition('messenger.inbox.doctrine_schema_listener'));
+        $this->assertSame([], $container->getDefinition('messenger.middleware.dispatch_after_current_bus')->getArguments());
+        $this->assertNotContains('inbox', array_column($container->getParameter('messenger.bus.default.middleware'), 'id'));
+    }
+
+    public function testMessengerOutboxDsn()
+    {
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('messenger', [
+                'failure_transport' => 'failed',
+                'transports' => [
+                    'orders' => [
+                        'dsn' => 'amqp://localhost/%2f/orders',
+                        'outbox' => 'doctrine://default?queue_name=outbox',
+                    ],
+                    'failed' => 'doctrine://default?queue_name=failed',
+                ],
+            ]);
+        });
+
+        $outbox = $container->getDefinition('messenger.transport.orders.outbox');
+        $this->assertEquals([new Reference('messenger.transport_factory'), 'createTransport'], $outbox->getFactory());
+        $this->assertSame('doctrine://default?queue_name=outbox', $outbox->getArgument(0));
+        $this->assertSame(['transport_name' => 'orders.outbox'], $outbox->getArgument(1));
+        $this->assertEquals([['alias' => 'orders.outbox', 'is_failure_transport' => false, 'priority' => 0]], $outbox->getTag('messenger.receiver'));
+
+        $this->assertEquals([new Reference('messenger.transport.orders'), new Reference('messenger.transport.orders.outbox'), 'orders', 'orders.outbox', 'failed'], $container->getDefinition('.messenger.transport.orders.outbox_sender')->getArguments());
+
+        $sendersLocatorId = (string) $container->getDefinition('messenger.senders_locator')->getArgument(1);
+        $senders = $container->getDefinition($sendersLocatorId)->getArgument(0);
+        $this->assertEquals(new Reference('.messenger.transport.orders.outbox_sender'), $senders['orders']->getValues()[0]);
+        $this->assertEquals(new Reference('messenger.transport.orders.outbox'), $senders['orders.outbox']->getValues()[0]);
+
+        $this->assertEquals(new Reference('messenger.retry.multiplier_retry_strategy.orders.outbox'), $container->getDefinition('messenger.retry_strategy_locator')->getArgument(0)['orders.outbox']);
+        $this->assertSame(['orders' => 'failed', 'failed' => 'failed', 'orders.outbox' => 'failed'], $container->getDefinition('messenger.failure.send_failed_message_to_failure_transport_listener')->getArgument(2));
+    }
+
+    public function testMessengerOutboxDsnSignsRetriesAndFailsLikeTheTransportItServes()
+    {
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('messenger', [
+                'transports' => [
+                    'orders' => [
+                        'dsn' => 'in-memory://',
+                        'outbox' => 'in-memory://',
+                        'serializer' => 'app.interop_serializer',
+                        'sign' => true,
+                        'failure_transport' => 'orders_failed',
+                        'retry_strategy' => ['max_retries' => 7],
+                    ],
+                    'orders_failed' => ['dsn' => 'in-memory://', 'sign' => true],
+                ],
+            ]);
+        });
+
+        $signingSerializer = $container->getDefinition('.messenger.transport.orders.outbox.signing_serializer');
+        $this->assertEquals(new Reference('messenger.default_serializer'), $signingSerializer->getArgument(0));
+        $this->assertNull($signingSerializer->getFactory());
+        $this->assertSame(7, $container->getDefinition('messenger.retry.multiplier_retry_strategy.orders.outbox')->getArgument(0));
+        $this->assertSame('orders_failed', $container->getDefinition('.messenger.transport.orders.outbox_sender')->getArgument(4));
+        $this->assertSame('orders_failed', $container->getDefinition('messenger.failure.send_failed_message_to_failure_transport_listener')->getArgument(2)['orders.outbox']);
+    }
+
+    public function testMessengerOutboxDsnFromAnEnvVar()
+    {
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('messenger', [
+                'transports' => [
+                    'orders' => ['dsn' => 'in-memory://', 'outbox' => '%env(OUTBOX_DSN)%'],
+                ],
+            ]);
+        });
+
+        $outbox = $container->getDefinition('messenger.transport.orders.outbox');
+        $this->assertSame('%env(OUTBOX_DSN)%', $container->resolveEnvPlaceholders($outbox->getArgument(0), '%%env(%s)%%'));
+        $this->assertSame([['keep' => true]], $outbox->getTag('kernel.test_state'));
+        $this->assertSame('orders.outbox', $container->getDefinition('.messenger.transport.orders.outbox_sender')->getArgument(3));
+    }
+
+    public function testMessengerOutboxDsnCannotCreateAConfiguredTransport()
+    {
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage('Invalid Messenger configuration: the outbox DSN of the "orders" transport cannot create the "orders.outbox" transport, which is configured already.');
+
+        $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('messenger', [
+                'transports' => [
+                    'orders' => ['dsn' => 'in-memory:///', 'outbox' => 'in-memory:///'],
+                    'orders.outbox' => 'in-memory:///',
+                ],
+            ]);
+        });
+    }
+
+    public function testMessengerOutboxMustBeAConfiguredTransportOrADsn()
+    {
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage('Invalid Messenger configuration: the outbox "missing" of the "orders" transport is neither a configured transport nor a DSN.');
 
         $this->createContainerFromClosure(static function (ContainerBuilder $container) {
             $container->loadFromExtension('messenger', [
@@ -551,6 +1098,28 @@ class MessengerBundleExtensionTest extends TestCase
         $this->assertSame(['enable_max_depth' => true], $serializerTransportDefinition->getArgument(2));
     }
 
+    public function testMessengerInteropSerializer()
+    {
+        $container = $this->createContainerFromFile('messenger_transport');
+
+        $definition = $container->getDefinition('messenger.transport.interop_serializer');
+        $this->assertSame(InteropSerializer::class, $definition->getClass());
+        $this->assertEquals(new Reference('messenger.transport.symfony_serializer'), $definition->getArgument(0));
+        $this->assertNull($definition->getArgument(1));
+        $this->assertInstanceOf(TaggedIteratorArgument::class, $mappers = $definition->getArgument(2));
+        $this->assertSame('messenger.stamp_header_mapper', $mappers->getTag());
+
+        $identityMapper = $container->getDefinition('messenger.stamp_header_mapper.identity');
+        $this->assertSame(IdentityStampHeaderMapper::class, $identityMapper->getClass());
+        $this->assertSame([[]], $identityMapper->getTag('messenger.stamp_header_mapper'));
+
+        $this->assertSame(['messenger.stamp_header_mapper' => [[]]], $container->getAutoconfiguredInstanceof()[StampHeaderMapperInterface::class]->getTags());
+
+        $container = $this->createContainerFromFile('messenger_multiple_buses');
+        $this->assertFalse($container->hasDefinition('messenger.transport.interop_serializer'));
+        $this->assertFalse($container->hasDefinition('messenger.stamp_header_mapper.identity'));
+    }
+
     public function testMessengerTransportSerializerConfiguration()
     {
         $container = $this->createContainerFromFile('messenger_transport_serializer');
@@ -559,6 +1128,28 @@ class MessengerBundleExtensionTest extends TestCase
         $this->assertEquals(new Reference('serializer.api'), $serializerTransportDefinition->getArgument(0));
         $this->assertSame('json', $serializerTransportDefinition->getArgument(1));
         $this->assertSame([], $serializerTransportDefinition->getArgument(2));
+    }
+
+    public function testDeduplicationUsesTheDefaultLockFactory()
+    {
+        $container = $this->createContainerFromFile('messenger');
+
+        foreach (self::DEDUPLICATION_SERVICES as $id) {
+            $definition = $container->getDefinition($id);
+            $this->assertEquals(new Reference('lock.factory'), $definition->getArgument(0), $id);
+            $this->assertTrue($definition->hasTag('container.remove_if_missing'), $id);
+        }
+    }
+
+    public function testDeduplicationUsesTheConfiguredLockFactory()
+    {
+        $container = $this->createContainerFromFile('messenger_deduplication_lock_factory');
+
+        foreach (self::DEDUPLICATION_SERVICES as $id) {
+            $definition = $container->getDefinition($id);
+            $this->assertEquals(new Reference('lock.dedup.factory'), $definition->getArgument(0), $id);
+            $this->assertFalse($definition->hasTag('container.remove_if_missing'), $id);
+        }
     }
 
     public function testMessengerWithAddBusNameStampMiddleware()
@@ -577,13 +1168,42 @@ class MessengerBundleExtensionTest extends TestCase
             ['id' => 'add_default_stamps_middleware'],
             ['id' => 'add_bus_name_stamp_middleware', 'arguments' => ['messenger.bus.events']],
             ['id' => 'reject_redelivered_message_middleware'],
-            ['id' => 'dispatch_after_current_bus'],
             ['id' => 'decode_failed_message_middleware'],
+            ['id' => 'flow_context'],
+            ['id' => 'dispatch_on_failure'],
+            ['id' => 'dispatch_after_current_bus'],
             ['id' => 'failed_message_processing_middleware'],
             ['id' => 'deduplicate_middleware'],
             ['id' => 'send_message', 'arguments' => [true]],
+            ['id' => 'chain'],
             ['id' => 'handle_message', 'arguments' => ['index_1' => false]],
         ], $container->getParameter('messenger.bus.events.middleware'));
+    }
+
+    public function testMessengerBusMessages()
+    {
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('messenger', [
+                'default_bus' => 'command.bus',
+                'buses' => [
+                    'command.bus' => ['messages' => DummyMessage::class],
+                    'event.bus' => [],
+                ],
+            ]);
+        });
+
+        $this->assertSame([DummyMessage::class], $container->getDefinition('command.bus')->getArgument('$messageTypes'));
+        $this->assertSame([[]], $container->getDefinition('event.bus')->getArguments());
+    }
+
+    public function testMessengerBusMessagesMustExist()
+    {
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage('Invalid Messenger configuration: the class or interface "App\\Missing" listed in the "messages" of the "command.bus" bus does not exist.');
+
+        $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('messenger', ['buses' => ['command.bus' => ['messages' => 'App\\Missing']]]);
+        });
     }
 
     public function testMessengerWithMultipleBuses()
@@ -596,11 +1216,14 @@ class MessengerBundleExtensionTest extends TestCase
             ['id' => 'add_default_stamps_middleware'],
             ['id' => 'add_bus_name_stamp_middleware', 'arguments' => ['messenger.bus.commands']],
             ['id' => 'reject_redelivered_message_middleware'],
-            ['id' => 'dispatch_after_current_bus'],
             ['id' => 'decode_failed_message_middleware'],
+            ['id' => 'flow_context'],
+            ['id' => 'dispatch_on_failure'],
+            ['id' => 'dispatch_after_current_bus'],
             ['id' => 'failed_message_processing_middleware'],
             ['id' => 'deduplicate_middleware'],
             ['id' => 'send_message', 'arguments' => [true]],
+            ['id' => 'chain'],
             ['id' => 'handle_message', 'arguments' => ['index_1' => false]],
         ], $container->getParameter('messenger.bus.commands.middleware'));
         $this->assertTrue($container->has('messenger.bus.events'));
@@ -609,12 +1232,15 @@ class MessengerBundleExtensionTest extends TestCase
             ['id' => 'add_default_stamps_middleware'],
             ['id' => 'add_bus_name_stamp_middleware', 'arguments' => ['messenger.bus.events']],
             ['id' => 'reject_redelivered_message_middleware'],
-            ['id' => 'dispatch_after_current_bus'],
             ['id' => 'decode_failed_message_middleware'],
+            ['id' => 'flow_context'],
+            ['id' => 'dispatch_on_failure'],
+            ['id' => 'dispatch_after_current_bus'],
             ['id' => 'failed_message_processing_middleware'],
             ['id' => 'deduplicate_middleware'],
             ['id' => 'with_factory', 'arguments' => ['foo', true, ['bar' => 'baz']]],
             ['id' => 'send_message', 'arguments' => [true]],
+            ['id' => 'chain'],
             ['id' => 'handle_message', 'arguments' => ['index_1' => false]],
         ], $container->getParameter('messenger.bus.events.middleware'));
         $this->assertTrue($container->has('messenger.bus.queries'));
@@ -672,10 +1298,8 @@ class MessengerBundleExtensionTest extends TestCase
             ]);
         });
 
-        $this->assertTrue($container->hasDefinition('messenger.signing_serializer'));
-        $mapping = $container->getDefinition('messenger.signing_serializer')->getArgument(2);
-        $this->assertArrayHasKey(DummyMessage::class, $mapping);
-        $this->assertNotEmpty($mapping[DummyMessage::class]);
+        $this->assertSame('.messenger.transport.async.signing_serializer', (string) $container->getDefinition('messenger.transport.async')->getArgument(2));
+        $this->assertSame('messenger.default_serializer', (string) $container->getDefinition('.messenger.transport.async.signing_serializer')->getArgument(0));
 
         $this->assertTrue($container->hasDefinition('message_bus'));
         $this->assertSame('message_bus', (string) $container->getAlias('messenger.default_bus'));
@@ -700,10 +1324,8 @@ class MessengerBundleExtensionTest extends TestCase
             ]);
         });
 
-        $this->assertTrue($container->hasDefinition('messenger.signing_serializer'));
-        $mapping = $container->getDefinition('messenger.signing_serializer')->getArgument(2);
-        $this->assertArrayHasKey(DummyMessage::class, $mapping);
-        $this->assertNotEmpty($mapping[DummyMessage::class]);
+        $this->assertSame('.messenger.transport.async.signing_serializer', (string) $container->getDefinition('messenger.transport.async')->getArgument(2));
+        $this->assertSame('messenger.default_serializer', (string) $container->getDefinition('.messenger.transport.async.signing_serializer')->getArgument(0));
 
         $this->assertTrue($container->hasDefinition('message_bus'));
         $this->assertSame('message_bus', (string) $container->getAlias('messenger.default_bus'));
@@ -726,10 +1348,43 @@ class MessengerBundleExtensionTest extends TestCase
             ]);
         });
 
-        $this->assertTrue($container->hasDefinition('messenger.signing_serializer'));
-        $mapping = $container->getDefinition('messenger.signing_serializer')->getArgument(2);
-        $this->assertArrayHasKey('*', $mapping);
-        $this->assertContains('messenger.default_serializer', $mapping['*']);
+        $this->assertSame('.messenger.transport.async.signing_serializer', (string) $container->getDefinition('messenger.transport.async')->getArgument(2));
+        $this->assertSame('messenger.default_serializer', (string) $container->getDefinition('.messenger.transport.async.signing_serializer')->getArgument(0));
+    }
+
+    public function testMessengerRedispatchMessageRequiresSignature()
+    {
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('messenger', ['transports' => ['async' => ['dsn' => 'in-memory://']]]);
+            $container->addCompilerPass(new MessengerPass());
+        });
+
+        $this->assertTrue($container->hasDefinition('.messenger.signing_serializer.message_types'));
+        $this->assertContains(RedispatchMessage::class, $container->getDefinition('.messenger.signing_serializer.message_types')->getArgument(2));
+    }
+
+    public function testMessengerSigningSecretDefaultsToTheKernelSecret()
+    {
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('messenger', []);
+        });
+
+        $this->assertSame('.messenger.signing_serializer.lazy_signing_key', (string) $container->getDefinition('messenger.signing_serializer')->getArgument(1));
+        $this->assertSame('.messenger.signing_serializer.lazy_signing_key', (string) $container->getDefinition('.messenger.signing_serializer.message_types')->getArgument(1));
+        $this->assertEquals([[new Parameter('kernel.secret')]], $container->getDefinition('.messenger.signing_serializer.signing_key')->getArguments());
+    }
+
+    public function testMessengerSigningSecrets()
+    {
+        $container = $this->createContainerFromClosure(static function (ContainerBuilder $container) {
+            $container->loadFromExtension('messenger', [
+                'serializer' => ['signing_secret' => ['new', 'old']],
+                'transports' => ['async' => ['dsn' => 'in-memory://', 'sign' => true], 'plain' => 'in-memory://'],
+            ]);
+        });
+
+        $this->assertSame(['new', 'old'], $container->getDefinition('.messenger.transport.async.signing_serializer')->getArgument(1));
+        $this->assertSame(['new', 'old'], $container->getDefinition('.messenger.transport.plain.signing_serializer')->getArgument(1));
     }
 
     private function getBusMiddlewareIds(ContainerBuilder $container, string $busId): array

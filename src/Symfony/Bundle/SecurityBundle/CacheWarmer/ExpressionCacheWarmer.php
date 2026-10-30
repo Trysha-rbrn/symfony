@@ -12,9 +12,12 @@
 namespace Symfony\Bundle\SecurityBundle\CacheWarmer;
 
 use Symfony\Component\ExpressionLanguage\Expression;
+use Symfony\Component\ExpressionLanguage\ExpressionLanguage;
 use Symfony\Component\HttpKernel\CacheWarmer\CacheWarmerInterface;
-use Symfony\Component\Security\Core\Authorization\ExpressionLanguage;
 
+/**
+ * @deprecated since Symfony 8.2, the expressions of access_control rules are compiled when warming up the cache
+ */
 final class ExpressionCacheWarmer implements CacheWarmerInterface
 {
     /**
@@ -24,6 +27,7 @@ final class ExpressionCacheWarmer implements CacheWarmerInterface
         private iterable $expressions,
         private ExpressionLanguage $expressionLanguage,
     ) {
+        trigger_deprecation('symfony/security-bundle', '8.2', 'The "%s" class is deprecated, as the expressions of "access_control" rules are compiled when warming up the cache.', self::class);
     }
 
     public function isOptional(): bool
@@ -34,7 +38,7 @@ final class ExpressionCacheWarmer implements CacheWarmerInterface
     public function warmUp(string $cacheDir, ?string $buildDir = null): array
     {
         foreach ($this->expressions as $expression) {
-            $this->expressionLanguage->parse($expression, ['token', 'user', 'object', 'subject', 'role_names', 'request', 'trust_resolver']);
+            $this->expressionLanguage->parse($expression, ['token', 'user', 'object', 'subject', 'role_names', 'auth_checker', 'request', 'trust_resolver']);
         }
 
         return [];

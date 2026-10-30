@@ -30,12 +30,14 @@ final class NativeResponse implements ResponseInterface, StreamableInterface
     use CommonResponseTrait;
     use TransportResponseTrait;
 
+    private const MAX_PENDING_SIZE = 1048576;
+
     private \Closure $resolver;
     private ?\Closure $onProgress;
     private ?int $remaining = null;
 
     private ?Dechunker $dechunker;
-    private float $pauseExpiry = 0.0;
+    private Canary $countCanary;
 
     /**
      * @internal
@@ -67,19 +69,27 @@ final class NativeResponse implements ResponseInterface, StreamableInterface
         $info['max_duration'] = $options['max_duration'];
         $info['max_connect_duration'] = $options['max_connect_duration'];
         ++$multi->responseCount;
+        // Decorators can call __destruct() before PHP does, so the count is decremented when the response is freed
+        $this->countCanary = new Canary(static function () use ($multi) {
+            // Clear the DNS cache when all requests completed
+            if (0 >= --$multi->responseCount) {
+                $multi->responseCount = 0;
+                $multi->dnsCache = [];
+            }
+        });
 
         $this->initializer = static fn (self $response) => null === $response->remaining;
 
         $pauseExpiry = &$this->pauseExpiry;
         $info['pause_handler'] = static function (float $duration) use (&$pauseExpiry) {
-            $pauseExpiry = 0 < $duration ? hrtime(true) / 1E9 + $duration : 0;
+            $pauseExpiry = 0 < $duration ? hrtime(true) / 1E9 + $duration : min($pauseExpiry, hrtime(true) / 1E9);
         };
 
         $this->canary = new Canary(static function () use ($multi, $id) {
             if (null !== ($host = $multi->openHandles[$id][6] ?? null) && isset($multi->hosts[$host]) && 0 >= --$multi->hosts[$host]) {
                 unset($multi->hosts[$host]);
             }
-            unset($multi->openHandles[$id], $multi->handlesActivity[$id]);
+            unset($multi->openHandles[$id], $multi->handlesActivity[$id], $multi->streamingResponses[$id]);
         });
     }
 
@@ -100,15 +110,7 @@ final class NativeResponse implements ResponseInterface, StreamableInterface
 
     public function __destruct()
     {
-        try {
-            $this->doDestruct();
-        } finally {
-            // Clear the DNS cache when all requests completed
-            if (0 >= --$this->multi->responseCount) {
-                $this->multi->responseCount = 0;
-                $this->multi->dnsCache = [];
-            }
-        }
+        $this->doDestruct();
     }
 
     private function open(): void
@@ -127,6 +129,10 @@ final class NativeResponse implements ResponseInterface, StreamableInterface
             $this->info['start_time'] = microtime(true);
 
             [$resolver, $url] = ($this->resolver)($this->multi);
+
+            if ($this->maxDurationExpiry) {
+                stream_context_set_option($this->context, 'http', 'timeout', max(0.001, min(stream_context_get_options($this->context)['http']['timeout'], $this->maxDurationExpiry - hrtime(true) / 1E9)));
+            }
 
             while (true) {
                 $context = stream_context_get_options($this->context);
@@ -195,7 +201,7 @@ final class NativeResponse implements ResponseInterface, StreamableInterface
 
         $host = parse_url($this->info['redirect_url'] ?? $this->url, \PHP_URL_HOST);
         $this->multi->lastTimeout = null;
-        $this->multi->openHandles[$this->id] = [&$this->pauseExpiry, $h, -1 === $this->remaining ? $this->dechunker : null, $this->onProgress, &$this->remaining, &$this->info, $host];
+        $this->multi->openHandles[$this->id] = [&$this->pauseExpiry, $h, -1 === $this->remaining ? $this->dechunker : null, $this->onProgress, &$this->remaining, &$this->info, $host, &$this->pendingSize];
         $this->multi->hosts[$host] = 1 + ($this->multi->hosts[$host] ?? 0);
     }
 
@@ -203,6 +209,7 @@ final class NativeResponse implements ResponseInterface, StreamableInterface
     {
         $this->canary->cancel();
         $this->handle = $this->dechunker = $this->inflate = $this->onProgress = null;
+        $this->pendingSize = 0;
     }
 
     private static function schedule(self $response, array &$runningResponses): void
@@ -225,23 +232,28 @@ final class NativeResponse implements ResponseInterface, StreamableInterface
      */
     private static function perform(ClientState $multi, ?array $responses = null): void
     {
-        foreach ($multi->openHandles as $i => [$pauseExpiry, $h, $dechunker, $onProgress]) {
-            if ($pauseExpiry) {
-                if (hrtime(true) / 1E9 < $pauseExpiry) {
-                    continue;
-                }
+        if (null !== $responses && (\count($responses) !== \count($multi->streamingResponses) || (1 === \count($responses) ? !isset($multi->streamingResponses[array_key_first($responses)]) : array_diff_key($responses, $multi->streamingResponses)))) {
+            $multi->streamingResponses = array_fill_keys(array_keys($responses), true);
+        }
 
-                $multi->openHandles[$i][0] = 0;
+        foreach ($multi->openHandles as $i => [$pauseExpiry, $h, $dechunker, $onProgress]) {
+            if (null === $h) {
+                continue;
+            }
+
+            if ($pauseExpiry && hrtime(true) / 1E9 < $pauseExpiry) {
+                continue;
             }
 
             $hasActivity = false;
             $remaining = &$multi->openHandles[$i][4];
             $info = &$multi->openHandles[$i][5];
+            $pendingSize = &$multi->openHandles[$i][7];
             $e = null;
 
             // Read incoming buffer and dechunk it when needed
             try {
-                if ($remaining && '' !== $data = (string) fread($h, 0 > $remaining ? 16372 : $remaining)) {
+                if ($remaining && ($pendingSize < self::MAX_PENDING_SIZE || !isset($multi->streamingResponses[$i])) && '' !== $data = (string) fread($h, 0 > $remaining ? 16372 : min(16372, $remaining))) {
                     $hasActivity = true;
                     $multi->sleep = false;
 
@@ -253,6 +265,7 @@ final class NativeResponse implements ResponseInterface, StreamableInterface
 
                     if ('' !== $data) {
                         $multi->handlesActivity[$i][] = $data;
+                        $pendingSize += \strlen($data);
                     }
                 }
             } catch (\Throwable $e) {
@@ -322,7 +335,7 @@ final class NativeResponse implements ResponseInterface, StreamableInterface
                 $maxHosts = 0;
             } else {
                 // Create empty open handles to tell we still have pending requests
-                $multi->openHandles[$i] = [\INF, null, null, null];
+                $multi->openHandles[$i] = [&$response->pauseExpiry, null, null, null];
             }
         }
     }
@@ -339,17 +352,12 @@ final class NativeResponse implements ResponseInterface, StreamableInterface
         $_ = $handles = [];
         $now = null;
 
-        foreach ($multi->openHandles as [$pauseExpiry, $h]) {
-            if (null === $h) {
-                continue;
-            }
-
+        foreach ($multi->openHandles as $i => [$pauseExpiry, $h]) {
             if ($pauseExpiry && ($now ??= hrtime(true) / 1E9) < $pauseExpiry) {
                 $timeout = min($timeout, $pauseExpiry - $now);
-                continue;
+            } elseif (null !== $h && ($multi->openHandles[$i][7] < self::MAX_PENDING_SIZE || !isset($multi->streamingResponses[$i]))) {
+                $handles[] = $h;
             }
-
-            $handles[] = $h;
         }
 
         if (!$handles) {

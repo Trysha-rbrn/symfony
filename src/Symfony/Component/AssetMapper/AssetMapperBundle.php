@@ -19,6 +19,7 @@ use Symfony\Component\Config\Resource\FileResource;
 use Symfony\Component\Console\Application;
 use Symfony\Component\Console\ConsoleBundle;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
+use Symfony\Component\DependencyInjection\ContainerInterface;
 use Symfony\Component\DependencyInjection\Kernel\AbstractBundle;
 use Symfony\Component\DependencyInjection\Kernel\RequiredBundle;
 use Symfony\Component\DependencyInjection\Kernel\ServicesBundle;
@@ -105,9 +106,9 @@ class AssetMapperBundle extends AbstractBundle
                     ->cannotBeEmpty()
                 ->end()
                 ->enumNode('missing_import_mode')
-                    ->values(['strict', 'warn', 'ignore'])
-                    ->info('Behavior if an asset cannot be found when imported from JavaScript or CSS files - e.g. "import \'./non-existent.js\'". "strict" means an exception is thrown, "warn" means a warning is logged, "ignore" means the import is left as-is.')
-                    ->defaultValue('warn')
+                    ->values(['strict', 'warn', 'ignore', null])
+                    ->info('Behavior if an asset cannot be found when imported from JavaScript or CSS files - e.g. "import \'./non-existent.js\'". "strict" means an exception is thrown, "warn" means a warning is logged, "ignore" means the import is left as-is. Defaults to "strict" in debug mode and to "warn" otherwise.')
+                    ->defaultNull()
                 ->end()
                 ->arrayNode('extensions', 'extension')
                     ->info('Key-value pair of file extensions set to their mime type.')
@@ -240,11 +241,13 @@ class AssetMapperBundle extends AbstractBundle
                 ->setArgument(2, $config['extensions']);
         }
 
+        $missingImportMode = $config['missing_import_mode'] ?? ($container->getParameter('kernel.debug') ? 'strict' : 'warn');
+
         $container->getDefinition('asset_mapper.compiler.css_asset_url_compiler')
-            ->setArgument(0, $config['missing_import_mode']);
+            ->setArgument(0, $missingImportMode);
 
         $container->getDefinition('asset_mapper.compiler.javascript_import_path_compiler')
-            ->setArgument(1, $config['missing_import_mode']);
+            ->setArgument(1, $missingImportMode);
 
         $container
             ->getDefinition('asset_mapper.importmap.remote_package_storage')
@@ -259,6 +262,8 @@ class AssetMapperBundle extends AbstractBundle
             ->getDefinition('asset_mapper.importmap.generator')
             ->replaceArgument(3, $config['importmap_integrity_algorithms'])
             ->setArgument(4, $config['importmap_entries'])
+            // without debug and without the dev server, the import map is expected to be compiled
+            ->setArgument(5, $server || $container->getParameter('kernel.debug') ? null : new Reference('logger', ContainerInterface::NULL_ON_INVALID_REFERENCE))
         ;
 
         $container

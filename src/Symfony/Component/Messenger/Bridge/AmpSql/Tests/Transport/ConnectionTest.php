@@ -11,9 +11,14 @@
 
 namespace Symfony\Component\Messenger\Bridge\AmpSql\Tests\Transport;
 
+use Amp\Parallel\Context\ProcessContextFactory;
 use Amp\Sql\SqlConnection;
 use Amp\Sql\SqlConnectionException;
+use Amp\Sql\SqlQueryError;
 use Amp\Sql\SqlResult;
+use Amp\Sql\SqlTransaction;
+use Fabpot\Amp\Sqlite\SqliteConfig;
+use Fabpot\Amp\Sqlite\SqliteConnector;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Messenger\Bridge\AmpSql\Transport\Backend\BackendInterface;
@@ -35,7 +40,7 @@ final class ConnectionTest extends TestCase
         $this->expectException(TransportException::class);
         $this->expectExceptionMessage('AMPHP SQL requires SQLite 3.42 or newer.');
 
-        (new Connection($connection, new SqliteBackend()))->setup();
+        (new Connection(static fn () => $connection, new SqliteBackend()))->setup();
     }
 
     #[DataProvider('provideBackendWithInvalidVersion')]
@@ -66,7 +71,7 @@ final class ConnectionTest extends TestCase
         $connection->method('query')->willThrowException($error);
 
         try {
-            (new Connection($connection, new SqliteBackend(), ['auto_setup' => false]))->getMessageCount();
+            (new Connection(static fn () => $connection, new SqliteBackend(), ['auto_setup' => false]))->getMessageCount();
             self::fail('Expected version validation to fail.');
         } catch (TransportException $e) {
             self::assertInstanceOf(SqlConnectionException::class, $e->getPrevious());
@@ -122,5 +127,247 @@ final class ConnectionTest extends TestCase
             ->willReturn($result);
 
         (new MysqlBackend())->setup($connection, 'messages');
+    }
+
+    #[DataProvider('provideNowExpression')]
+    public function testNowIsTheTimeAtWhichTheStatementStarted(BackendInterface $backend, string $now)
+    {
+        self::assertSame($now, $backend->getNowExpression());
+    }
+
+    public static function provideNowExpression(): iterable
+    {
+        yield 'MySQL' => [new MysqlBackend(), 'CAST(ROUND(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000) AS SIGNED)'];
+        yield 'PostgreSQL' => [new PostgresBackend(), 'CAST(EXTRACT(EPOCH FROM statement_timestamp()) * 1000 AS BIGINT)'];
+        yield 'SQLite' => [new SqliteBackend(), "CAST(unixepoch('subsec') * 1000 AS INTEGER)"];
+    }
+
+    public function testSendBatchInsertsTheMessagesInOneTransaction()
+    {
+        $transaction = $this->createMock(SqlTransaction::class);
+        $transaction->expects(self::once())->method('commit');
+        $transaction->expects(self::never())->method('rollback');
+        $connection = $this->createMock(SqlConnection::class);
+        $connection->expects(self::once())->method('beginTransaction')->willReturn($transaction);
+        $backend = $this->createMock(BackendInterface::class);
+        $backend->expects(self::once())
+            ->method('insertBatch')
+            ->with($transaction, 'messages', [[base64_encode('body a'), '{"type":"A"}', 0], [base64_encode('body b'), '[]', 500]], 'queue')
+            ->willReturn([15, '16']);
+
+        $ids = (new Connection(static fn () => $connection, $backend, ['auto_setup' => false, 'table_name' => 'messages', 'queue_name' => 'queue']))->sendBatch(['a' => ['body a', ['type' => 'A'], 0], 'b' => ['body b', [], 500]]);
+
+        self::assertSame(['a' => 15, 'b' => '16'], $ids);
+    }
+
+    public function testSendBatchSplitsLargeBatches()
+    {
+        $transaction = $this->createMock(SqlTransaction::class);
+        $transaction->expects(self::once())->method('commit');
+        $connection = $this->createStub(SqlConnection::class);
+        $connection->method('beginTransaction')->willReturn($transaction);
+        $rows = [];
+        $backend = $this->createStub(BackendInterface::class);
+        $backend->method('insertBatch')->willReturnCallback(static function (SqlTransaction $transaction, string $table, array $messages) use (&$rows): array {
+            $rows[] = \count($messages);
+
+            return [];
+        });
+
+        $messages = array_fill(0, 250, ['body', [], 0]);
+        $messages[] = [str_repeat('a', 600000), [], 0];
+        $messages[] = [str_repeat('b', 600000), [], 0];
+
+        self::assertSame([], (new Connection(static fn () => $connection, $backend, ['auto_setup' => false]))->sendBatch($messages));
+        self::assertSame([100, 100, 51, 1], $rows);
+    }
+
+    public function testSendBatchRollsBackWhenAStatementFails()
+    {
+        $error = new SqlQueryError('Deadlock found.', 'INSERT INTO messages');
+        $transaction = $this->createMock(SqlTransaction::class);
+        $transaction->method('isActive')->willReturn(true);
+        $transaction->expects(self::never())->method('commit');
+        $transaction->expects(self::once())->method('rollback');
+        $connection = $this->createStub(SqlConnection::class);
+        $connection->method('beginTransaction')->willReturn($transaction);
+        $calls = 0;
+        $backend = $this->createStub(BackendInterface::class);
+        $backend->method('insertBatch')->willReturnCallback(static function () use (&$calls, $error): array {
+            if (2 === ++$calls) {
+                throw $error;
+            }
+
+            return [];
+        });
+
+        try {
+            (new Connection(static fn () => $connection, $backend, ['auto_setup' => false]))->sendBatch(array_fill(0, 150, ['body', [], 0]));
+            self::fail('Expected sending to fail.');
+        } catch (TransportException $e) {
+            self::assertSame('Could not send the messages to AMPHP SQL.', $e->getMessage());
+            self::assertInstanceOf(SqlQueryError::class, $e->getPrevious());
+            self::assertSame($error->getMessage(), $e->getPrevious()->getMessage());
+            self::assertNotSame($error, $e->getPrevious());
+        }
+    }
+
+    #[DataProvider('provideBackendWithClaimLock')]
+    public function testGetClaimsTheMessagesInTheOrderOfTheIndex(BackendInterface $backend, string $version, string $lock)
+    {
+        self::assertSame([
+            [\sprintf('SELECT id, body, headers FROM messages WHERE queue_name = ? AND available_at <= %1$s AND (delivered_at IS NULL OR delivered_at < %1$s - ?) ORDER BY available_at ASC, delivered_at ASC, id ASC LIMIT ?%2$s', $backend->getNowExpression(), $lock), ['queue', 60000, 10]],
+        ], $this->getClaimStatements($backend, $version));
+    }
+
+    public static function provideBackendWithClaimLock(): iterable
+    {
+        yield 'MySQL' => [new MysqlBackend(), '8.4.0', ' FOR UPDATE SKIP LOCKED'];
+        yield 'PostgreSQL' => [new PostgresBackend(), '160000', ' FOR UPDATE SKIP LOCKED'];
+        yield 'SQLite' => [new SqliteBackend(), '3.45.1', ''];
+    }
+
+    #[DataProvider('provideBackend')]
+    public function testFindAllReadsTheMessagesInTheOrderOfTheIndex(BackendInterface $backend, string $version)
+    {
+        $result = $this->createStub(SqlResult::class);
+        $result->method('fetchRow')->willReturn(['version' => $version]);
+        $statements = [];
+        $connection = $this->createStub(SqlConnection::class);
+        $connection->method('query')->willReturn($result);
+        $connection->method('execute')->willReturnCallback(function (string $sql, array $params) use (&$statements): SqlResult {
+            $statements[] = [$sql, $params];
+
+            return $this->createStub(SqlResult::class);
+        });
+
+        (new Connection(static fn () => $connection, $backend, ['auto_setup' => false, 'table_name' => 'messages', 'queue_name' => 'queue', 'redeliver_timeout' => 60]))->findAll(50);
+
+        self::assertSame([
+            [\sprintf('SELECT id, body, headers FROM messages WHERE queue_name = ? AND available_at <= %1$s AND (delivered_at IS NULL OR delivered_at < %1$s - ?) ORDER BY available_at ASC, delivered_at ASC, id ASC LIMIT ?', $backend->getNowExpression()), ['queue', 60000, 50]],
+        ], $statements);
+    }
+
+    public static function provideBackend(): iterable
+    {
+        yield 'MySQL' => [new MysqlBackend(), '8.4.0'];
+        yield 'PostgreSQL' => [new PostgresBackend(), '160000'];
+        yield 'SQLite' => [new SqliteBackend(), '3.45.1'];
+    }
+
+    public function testSqliteClaimsTheMessagesWithoutSortingThem()
+    {
+        [[$sql, $params]] = $this->getClaimStatements(new SqliteBackend(), '3.45.1');
+        $connection = (new SqliteConnector(new ProcessContextFactory(null, [], null, 30)))->connect(new SqliteConfig(':memory:'));
+
+        try {
+            (new SqliteBackend())->setup($connection, 'messages');
+            $plan = iterator_to_array($connection->execute('EXPLAIN QUERY PLAN '.$sql, $params), false);
+
+            self::assertSame(['SEARCH messages USING INDEX messages_available_idx (queue_name=? AND available_at<?)'], array_column($plan, 'detail'));
+        } finally {
+            $connection->close();
+        }
+    }
+
+    #[DataProvider('provideNeverDeliveredOrderBy')]
+    public function testFindAllInBatchesFollowsTheOrderOfTheIndex(BackendInterface $backend, string $serverVersion, string $neverDeliveredOrderBy, string $sameAvailableAtOrderBy)
+    {
+        $neverDelivered = array_map(static fn (int $id) => ['id' => $id, 'body' => base64_encode('body '.$id), 'headers' => '[]', 'available_at' => 1000, 'delivered_at' => null], range(1, 100));
+        $deliveryTimedOut = array_map(static fn (int $id) => ['id' => $id, 'body' => base64_encode('body '.$id), 'headers' => '[]', 'available_at' => 1000, 'delivered_at' => 2000], range(101, 200));
+        $results = [[['now' => 100000, 'max_id' => 500]], $neverDelivered, [], [], $deliveryTimedOut, [], [], []];
+        $statements = [];
+        $connection = $this->createStub(SqlConnection::class);
+        $connection->method('execute')->willReturnCallback(static function (string $sql, array $params) use (&$results, &$statements): SqlResult {
+            $statements[] = [$sql, $params];
+
+            return new class(array_shift($results)) implements \IteratorAggregate, SqlResult {
+                public function __construct(private array $rows)
+                {
+                }
+
+                public function getIterator(): \Iterator
+                {
+                    return new \ArrayIterator($this->rows);
+                }
+
+                public function fetchRow(): ?array
+                {
+                    return array_shift($this->rows);
+                }
+
+                public function getNextResult(): ?SqlResult
+                {
+                    return null;
+                }
+
+                public function getRowCount(): ?int
+                {
+                    return null;
+                }
+
+                public function getColumnCount(): ?int
+                {
+                    return null;
+                }
+            };
+        });
+        $version = $this->createStub(SqlResult::class);
+        $version->method('fetchRow')->willReturn(['version' => $serverVersion]);
+        $connection->method('query')->willReturn($version);
+
+        $messages = iterator_to_array((new Connection(static fn () => $connection, $backend, ['auto_setup' => false, 'table_name' => 'messages', 'queue_name' => 'queue', 'redeliver_timeout' => 60]))->findAllInBatches(), false);
+
+        self::assertCount(200, $messages);
+        self::assertSame([
+            [\sprintf('SELECT %s AS now, (SELECT MAX(id) FROM messages) AS max_id', $backend->getNowExpression()), []],
+            ['SELECT id, body, headers, available_at, delivered_at FROM messages WHERE queue_name = ? AND available_at <= ? AND id <= ? AND NOT (delivered_at IS NOT NULL) ORDER BY '.$neverDeliveredOrderBy.' LIMIT ?', ['queue', 100000, 500, 100]],
+            ['SELECT id, body, headers, available_at, delivered_at FROM messages WHERE queue_name = ? AND available_at <= ? AND id <= ? AND delivered_at IS NULL AND available_at = ? AND id > ? ORDER BY '.$sameAvailableAtOrderBy.' LIMIT ?', ['queue', 100000, 500, 1000, 100, 100]],
+            ['SELECT id, body, headers, available_at, delivered_at FROM messages WHERE queue_name = ? AND available_at <= ? AND id <= ? AND available_at > ? AND NOT (delivered_at IS NOT NULL) ORDER BY '.$neverDeliveredOrderBy.' LIMIT ?', ['queue', 100000, 500, 1000, 100]],
+            ['SELECT id, body, headers, available_at, delivered_at FROM messages WHERE queue_name = ? AND available_at <= ? AND id <= ? AND delivered_at < ? ORDER BY available_at ASC, delivered_at ASC, id ASC LIMIT ?', ['queue', 100000, 500, 40000, 100]],
+            ['SELECT id, body, headers, available_at, delivered_at FROM messages WHERE queue_name = ? AND available_at <= ? AND id <= ? AND delivered_at < ? AND available_at = ? AND delivered_at = ? AND id > ? ORDER BY id ASC LIMIT ?', ['queue', 100000, 500, 40000, 1000, 2000, 200, 100]],
+            ['SELECT id, body, headers, available_at, delivered_at FROM messages WHERE queue_name = ? AND available_at <= ? AND id <= ? AND delivered_at < ? AND available_at = ? AND delivered_at > ? ORDER BY delivered_at ASC, id ASC LIMIT ?', ['queue', 100000, 500, 40000, 1000, 2000, 100]],
+            ['SELECT id, body, headers, available_at, delivered_at FROM messages WHERE queue_name = ? AND available_at <= ? AND id <= ? AND delivered_at < ? AND available_at > ? ORDER BY available_at ASC, delivered_at ASC, id ASC LIMIT ?', ['queue', 100000, 500, 40000, 1000, 100]],
+        ], $statements);
+    }
+
+    public static function provideNeverDeliveredOrderBy(): iterable
+    {
+        yield 'MySQL' => [new MysqlBackend(), '8.4.0', 'available_at ASC, id ASC', 'id ASC'];
+        yield 'PostgreSQL' => [new PostgresBackend(), '160000', 'available_at ASC, delivered_at ASC, id ASC', 'delivered_at ASC, id ASC'];
+        yield 'SQLite' => [new SqliteBackend(), '3.45.0', 'available_at ASC, delivered_at ASC, id ASC', 'delivered_at ASC, id ASC'];
+    }
+
+    public function testMysqlInsertBatchUsesOneStatementWithoutIds()
+    {
+        $backend = new MysqlBackend();
+        $now = $backend->getNowExpression();
+        $transaction = $this->createMock(SqlTransaction::class);
+        $transaction->expects(self::once())
+            ->method('execute')
+            ->with(\sprintf('INSERT INTO messages (body, headers, queue_name, created_at, available_at) VALUES (?, ?, ?, %1$s, %1$s + ?), (?, ?, ?, %1$s, %1$s + ?)', $now), ['body a', '{"type":"A"}', 'queue', 0, 'body b', '[]', 'queue', 500])
+            ->willReturn($this->createStub(SqlResult::class));
+
+        self::assertSame([], $backend->insertBatch($transaction, 'messages', [['body a', '{"type":"A"}', 0], ['body b', '[]', 500]], 'queue'));
+    }
+
+    private function getClaimStatements(BackendInterface $backend, string $version): array
+    {
+        $result = $this->createStub(SqlResult::class);
+        $result->method('fetchRow')->willReturn(['version' => $version]);
+        $statements = [];
+        $transaction = $this->createStub(SqlTransaction::class);
+        $transaction->method('execute')->willReturnCallback(function (string $sql, array $params) use (&$statements): SqlResult {
+            $statements[] = [$sql, $params];
+
+            return $this->createStub(SqlResult::class);
+        });
+        $connection = $this->createStub(SqlConnection::class);
+        $connection->method('query')->willReturn($result);
+        $connection->method('beginTransaction')->willReturn($transaction);
+
+        (new Connection(static fn () => $connection, $backend, ['auto_setup' => false, 'table_name' => 'messages', 'queue_name' => 'queue', 'redeliver_timeout' => 60]))->get(10);
+
+        return $statements;
     }
 }

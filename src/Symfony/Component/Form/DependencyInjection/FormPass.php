@@ -68,10 +68,11 @@ class FormPass implements CompilerPassInterface
         }
 
         $dataClasses = [];
+        $dataClassTypes = [];
         // abstract data classes get a type too, they can be the parent type of concrete ones
         foreach (array_keys($container->findTaggedResourceIds('form.data_class', false)) as $id) {
             $class = $container->getDefinition($id)->getClass();
-            $container->setDefinition($typeId = '.form.data_class_type.'.$class, $this->createDataClassTypeDefinition($container, $class));
+            $container->setDefinition($typeId = '.form.data_class_type.'.$class, $dataClassTypes[$class] = $this->createDataClassTypeDefinition($container, $class));
 
             $servicesMap[$class] = new Reference($typeId);
             $dataClasses[] = $class;
@@ -83,6 +84,10 @@ class FormPass implements CompilerPassInterface
             $commandDefinition->setArgument(1, array_keys($namespaces));
             $commandDefinition->setArgument(2, array_keys($servicesMap));
             $commandDefinition->setArgument('$dataClassTypes', $dataClasses);
+        }
+
+        if ($container->hasDefinition('form.type_guesser.type_info.cache_warmer')) {
+            $container->getDefinition('form.type_guesser.type_info.cache_warmer')->replaceArgument(0, $this->getGuessedFields($dataClassTypes));
         }
 
         if ($csrfTokenIds && $container->hasDefinition('form.type_extension.csrf')) {
@@ -160,6 +165,8 @@ class FormPass implements CompilerPassInterface
     private function createDataClassTypeDefinition(ContainerBuilder $container, string $class): Definition
     {
         $reflector = $container->getReflectionClass($class);
+        // the resource registered by getReflectionClass() ignores the attributes of private properties
+        $container->addObjectResource($class);
 
         if (!$attributes = $reflector->getAttributes(AsFormType::class, \ReflectionAttribute::IS_INSTANCEOF)) {
             throw new InvalidArgumentException(\sprintf('The class "%s" is tagged "form.data_class" but has no #[AsFormType] attribute.', $class));
@@ -172,41 +179,49 @@ class FormPass implements CompilerPassInterface
         }
         $this->validateOptionValues($options, \sprintf('the #[AsFormType] attribute of class "%s"', $class));
 
-        $fields = [];
-        foreach ($reflector->getProperties() as $property) {
-            if ($property->getDeclaringClass()->name !== $reflector->name || !$fieldAttributes = $property->getAttributes(FormField::class, \ReflectionAttribute::IS_INSTANCEOF)) {
-                continue;
-            }
-            $field = $fieldAttributes[0]->newInstance();
-            $context = \sprintf('the #[FormField] attribute of property "%s::$%s"', $class, $property->name);
-
-            if (null !== $field->type && !class_exists($field->type)) {
-                throw new InvalidArgumentException(\sprintf('The form type "%s" declared on %s does not exist.', $field->type, $context));
-            }
-
-            $name = $property->name;
-            $fieldOptions = $field->options;
-            if (null !== $field->name) {
-                if (isset($fieldOptions['property_path'])) {
-                    throw new InvalidArgumentException(\sprintf('The "name" argument of %s cannot be combined with the "property_path" option.', $context));
-                }
-                $fieldOptions['property_path'] = $name;
-                $name = $field->name;
-            }
-            if (isset($fields[$name])) {
-                throw new InvalidArgumentException(\sprintf('Duplicate field "%s" declared on %s.', $name, $context));
-            }
-            $this->validateOptionValues($fieldOptions, $context);
-
-            $fields[$name] = [$field->type, $fieldOptions];
-        }
-
+        // the closest parent class with #[AsFormType] adds its fields through its own type, so only the classes below it are read
         $parent = FormType::class;
-        $parentReflector = $reflector;
-        while ($parentReflector = $parentReflector->getParentClass()) {
+        $declaringClasses = [$reflector];
+        while ($parentReflector = end($declaringClasses)->getParentClass()) {
             if ($parentReflector->getAttributes(AsFormType::class, \ReflectionAttribute::IS_INSTANCEOF)) {
                 $parent = $parentReflector->name;
                 break;
+            }
+            $declaringClasses[] = $parentReflector;
+        }
+
+        $fields = [];
+        foreach (array_reverse($declaringClasses) as $declaringClass) {
+            foreach ($declaringClass->getProperties() as $property) {
+                if ($property->class !== $declaringClass->name || !$fieldAttributes = $property->getAttributes(FormField::class, \ReflectionAttribute::IS_INSTANCEOF)) {
+                    continue;
+                }
+                // a property redeclared by a child class is read from that child class
+                if (!$property->isPrivate() && $reflector->getProperty($property->name)->class !== $property->class) {
+                    continue;
+                }
+                $field = $fieldAttributes[0]->newInstance();
+                $context = \sprintf('the #[FormField] attribute of property "%s::$%s"', $property->class, $property->name);
+
+                if (null !== $field->type && !class_exists($field->type)) {
+                    throw new InvalidArgumentException(\sprintf('The form type "%s" declared on %s does not exist.', $field->type, $context));
+                }
+
+                $name = $property->name;
+                $fieldOptions = $field->options;
+                if (null !== $field->name) {
+                    if (isset($fieldOptions['property_path'])) {
+                        throw new InvalidArgumentException(\sprintf('The "name" argument of %s cannot be combined with the "property_path" option.', $context));
+                    }
+                    $fieldOptions['property_path'] = $name;
+                    $name = $field->name;
+                }
+                if (isset($fields[$name])) {
+                    throw new InvalidArgumentException(\sprintf('Duplicate field "%s" declared on %s.', $name, $context));
+                }
+                $this->validateOptionValues($fieldOptions, $context);
+
+                $fields[$name] = [$field->type, $fieldOptions];
             }
         }
 
@@ -214,6 +229,38 @@ class FormPass implements CompilerPassInterface
         $parameterBag = $container->getParameterBag();
 
         return new Definition(DataClassType::class, [$class, $parent, StringUtil::fqcnToBlockPrefix($class) ?: '', $parameterBag->escapeValue($fields), $parameterBag->escapeValue($options)]);
+    }
+
+    /**
+     * Lists the fields that have no type, for which the type guessers are called.
+     *
+     * @param array<class-string, Definition> $dataClassTypes
+     *
+     * @return array<class-string, list<string>>
+     */
+    private function getGuessedFields(array $dataClassTypes): array
+    {
+        $guessedFields = [];
+
+        foreach ($dataClassTypes as $class => $definition) {
+            $fields = [];
+
+            // the parent types add their fields to the form of the child class, so the guessers are called with the child class
+            do {
+                foreach ($definition->getArgument(3) as $name => [$type, $options]) {
+                    if (null === $type) {
+                        $propertyPath = $options['property_path'] ?? null;
+                        $fields[$name] = \is_string($propertyPath) && '' !== $propertyPath && false === strpbrk($propertyPath, '.[]?\\') ? $propertyPath : $name;
+                    }
+                }
+            } while ($definition = $dataClassTypes[$definition->getArgument(1)] ?? null);
+
+            if ($fields) {
+                $guessedFields[$class] = array_values($fields);
+            }
+        }
+
+        return $guessedFields;
     }
 
     private function validateOptionValues(array $options, string $context, string $path = ''): void

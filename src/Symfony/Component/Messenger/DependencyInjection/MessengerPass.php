@@ -12,12 +12,15 @@
 namespace Symfony\Component\Messenger\DependencyInjection;
 
 use Symfony\Component\DependencyInjection\Argument\IteratorArgument;
+use Symfony\Component\DependencyInjection\Argument\TaggedIteratorArgument;
 use Symfony\Component\DependencyInjection\ChildDefinition;
+use Symfony\Component\DependencyInjection\Compiler\BeforeAfterSorter;
 use Symfony\Component\DependencyInjection\Compiler\CompilerPassInterface;
 use Symfony\Component\DependencyInjection\Compiler\PriorityTaggedServiceTrait;
 use Symfony\Component\DependencyInjection\Compiler\ServiceLocatorTagPass;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Definition;
+use Symfony\Component\DependencyInjection\Exception\InvalidArgumentException;
 use Symfony\Component\DependencyInjection\Exception\RuntimeException;
 use Symfony\Component\DependencyInjection\Reference;
 use Symfony\Component\Messenger\Handler\HandlerDescriptor;
@@ -39,10 +42,17 @@ class MessengerPass implements CompilerPassInterface
     public function process(ContainerBuilder $container): void
     {
         $busIds = array_keys($container->findTaggedServiceIds('messenger.bus'));
+        $taggedMiddleware = $this->findTaggedMiddleware($container, $busIds);
 
         foreach ($busIds as $busId) {
             if ($container->hasParameter($busMiddlewareParameter = $busId.'.middleware')) {
-                $this->registerBusMiddleware($container, $busId, $container->getParameter($busMiddlewareParameter));
+                $middleware = $container->getParameter($busMiddlewareParameter);
+
+                if (isset($taggedMiddleware[$busId]) || isset($taggedMiddleware['*'])) {
+                    $middleware = $this->addTaggedMiddleware($container, $busId, $middleware, $taggedMiddleware[$busId] ?? [], $taggedMiddleware['*'] ?? []);
+                }
+
+                $this->registerBusMiddleware($container, $busId, $middleware);
 
                 $container->getParameterBag()->remove($busMiddlewareParameter);
             }
@@ -59,6 +69,7 @@ class MessengerPass implements CompilerPassInterface
         $this->registerHandlers($container, $busIds);
         $this->registerTypeMapping($container);
         $this->registerDebugCommandRouting($container);
+        $this->registerDebugCommandMiddleware($container, $busIds);
     }
 
     private function registerHandlers(ContainerBuilder $container, array $busIds): void
@@ -70,12 +81,15 @@ class MessengerPass implements CompilerPassInterface
         $handlerTransports = [];
         $hasSendersLocator = $container->hasDefinition('messenger.senders_locator');
         $receiverNames = null;
+        $trustedTransports = [];
 
         if ($container->hasDefinition('messenger.receiver_locator')) {
             $receiverNames = [];
             foreach ($container->findTaggedServiceIds('messenger.receiver') as $id => $tags) {
                 foreach ($tags as $tag) {
                     $receiverNames[$tag['alias'] ?? $id] = $id;
+                    // messages can be trusted when their transport signs every message or handles them in this process
+                    $trustedTransports[$tag['alias'] ?? $id] = $trustedTransports[$id] = ($tag['sign'] ?? false) || false === ($tag['is_consumable'] ?? true);
                 }
             }
         }
@@ -106,6 +120,8 @@ class MessengerPass implements CompilerPassInterface
 
                 $message = null;
                 $handlerBuses = (array) ($tag['bus'] ?? $busIds);
+                $declaredPriority = $tag['priority'] ?? null;
+                $constraints = array_filter(['before' => (array) ($tag['before'] ?? []), 'after' => (array) ($tag['after'] ?? [])]);
 
                 foreach ($handles as $message => $options) {
                     $buses = $handlerBuses;
@@ -124,7 +140,7 @@ class MessengerPass implements CompilerPassInterface
                     }
 
                     $options += array_filter($tag);
-                    unset($options['handles']);
+                    unset($options['handles'], $options['before'], $options['after']);
 
                     if (null !== $transport = $options['transport'] ?? null) {
                         if (isset($options['from_transport']) && $transport !== $options['from_transport']) {
@@ -141,6 +157,10 @@ class MessengerPass implements CompilerPassInterface
 
                         if (!$hasSendersLocator) {
                             throw new RuntimeException(\sprintf('Invalid handler service "%s": the "transport" option needs the "messenger.senders_locator" service, which is not defined.', $serviceId));
+                        }
+
+                        if (($options['sign'] ?? false) && null !== $receiverNames && !$trustedTransports[$transport]) {
+                            throw new RuntimeException(\sprintf('Invalid handler service "%s": it requires a signature, so the "%s" transport that its "transport" option refers to must sign every message; set the "sign" option of that transport to true.', $serviceId, $transport));
                         }
 
                         unset($options['transport']);
@@ -184,7 +204,7 @@ class MessengerPass implements CompilerPassInterface
                     $handlerToOriginalServiceIdMapping[$definitionId] = $serviceId;
 
                     foreach ($buses as $handlerBus) {
-                        $handlersByBusAndMessage[$handlerBus][$message][$priority][] = [$definitionId, $options];
+                        $handlersByBusAndMessage[$handlerBus][$message][$priority][] = [$definitionId, $options, $declaredPriority, $constraints];
                     }
 
                     if ($sign && '*' !== $message) {
@@ -201,10 +221,11 @@ class MessengerPass implements CompilerPassInterface
         foreach ($handlersByBusAndMessage as $bus => $handlersByMessage) {
             foreach ($handlersByMessage as $message => $handlersByPriority) {
                 krsort($handlersByPriority);
-                $handlers = array_merge(...$handlersByPriority);
+                $handlers = $this->sortHandlersByConstraints($container, $bus, $message, array_merge(...$handlersByPriority), $handlerToOriginalServiceIdMapping);
                 $serviceIdsByName = [];
 
                 foreach ($handlers as $key => [$definitionId, $options]) {
+                    $handlers[$key] = [$definitionId, $options];
                     $serviceId = $handlerToOriginalServiceIdMapping[$definitionId];
                     $name = $this->getServiceClass($container, $serviceId).'::'.($options['method'] ?? '__invoke');
                     $serviceIdsByName[$name][$key] = $serviceId;
@@ -239,18 +260,15 @@ class MessengerPass implements CompilerPassInterface
         }
         $container->addDefinitions($definitions);
 
-        if ($signedMessageTypes && $container->hasDefinition('messenger.signing_serializer')) {
-            $signingSerializerDefinition = $container->getDefinition('messenger.signing_serializer');
-            $messageToSerializersMapping = $signingSerializerDefinition->getArgument(2);
+        if ($container->hasDefinition('.messenger.signing_serializer.message_types')) {
+            $container->getDefinition('.messenger.signing_serializer.message_types')->replaceArgument(2, array_keys($signedMessageTypes));
 
-            $signingSerializerDefinition->replaceArgument(2, array_keys($signedMessageTypes));
-
-            // because transports accept any message types - not only listed ones - we have to decorate all serializers regardless of message signing
-            foreach (array_unique(array_merge(...array_values($messageToSerializersMapping))) as $serializerId) {
-                $container->setDefinition('.signing.'.$serializerId, (new ChildDefinition('messenger.signing_serializer'))->setDecoratedService($serializerId));
+            foreach ($container->getDefinitions() as $id => $definition) {
+                // the signing serializer of a transport that does not sign every message has nothing to do when no message type requires a signature
+                if (!$signedMessageTypes && $definition instanceof ChildDefinition && '.messenger.signing_serializer.message_types' === $definition->getParent()) {
+                    $container->setAlias($id, (string) $definition->getArgument(0));
+                }
             }
-        } else {
-            $container->removeDefinition('messenger.signing_serializer');
         }
 
         if ($handlerTransports) {
@@ -282,6 +300,10 @@ class MessengerPass implements CompilerPassInterface
             $sendersLocatorDefinition->replaceArgument(0, $sendersMap);
         }
 
+        if ($signedMessageTypes && $hasSendersLocator && null !== $receiverNames) {
+            $this->triggerUntrustedRoutingDeprecations($container, array_keys($signedMessageTypes), $trustedTransports);
+        }
+
         foreach ($busIds as $bus) {
             $container->register($locatorId = $bus.'.messenger.handlers_locator', HandlersLocator::class)
                 ->setArgument(0, $handlersLocatorMappingByBus[$bus] ?? [])
@@ -307,6 +329,87 @@ class MessengerPass implements CompilerPassInterface
                 }
             }
             $container->getDefinition('console.command.messenger_debug')->replaceArgument(0, $debugCommandMapping);
+        }
+    }
+
+    /**
+     * Reorders the handlers of a message on a bus so that their "before"/"after" constraints are met.
+     *
+     * A declared priority is never crossed; a handler without one goes where its constraints put it.
+     *
+     * @param list<array{0: string, 1: array, 2: int|null, 3: array}> $handlers                          Definition id, options, declared priority and "before"/"after" constraints of each handler, in their default order
+     * @param array<string, string>                                   $handlerToOriginalServiceIdMapping
+     *
+     * @return list<array{0: string, 1: array, 2: int|null, 3: array}>
+     */
+    private function sortHandlersByConstraints(ContainerBuilder $container, string $bus, string $message, array $handlers, array $handlerToOriginalServiceIdMapping): array
+    {
+        if (!array_filter(array_column($handlers, 3))) {
+            return $handlers;
+        }
+
+        $indexes = $priorities = $constraints = $keysById = $aliases = [];
+
+        foreach ($handlers as $i => [$definitionId, $options, $declaredPriority, $handlerConstraints]) {
+            $serviceId = $handlerToOriginalServiceIdMapping[$definitionId];
+            $method = $options['method'] ?? '__invoke';
+
+            // keys show up in error messages: the service id, then "id::method", then a counter for a repeated method
+            for ($n = 0, $key = $serviceId; isset($indexes[$key]); ++$n) {
+                $key = $serviceId.'::'.$method.($n ? '#'.$n : '');
+            }
+
+            $indexes[$key] = $i;
+            $priorities[$key] = $declaredPriority;
+            $keysById[$serviceId][] = $key;
+            $keysById[$serviceId.'::'.$method][] = $key;
+
+            if ($handlerConstraints) {
+                $constraints[$key] = $handlerConstraints;
+            }
+
+            $class = $container->getParameterBag()->resolveValue($this->getServiceClass($container, $serviceId));
+            $aliases[$class][] = $key;
+            $aliases[$class.'::'.$method][] = $key;
+        }
+
+        // a service id always designates its own handlers, whatever class it shares a name with
+        $aliases = $keysById + $aliases;
+
+        $this->checkTargetMethods($constraints, $aliases, $bus, $message);
+
+        try {
+            $sorted = BeforeAfterSorter::sortWithPriorities($priorities, $constraints, $aliases);
+        } catch (InvalidArgumentException $e) {
+            throw new RuntimeException(\sprintf('Cannot order the handlers of "%s" on bus "%s": ', $message, $bus).lcfirst($e->getMessage()), 0, $e);
+        }
+
+        return array_map(static fn ($key) => $handlers[$indexes[$key]], array_keys($sorted));
+    }
+
+    /**
+     * Rejects a "service::method" target naming a method the service does not handle the message with.
+     *
+     * A target whose service part is absent stays ignored: the package declaring it may not be installed.
+     * One that is present has to name one of its handlers, otherwise the constraint would silently do nothing.
+     *
+     * @param array<string, array{before?: list<string>, after?: list<string>}> $constraints
+     * @param array<string, list<string>>                                       $aliases
+     */
+    private function checkTargetMethods(array $constraints, array $aliases, string $bus, string $message): void
+    {
+        foreach ($constraints as $key => $constraint) {
+            foreach ($constraint as $direction => $targets) {
+                foreach ($targets as $target) {
+                    if (isset($aliases[$target]) || false === $i = strrpos($target, '::')) {
+                        continue;
+                    }
+
+                    if (isset($aliases[$service = substr($target, 0, $i)])) {
+                        throw new RuntimeException(\sprintf('Invalid "%s" constraint on handler "%s": "%s" does not handle "%s" on bus "%s" with method "%s".', $direction, $key, $service, $message, $bus, substr($target, 2 + $i)));
+                    }
+                }
+            }
         }
     }
 
@@ -473,6 +576,116 @@ class MessengerPass implements CompilerPassInterface
         $container->getDefinition('data_collector.messenger')->addMethodCall('registerBus', [$busId, new Reference($tracedBusId)]);
     }
 
+    /**
+     * @param list<string> $busIds
+     *
+     * @return array<string, array<string, array{before?: list<string>, after?: list<string>}>> The constraints of the tagged middleware, by bus ("*" for all buses) and service id
+     */
+    private function findTaggedMiddleware(ContainerBuilder $container, array $busIds): array
+    {
+        $knownBusIds = array_values(array_filter($busIds, static fn ($busId) => $container->hasParameter($busId.'.middleware')));
+        $middlewareByBus = [];
+
+        foreach ($container->findTaggedServiceIds('messenger.middleware', true) as $serviceId => $tags) {
+            foreach ($tags as $tag) {
+                if (null === $busId = $tag['bus'] ?? null) {
+                    throw new RuntimeException(\sprintf('Invalid middleware service "%s": the "messenger.middleware" tag requires a "bus" attribute.', $serviceId));
+                }
+
+                if ('*' !== $busId && !\in_array($busId, $knownBusIds, true)) {
+                    throw new RuntimeException(\sprintf('Invalid middleware service "%s": bus "%s" specified on the tag "messenger.middleware" does not exist (known ones are: "%s").', $serviceId, $busId, implode('", "', $knownBusIds)));
+                }
+
+                if (isset($middlewareByBus[$busId][$serviceId])) {
+                    throw new RuntimeException(\sprintf('Invalid middleware service "%s": it is tagged "messenger.middleware" more than once for bus "%s".', $serviceId, $busId));
+                }
+
+                $middlewareByBus[$busId][$serviceId] = array_filter(['before' => (array) ($tag['before'] ?? []), 'after' => (array) ($tag['after'] ?? [])]);
+            }
+        }
+
+        return $middlewareByBus;
+    }
+
+    /**
+     * @param list<array{id: string, arguments?: array}>                        $middleware
+     * @param array<string, array{before?: list<string>, after?: list<string>}> $tagged            The middleware tagged for this bus
+     * @param array<string, array{before?: list<string>, after?: list<string>}> $taggedForAllBuses The middleware tagged for all buses
+     *
+     * @return list<array{id: string, arguments?: array}>
+     */
+    private function addTaggedMiddleware(ContainerBuilder $container, string $busId, array $middleware, array $tagged, array $taggedForAllBuses): array
+    {
+        $items = $names = $constraints = $byId = $byClass = [];
+        $insertAt = null;
+
+        foreach ($middleware as $item) {
+            $serviceId = $container->has('messenger.middleware.'.$item['id']) ? 'messenger.middleware.'.$item['id'] : $item['id'];
+
+            // tags are on definitions, so a middleware configured through an alias is compared by the definition it points to
+            for ($definitionId = $serviceId, $seen = []; $container->hasAlias($definitionId) && !isset($seen[$definitionId]); $seen[$definitionId] = true) {
+                $definitionId = (string) $container->getAlias($definitionId);
+            }
+
+            if (isset($tagged[$definitionId])) {
+                throw new RuntimeException(\sprintf('Invalid middleware service "%s": it is both listed in the configuration of bus "%s" and tagged "messenger.middleware" for it.', $definitionId, $busId));
+            }
+
+            // a middleware tagged for all buses keeps the position the configuration of a bus gives it
+            unset($taggedForAllBuses[$definitionId]);
+
+            for ($n = 0, $key = $item['id']; isset($items[$key]); ++$n) {
+                $key = $item['id'].'#'.$n;
+            }
+
+            // tagged middleware go after the configured ones, in front of the ones that send and handle the message
+            if (null === $insertAt && \in_array($serviceId, ['messenger.middleware.send_message', 'messenger.middleware.chain', 'messenger.middleware.handle_message'], true)) {
+                $insertAt = \count($items);
+            }
+
+            $items[$key] = $item;
+            $names[$key] = [$item['id'], $serviceId, $definitionId];
+        }
+
+        $seed = array_keys($items);
+        $taggedKeys = [];
+
+        foreach ($tagged + $taggedForAllBuses as $serviceId => $serviceConstraints) {
+            for ($n = 0, $key = $serviceId; isset($items[$key]); ++$n) {
+                $key = $serviceId.'#'.$n;
+            }
+
+            $items[$key] = ['id' => $serviceId];
+            $taggedKeys[] = $key;
+
+            if ($serviceConstraints) {
+                $constraints[$key] = $serviceConstraints;
+            }
+
+            $names[$key] = [$serviceId];
+        }
+
+        array_splice($seed, $insertAt ?? \count($seed), 0, $taggedKeys);
+
+        foreach ($names as $key => $ids) {
+            foreach (array_unique($ids) as $id) {
+                $byId[$id][] = $key;
+            }
+
+            if ($container->has($serviceId = end($ids)) && \is_string($class = $container->getParameterBag()->resolveValue($container->findDefinition($serviceId)->getClass()))) {
+                $byClass[$class][] = $key;
+            }
+        }
+
+        try {
+            $sorted = BeforeAfterSorter::sort($seed, $constraints, $byId + $byClass);
+        } catch (InvalidArgumentException $e) {
+            throw new RuntimeException(\sprintf('Cannot order the middleware of bus "%s": ', $busId).lcfirst($e->getMessage()), 0, $e);
+        }
+
+        return array_map(static fn ($key) => $items[$key], $sorted);
+    }
+
     private function registerBusMiddleware(ContainerBuilder $container, string $busId, array $middlewareCollection): void
     {
         $middlewareReferences = [];
@@ -574,6 +787,37 @@ class MessengerPass implements CompilerPassInterface
         $container->getDefinition('messenger.transport.symfony_serializer')->setArgument(3, $typeToClassMap);
     }
 
+    /**
+     * @param list<class-string>  $signedMessageTypes
+     * @param array<string, bool> $trustedTransports
+     */
+    private function triggerUntrustedRoutingDeprecations(ContainerBuilder $container, array $signedMessageTypes, array $trustedTransports): void
+    {
+        if (!\is_array($sendersMap = $container->getDefinition('messenger.senders_locator')->getArgument(0))) {
+            return;
+        }
+
+        // wildcards also match messages that the application never dispatches, so only explicit routes are checked
+        $sendersMap = array_filter($sendersMap, static fn ($type) => !str_ends_with($type, '*'), \ARRAY_FILTER_USE_KEY);
+        $classes = array_keys($sendersMap);
+
+        foreach ($container->findTaggedResourceIds('messenger.message', false) as $id => $tags) {
+            $classes[] = $container->getDefinition($id)->getClass();
+        }
+
+        foreach (array_unique([...$signedMessageTypes, ...$classes]) as $class) {
+            if (!$container->getReflectionClass($class, false) || !array_any($signedMessageTypes, static fn ($type) => is_a($class, $type, true))) {
+                continue;
+            }
+
+            foreach (SendersLocator::getSenderAliases($class, $sendersMap) as $sender) {
+                if (false === ($trustedTransports[$sender] ?? null)) {
+                    trigger_deprecation('symfony/messenger', '8.2', 'Routing message "%s" to the "%s" transport is deprecated. A handler of this message requires a signature, but the transport does not sign every message. Set the "sign" option of the transport to true, or the handler will refuse these messages in 9.0.', $class, $sender);
+                }
+            }
+        }
+    }
+
     private function registerDebugCommandRouting(ContainerBuilder $container): void
     {
         if (!$container->hasDefinition('console.command.messenger_debug') || !$container->hasDefinition('messenger.senders_locator')) {
@@ -619,5 +863,46 @@ class MessengerPass implements CompilerPassInterface
             ->setArgument(4, $failureTransports)
             ->setArgument(5, $this->handlerTransports)
         ;
+    }
+
+    private function registerDebugCommandMiddleware(ContainerBuilder $container, array $busIds): void
+    {
+        if (!$container->hasDefinition('console.command.messenger_debug')) {
+            return;
+        }
+
+        $middlewareByBus = [];
+        foreach ($busIds as $busId) {
+            $middlewareByBus[$busId] = [];
+
+            $arguments = $container->getDefinition($busId)->getArguments();
+            $middleware = $arguments[0] ?? [];
+            if ($middleware instanceof TaggedIteratorArgument) {
+                $middleware = $this->findAndSortTaggedServices($middleware, $container, $middleware->excludeSelf() ? [$busId] : []);
+            } elseif ($middleware instanceof IteratorArgument) {
+                $middleware = $middleware->getValues();
+            }
+            if (!\is_array($middleware)) {
+                continue;
+            }
+
+            foreach ($middleware as $reference) {
+                if (!$reference instanceof Reference) {
+                    continue;
+                }
+
+                $id = $class = (string) $reference;
+                $seen = [];
+                do {
+                    $definition = !isset($seen[$class]) && $container->has($class) ? $container->findDefinition($class) : null;
+                    $seen[$class] = true;
+                    $class = $definition instanceof ChildDefinition && !$definition->getClass() ? $definition->getParent() : $definition?->getClass();
+                } while ($definition instanceof ChildDefinition && !$definition->getClass());
+
+                $middlewareByBus[$busId][] = [$id, $class];
+            }
+        }
+
+        $container->getDefinition('console.command.messenger_debug')->setArgument('$middleware', $middlewareByBus);
     }
 }

@@ -11,18 +11,26 @@
 
 namespace Symfony\Bundle\SecurityBundle\Tests\Command;
 
+use PHPUnit\Framework\Attributes\BackupGlobals;
 use PHPUnit\Framework\TestCase;
 use Symfony\Bundle\SecurityBundle\Command\DebugRolesCommand;
 use Symfony\Bundle\SecurityBundle\Debug\DebugRoleHierarchy;
 use Symfony\Component\Console\Application;
+use Symfony\Component\Console\Exception\InvalidOptionException;
 use Symfony\Component\Console\Exception\RuntimeException;
 use Symfony\Component\Console\Tester\CommandTester;
+use Symfony\Component\Security\Core\Role\RoleHierarchy;
 use Symfony\Component\Security\Core\Role\RoleHierarchyInterface;
 
 class DebugRolesCommandTest extends TestCase
 {
+    #[BackupGlobals(true)]
     public function testDebugBuiltInRoleHierarchy()
     {
+        $_SERVER['SCRIPT_FILENAME'] = __FILE__;
+        $_SERVER['SYMFONY_CLI_CONSOLE_COMMAND'] = '["symfony","console"]';
+        $_SERVER['SYMFONY_CLI_CONSOLE_SCRIPT'] = __FILE__;
+
         $roleHierarchy = new DebugRoleHierarchy([
             'ROLE_FOO' => ['ROLE_BAR'],
             'ROLE_BAR' => ['ROLE_BAZ'],
@@ -43,6 +51,8 @@ class DebugRolesCommandTest extends TestCase
 
             EOF;
         $this->assertStringContainsString($expected, str_replace(\PHP_EOL, "\n", $tester->getDisplay()));
+        $display = preg_replace('/\s+/', ' ', preg_replace('/^\s*\/\/ ?/m', '', $tester->getDisplay(true)));
+        $this->assertStringContainsString('symfony console debug:roles ROLE_USER', $display);
     }
 
     public function testDebugBuiltInHierarchyWithTreeOption()
@@ -110,6 +120,23 @@ class DebugRolesCommandTest extends TestCase
         $this->assertEquals(['ROLE_FOO'], $tester->getInput()->getArgument('roles'));
     }
 
+    public function testOnlyAnEmptyAnswerStopsAskingForRoles()
+    {
+        $roleHierarchy = $this->createMock(RoleHierarchyInterface::class);
+        $roleHierarchy
+            ->expects($this->once())
+            ->method('getReachableRoleNames')
+            ->with(['ROLE_FOO', '0'])
+            ->willReturnArgument(0);
+        $tester = $this->createCommandTester($roleHierarchy);
+
+        $tester->setInputs(['ROLE_FOO', '0', '']);
+        $tester->execute([], ['interactive' => true]);
+
+        $tester->assertCommandIsSuccessful();
+        $this->assertSame(['ROLE_FOO', '0'], $tester->getInput()->getArgument('roles'));
+    }
+
     public function testDebugCustomRoleHierarchyRequiresRoleArgument()
     {
         $roleHierarchy = $this->createStub(RoleHierarchyInterface::class);
@@ -138,6 +165,78 @@ class DebugRolesCommandTest extends TestCase
         $tester->assertCommandIsSuccessful();
         $this->assertNull($tester->getInput()->getOption('tree'));
         $this->assertStringContainsString('Ignoring option "--tree"', $tester->getDisplay());
+    }
+
+    public function testDumpBuiltInRoleHierarchyAsMermaid()
+    {
+        $roleHierarchy = new DebugRoleHierarchy([
+            'ROLE_ADMIN' => ['ROLE_USER'],
+            'ROLE_SUPER_ADMIN' => ['ROLE_ADMIN'],
+        ]);
+
+        $tester = $this->createCommandTester($roleHierarchy);
+
+        $tester->execute(['--format' => 'mermaid', '--direction' => 'LR']);
+
+        $tester->assertCommandIsSuccessful();
+        $expected = <<<EOF
+            graph LR
+                ROLE_ADMIN
+                ROLE_USER
+                ROLE_SUPER_ADMIN
+                ROLE_ADMIN --> ROLE_USER
+                ROLE_SUPER_ADMIN --> ROLE_ADMIN
+
+            EOF;
+        $this->assertSame($expected, str_replace(\PHP_EOL, "\n", $tester->getDisplay()));
+    }
+
+    public function testMermaidFormatDumpsTheWholeHierarchy()
+    {
+        $tester = $this->createCommandTester(new DebugRoleHierarchy(['ROLE_ADMIN' => ['ROLE_USER']]));
+
+        $this->assertSame(1, $tester->execute(['roles' => ['ROLE_ADMIN'], '--format' => 'mermaid']));
+        $this->assertStringContainsString('The "mermaid" format dumps the whole role hierarchy', $tester->getDisplay());
+    }
+
+    public function testDumpRoleHierarchySubclassAsMermaid()
+    {
+        $tester = $this->createCommandTester(new class(['ROLE_ADMIN' => ['ROLE_USER']]) extends RoleHierarchy {});
+
+        $tester->execute(['--format' => 'mermaid'], ['interactive' => false]);
+
+        $tester->assertCommandIsSuccessful();
+        $this->assertStringContainsString('ROLE_ADMIN --> ROLE_USER', $tester->getDisplay());
+    }
+
+    public function testRoleHierarchySubclassRequiresRoleArgumentWithTheTxtFormat()
+    {
+        $tester = $this->createCommandTester(new class(['ROLE_ADMIN' => ['ROLE_USER']]) extends RoleHierarchy {});
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Not enough arguments (missing: "roles").');
+
+        $tester->execute([], ['interactive' => false]);
+    }
+
+    public function testMermaidFormatRequiresTheBuiltInRoleHierarchy()
+    {
+        $tester = $this->createCommandTester($this->createStub(RoleHierarchyInterface::class));
+
+        $this->expectException(InvalidOptionException::class);
+        $this->expectExceptionMessage(\sprintf('The "mermaid" format requires the role hierarchy to extend "%s".', RoleHierarchy::class));
+
+        $tester->execute(['--format' => 'mermaid'], ['interactive' => false]);
+    }
+
+    public function testInvalidFormat()
+    {
+        $tester = $this->createCommandTester(new DebugRoleHierarchy([]));
+
+        $this->expectException(InvalidOptionException::class);
+        $this->expectExceptionMessage('Supported formats are "txt", "mermaid".');
+
+        $tester->execute(['--format' => 'json']);
     }
 
     private function createCommandTester(RoleHierarchyInterface $roleHierarchy): CommandTester

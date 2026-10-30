@@ -1454,6 +1454,45 @@ b'])]
         $this->disableHttpMethodParameterOverride();
     }
 
+    public function testCreateDoesNotWarnAboutQueryKeysNestedBeyondMaxInputNestingLevel()
+    {
+        $request = $this->withDisplayErrorsOff(static fn () => Request::create('/?'.self::deeplyNestedKey().'=1&x=2'), $warnings);
+
+        $this->assertSame([], $warnings);
+        $this->assertSame(['x' => '2'], $request->query->all());
+    }
+
+    private static function deeplyNestedKey(): string
+    {
+        return 'a'.str_repeat('[b]', (int) \ini_get('max_input_nesting_level') + 1);
+    }
+
+    private function withDisplayErrorsOff(callable $callback, ?array &$warnings = null): mixed
+    {
+        // parse_str() only warns when display_errors is off, which is the case in production
+        $displayErrors = ini_set('display_errors', '0');
+        // PHPUnit 10+ leaves E_WARNING out of error_reporting() while a test runs
+        $errorReporting = error_reporting(-1);
+        $warnings = [];
+        set_error_handler(static function (int $type, string $message) use (&$warnings): bool {
+            if (!(error_reporting() & $type)) {
+                return false;
+            }
+
+            $warnings[] = $message;
+
+            return true;
+        });
+
+        try {
+            return $callback();
+        } finally {
+            restore_error_handler();
+            error_reporting($errorReporting);
+            ini_set('display_errors', $displayErrors);
+        }
+    }
+
     public function testOverrideGlobals()
     {
         $request = new Request();
@@ -1626,6 +1665,8 @@ b'])]
         yield '"hi_Latn_IN" is selected as "hi_IN" is a similar dialect' => ['hi_Latn_IN', 'fr-fr,hi_IN;q=0.5', ['hi_Latn_IN', 'en_US']];
         yield '"en_US" is selected as "en_Latn_US+variants+extensions" is a similar dialect' => ['en_US', 'en-latn-us-fonapi-u-nu-numerical-x-private,fr;q=0.5', ['fr_FR', 'en_US']];
         yield '"zh_Hans" is selected over "zh_TW" as the script as a greater priority over the region' => ['zh_Hans', 'zh-hans-tw, zh-hant-tw', ['zh_Hans', 'zh_tw']];
+        yield '"en" is selected as "fil" is another language than "fi"' => ['en', 'fi', ['en', 'fil']];
+        yield '"fil" is selected as "fil_PH" is a similar dialect' => ['fil', 'fi, fil-ph;q=0.5', ['en', 'fil']];
     }
 
     public function testIsXmlHttpRequest()
@@ -1793,6 +1834,21 @@ b'])]
         $request->cookies->set('MOCKSESSID', 'foo');
         $this->assertFalse($request->hasPreviousSession());
         $request->setSession(new Session(new MockArraySessionStorage()));
+        $this->assertTrue($request->hasPreviousSession());
+    }
+
+    public function testHasPreviousSessionDoesNotCreateTheSessionWithoutCookies()
+    {
+        $request = new Request();
+        $request->setSessionFactory(static fn () => new Session(new MockArraySessionStorage()));
+
+        $this->assertFalse($request->hasPreviousSession());
+        $this->assertFalse($request->hasSession(true));
+
+        $request->cookies->set('foo', 'bar');
+        $this->assertFalse($request->hasPreviousSession());
+
+        $request->cookies->set('MOCKSESSID', 'foo');
         $this->assertTrue($request->hasPreviousSession());
     }
 
@@ -3169,6 +3225,23 @@ b'])]
         $this->expectUserDeprecationMessage(\sprintf('Since symfony/http-foundation 8.1: Directly setting property "%s" of "Symfony\Component\HttpFoundation\Request" is deprecated; %s', $property, $extra));
 
         $request->{$property} = $value;
+    }
+
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
+    public function testDirectPropertyWriteIsDeprecatedAfterFailedInitialize()
+    {
+        $request = new Request();
+
+        try {
+            $request->initialize([], [], [], [], ['file' => 'not an uploaded file']);
+            $this->fail('An exception should have been thrown.');
+        } catch (\InvalidArgumentException) {
+        }
+
+        $this->expectUserDeprecationMessage('Since symfony/http-foundation 8.1: Directly setting property "query" of "Symfony\Component\HttpFoundation\Request" is deprecated; pass query parameters as a constructor argument or call "initialize()" instead.');
+
+        $request->query = new InputBag(['k' => 'v']);
     }
 
     #[Group('legacy')]

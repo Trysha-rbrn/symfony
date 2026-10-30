@@ -11,6 +11,7 @@
 
 namespace Symfony\Component\HttpFoundation\Tests;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\IgnoreDeprecations;
 use PHPUnit\Framework\TestCase;
@@ -53,7 +54,7 @@ class UriSignerTest extends TestCase
 
         // "0" is a real expiration date, not the absence of one
         $this->assertFalse($signer->check($signer->sign('http://example.com/foo', 0)));
-        $this->assertFalse($signer->check($signer->sign('http://example.com/foo', new \DateTimeImmutable('@0'))));
+        $this->assertFalse($signer->check($signer->sign('http://example.com/foo', \DateTimeImmutable::createFromTimestamp(0))));
     }
 
     public function testCheck()
@@ -88,6 +89,38 @@ class UriSignerTest extends TestCase
         $this->assertTrue($signer->check($signer->sign('http://example.com/foo?foo=bar&0=integer')));
 
         $this->assertSame($signer->sign('http://example.com/foo?foo=bar&bar=foo'), $signer->sign('http://example.com/foo?bar=foo&foo=bar'));
+    }
+
+    public function testCheckDoesNotWarnAboutKeysNestedBeyondMaxInputNestingLevel()
+    {
+        $signer = new UriSigner('foobar');
+        $uri = 'http://example.com/foo?a'.str_repeat('[b]', (int) \ini_get('max_input_nesting_level') + 1).'=1&x=2';
+
+        // parse_str() only warns when display_errors is off, which is the case in production
+        $displayErrors = ini_set('display_errors', '0');
+        // PHPUnit 10+ leaves E_WARNING out of error_reporting() while a test runs
+        $errorReporting = error_reporting(-1);
+        $warnings = [];
+        set_error_handler(static function (int $type, string $message) use (&$warnings): bool {
+            if (!(error_reporting() & $type)) {
+                return false;
+            }
+
+            $warnings[] = $message;
+
+            return true;
+        });
+
+        try {
+            $result = $signer->check($uri);
+        } finally {
+            restore_error_handler();
+            error_reporting($errorReporting);
+            ini_set('display_errors', $displayErrors);
+        }
+
+        $this->assertSame([], $warnings);
+        $this->assertFalse($result);
     }
 
     public function testCheckWithNonStringHash()
@@ -432,5 +465,51 @@ class UriSignerTest extends TestCase
         $this->expectException(UnverifiedSignedUriException::class);
 
         $signer->verify($uri, 'invalid');
+    }
+
+    public function testSignWithTheFirstOfSeveralSecrets()
+    {
+        $expiration = new \DateTimeImmutable('2099-01-01 00:00:00');
+        $signer = new UriSigner(['new-secret', 'old-secret']);
+
+        $this->assertSame((new UriSigner('new-secret'))->sign('http://example.com/foo', $expiration), $signer->sign('http://example.com/foo', $expiration));
+    }
+
+    public function testCheckWithAnyOfSeveralSecrets()
+    {
+        $expiration = new \DateTimeImmutable('2099-01-01 00:00:00');
+        $signer = new UriSigner(['new-secret', 'old-secret']);
+        $uri = (new UriSigner('old-secret'))->sign('http://example.com/foo', $expiration, 'v1');
+
+        $this->assertTrue($signer->check($uri, 'v1'));
+        $this->assertTrue($signer->checkRequest(Request::create($uri), 'v1'));
+        $this->assertFalse($signer->check($uri, 'v2'));
+        $this->assertFalse($signer->check((new UriSigner('other-secret'))->sign('http://example.com/foo', $expiration)));
+    }
+
+    public function testVerifyExpiredUriSignedWithAPreviousSecret()
+    {
+        $signer = new UriSigner(['new-secret', 'old-secret']);
+        $uri = (new UriSigner('old-secret'))->sign('http://example.com/foo', 123456);
+
+        $this->expectException(ExpiredSignedUriException::class);
+
+        $signer->verify($uri);
+    }
+
+    #[DataProvider('provideEmptySecrets')]
+    public function testConstructorRejectsEmptySecrets(string|array $secret)
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('A non-empty secret is required.');
+
+        new UriSigner($secret);
+    }
+
+    public static function provideEmptySecrets(): iterable
+    {
+        yield 'empty string' => [''];
+        yield 'empty list' => [[]];
+        yield 'empty string in a list' => [['secret', '']];
     }
 }

@@ -29,6 +29,12 @@ final class MysqlBackend implements BackendInterface
         return ' FOR UPDATE SKIP LOCKED';
     }
 
+    public function getNeverDeliveredOrderBy(): string
+    {
+        // MySQL sorts the messages when "delivered_at" is in the ORDER BY, although it is NULL for all of them
+        return 'id ASC';
+    }
+
     public function validateVersion(SqlConnection $connection): void
     {
         $version = $connection->query('SELECT VERSION() AS version')->fetchRow()['version'] ?? null;
@@ -72,5 +78,19 @@ final class MysqlBackend implements BackendInterface
         $result = $transaction->execute(\sprintf('INSERT INTO %s (body, headers, queue_name, created_at, available_at) VALUES (?, ?, ?, %s, %s + ?)', $table, $now, $now), [$body, $headers, $queueName, $delay]);
 
         return $result instanceof MysqlResult ? $result->getLastInsertId() : null;
+    }
+
+    public function insertBatch(SqlTransaction $transaction, string $table, array $messages, string $queueName): array
+    {
+        $now = $this->getNowExpression();
+        $values = implode(', ', array_fill(0, \count($messages), \sprintf('(?, ?, ?, %s, %s + ?)', $now, $now)));
+        $params = [];
+        foreach ($messages as [$body, $headers, $delay]) {
+            array_push($params, $body, $headers, $queueName, $delay);
+        }
+        $transaction->execute(\sprintf('INSERT INTO %s (body, headers, queue_name, created_at, available_at) VALUES %s', $table, $values), $params);
+
+        // MySQL tells the ID of the first row only
+        return [];
     }
 }

@@ -15,8 +15,11 @@ use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\Connection as DBALConnection;
 use Doctrine\DBAL\Exception as DBALException;
 use Doctrine\DBAL\Exception\TableNotFoundException;
+use Doctrine\DBAL\Platforms\AbstractMySQLPlatform;
 use Doctrine\DBAL\Platforms\OraclePlatform;
 use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
+use Doctrine\DBAL\Platforms\SQLitePlatform;
+use Doctrine\DBAL\Platforms\SQLServerPlatform;
 use Doctrine\DBAL\Query\ForUpdate\ConflictResolutionMode;
 use Doctrine\DBAL\Query\QueryBuilder;
 use Doctrine\DBAL\Result;
@@ -48,6 +51,12 @@ use Symfony\Contracts\Service\ResetInterface;
 class Connection implements ResetInterface
 {
     private const ORACLE_SEQUENCES_SUFFIX = '_seq';
+    private const INSERT_TYPES = [Types::STRING, Types::STRING, Types::STRING, Types::DATETIME_IMMUTABLE, Types::DATETIME_IMMUTABLE];
+    // 500 parameters per statement, below the limit of every platform (2100 on SQL Server, 999 on SQLite before 3.32)
+    private const MAX_BATCH_ROWS = 100;
+    // keeps the statements of a batch below the packet size limit of the server
+    private const MAX_BATCH_SIZE = 1048576;
+    private const LISTING_BATCH_SIZE = 100;
     protected const TABLE_OPTION_NAME = '_symfony_messenger_table_name';
 
     protected const DEFAULT_OPTIONS = [
@@ -83,6 +92,27 @@ class Connection implements ResetInterface
     public function reset(): void
     {
         $this->queueEmptiedAt = null;
+    }
+
+    /**
+     * Checks that the database still answers, and closes the DBAL connection when it does not.
+     *
+     * DBAL only closes the connection by itself on errors it reports as ConnectionLost.
+     * After any other loss, every query fails on the dead connection until it is closed. The next query then opens a fresh one.
+     *
+     * @return bool Whether the connection was lost and has been closed
+     */
+    public function closeIfDisconnected(): bool
+    {
+        try {
+            $this->driverConnection->executeQuery($this->driverConnection->getDatabasePlatform()->getDummySelectSQL());
+
+            return false;
+        } catch (DBALException) {
+            $this->driverConnection->close();
+
+            return true;
+        }
     }
 
     public function getConfiguration(): array
@@ -130,38 +160,68 @@ class Connection implements ResetInterface
      */
     public function send(string $body, array $headers, int $delay = 0): string
     {
-        $now = new \DateTimeImmutable('UTC');
-        $availableAt = $now->modify(\sprintf('%+d milliseconds', $delay));
+        $parameters = $this->getInsertParameters(\DateTimeImmutable::createFromTimestamp(microtime(true)), $body, $headers, $delay);
 
-        if (0 < $delay && '000000' !== $availableAt->format('u')) {
-            // "available_at" is stored with second precision, so a truncated instant would make
-            // the message available before the delay elapsed
-            $availableAt = $availableAt->modify('+1 second');
+        return $this->executeInsert(fn () => $this->insert($this->getInsertSql(1), $parameters, self::INSERT_TYPES));
+    }
+
+    /**
+     * Inserts messages in one transaction, with as few statements as the platform allows.
+     *
+     * @param non-empty-array<array{string, array, int}> $messages The arguments of send() for each message
+     *
+     * @return array<string> The inserted ids by the key of the messages, when the platform tells them
+     *
+     * @throws DBALException
+     */
+    public function sendBatch(array $messages): array
+    {
+        $now = \DateTimeImmutable::createFromTimestamp(microtime(true));
+        $platform = $this->driverConnection->getDatabasePlatform();
+
+        if (!$platform instanceof AbstractMySQLPlatform && !$platform instanceof PostgreSQLPlatform && !$platform instanceof SQLitePlatform && !$platform instanceof SQLServerPlatform) {
+            $sql = $this->getInsertSql(1);
+
+            return $this->executeInsert(fn () => array_map(fn (array $message) => $this->insert($sql, $this->getInsertParameters($now, ...$message), self::INSERT_TYPES), $messages));
         }
 
-        $queryBuilder = $this->driverConnection->createQueryBuilder()
-            ->insert($this->configuration['table_name'])
-            ->values([
-                'body' => '?',
-                'headers' => '?',
-                'queue_name' => '?',
-                'created_at' => '?',
-                'available_at' => '?',
-            ]);
+        $batches = [];
+        $batch = [];
+        $batchSize = 0;
 
-        return $this->executeInsert($queryBuilder->getSQL(), [
-            $body,
-            json_encode($headers),
-            $this->configuration['queue_name'],
-            $now,
-            $availableAt,
-        ], [
-            Types::STRING,
-            Types::STRING,
-            Types::STRING,
-            Types::DATETIME_IMMUTABLE,
-            Types::DATETIME_IMMUTABLE,
-        ]);
+        foreach ($messages as $key => $message) {
+            $parameters = $this->getInsertParameters($now, ...$message);
+            $size = \strlen($parameters[0]) + \strlen($parameters[1]);
+
+            if ($batch && (self::MAX_BATCH_ROWS === \count($batch) || self::MAX_BATCH_SIZE < $batchSize + $size)) {
+                $batches[] = $batch;
+                $batch = [];
+                $batchSize = 0;
+            }
+
+            $batch[$key] = $parameters;
+            $batchSize += $size;
+        }
+
+        $batches[] = $batch;
+
+        return $this->executeInsert(function () use ($batches, $platform) {
+            $ids = [];
+
+            foreach ($batches as $batch) {
+                $sql = $this->getInsertSql(\count($batch));
+                $parameters = array_merge(...array_values($batch));
+                $types = array_merge(...array_fill(0, \count($batch), self::INSERT_TYPES));
+
+                if ($platform instanceof PostgreSQLPlatform) {
+                    $ids += array_combine(array_keys($batch), array_map(strval(...), $this->driverConnection->fetchFirstColumn($sql.' RETURNING id', $parameters, $types)));
+                } else {
+                    $this->driverConnection->executeStatement($sql, $parameters, $types);
+                }
+            }
+
+            return $ids;
+        });
     }
 
     public function get(int $fetchSize = 1): ?array
@@ -209,7 +269,7 @@ class Connection implements ResetInterface
 
             $doctrineEnvelopes = array_map($this->decodeEnvelopeHeaders(...), $doctrineEnvelopes);
 
-            $now = new \DateTimeImmutable('UTC');
+            $now = \DateTimeImmutable::createFromTimestamp(microtime(true));
 
             if (1 === \count($doctrineEnvelopes)) {
                 $queryBuilder = $this->driverConnection->createQueryBuilder()
@@ -243,7 +303,9 @@ class Connection implements ResetInterface
 
             return $doctrineEnvelopes;
         } catch (\Throwable $e) {
-            $this->driverConnection->rollBack();
+            if ($this->driverConnection->isTransactionActive()) {
+                $this->driverConnection->rollBack();
+            }
 
             if ($this->autoSetup && $e instanceof TableNotFoundException) {
                 $this->setup();
@@ -288,7 +350,7 @@ class Connection implements ResetInterface
                 ->set('delivered_at', '?')
                 ->where('id = ?');
             $this->executeStatement($queryBuilder->getSQL(), [
-                new \DateTimeImmutable('UTC'),
+                \DateTimeImmutable::createFromTimestamp(microtime(true)),
                 $id,
             ], [
                 Types::DATETIME_IMMUTABLE,
@@ -347,6 +409,77 @@ class Connection implements ResetInterface
         );
     }
 
+    /**
+     * Reads the available messages in batches, so that they are not all loaded in memory at once.
+     *
+     * The messages that were never delivered come first, then the ones whose delivery timed out.
+     *
+     * @return \Generator<int, array>
+     */
+    public function findAllInBatches(): \Generator
+    {
+        $now = \DateTimeImmutable::createFromTimestamp(microtime(true));
+
+        if (null === $maxId = $this->executeQuery($this->createQueryBuilder()->select('MAX(m.id)')->getSQL())->fetchOne()) {
+            return;
+        }
+
+        foreach ([false, true] as $deliveryTimedOut) {
+            $queryBuilder = $this->createQueryBuilder()
+                ->where('m.queue_name = ?')
+                ->andWhere('m.available_at <= ?')
+                ->andWhere('m.id <= ?');
+            $parameters = [$this->configuration['queue_name'], $now, $maxId];
+            $types = [Types::STRING, Types::DATETIME_IMMUTABLE, Types::BIGINT];
+
+            // the next batches are read in the order of the index, so the database does not sort the messages that have the same "available_at"
+            if ($deliveryTimedOut) {
+                $queryBuilder->andWhere('m.delivered_at < ?');
+                $parameters[] = $now->modify(\sprintf('-%d seconds', $this->configuration['redeliver_timeout']));
+                $types[] = Types::DATETIME_IMMUTABLE;
+                $orderBy = 'm.delivered_at, m.id';
+                $nextQueryBuilders = [
+                    [(clone $queryBuilder)->andWhere('m.available_at = ?')->andWhere('m.delivered_at = ?')->andWhere('m.id > ?')->orderBy('m.id'), ['available_at', 'delivered_at', 'id']],
+                    [(clone $queryBuilder)->andWhere('m.available_at = ?')->andWhere('m.delivered_at > ?')->orderBy($orderBy), ['available_at', 'delivered_at']],
+                ];
+            } else {
+                // MySQL sorts the messages when "delivered_at" is in the ORDER BY, PostgreSQL and Oracle when it is not
+                $orderBy = $this->driverConnection->getDatabasePlatform() instanceof AbstractMySQLPlatform ? 'm.id' : 'm.delivered_at, m.id';
+                $nextQueryBuilders = [
+                    [(clone $queryBuilder)->andWhere('m.delivered_at IS NULL')->andWhere('m.available_at = ?')->andWhere('m.id > ?')->orderBy($orderBy), ['available_at', 'id']],
+                ];
+                // SQLite sorts the messages that have the same "available_at" unless "delivered_at" is in the ORDER BY and its condition is not written "IS NULL"
+                $queryBuilder->andWhere('NOT (m.delivered_at IS NOT NULL)');
+            }
+
+            $queryBuilder->orderBy('m.available_at, '.$orderBy)->setMaxResults(self::LISTING_BATCH_SIZE);
+            $doctrineEnvelopes = $this->executeQuery($queryBuilder->getSQL(), $parameters, $types)->fetchAllAssociative();
+            $nextQueryBuilders[] = [$queryBuilder->andWhere('m.available_at > ?'), ['available_at']];
+
+            while (true) {
+                foreach ($doctrineEnvelopes as $doctrineEnvelope) {
+                    yield $this->decodeEnvelopeHeaders($doctrineEnvelope);
+                }
+
+                if (self::LISTING_BATCH_SIZE > \count($doctrineEnvelopes)) {
+                    break;
+                }
+
+                $last = end($doctrineEnvelopes);
+                $doctrineEnvelopes = [];
+
+                foreach ($nextQueryBuilders as [$nextQueryBuilder, $columns]) {
+                    $nextQueryBuilder->setMaxResults(self::LISTING_BATCH_SIZE - \count($doctrineEnvelopes));
+                    array_push($doctrineEnvelopes, ...$this->executeQuery($nextQueryBuilder->getSQL(), [...$parameters, ...array_map(static fn (string $column) => $last[$column], $columns)], $types)->fetchAllAssociative());
+
+                    if (self::LISTING_BATCH_SIZE === \count($doctrineEnvelopes)) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     public function find(mixed $id): ?array
     {
         $queryBuilder = $this->createQueryBuilder()
@@ -377,7 +510,7 @@ class Connection implements ResetInterface
 
     private function createAvailableMessagesQueryBuilder(): QueryBuilder
     {
-        $now = new \DateTimeImmutable('UTC');
+        $now = \DateTimeImmutable::createFromTimestamp(microtime(true));
         $redeliverLimit = $now->modify(\sprintf('-%d seconds', $this->configuration['redeliver_timeout']));
 
         return $this->createQueryBuilder()
@@ -448,43 +581,30 @@ class Connection implements ResetInterface
         return $this->driverConnection->executeStatement($sql, $parameters, $types);
     }
 
-    private function executeInsert(string $sql, array $parameters = [], array $types = []): string
+    /**
+     * @template T
+     *
+     * @param \Closure(): T $insert
+     *
+     * @return T
+     */
+    private function executeInsert(\Closure $insert): mixed
     {
-        // Use PostgreSQL RETURNING clause instead of lastInsertId() to get the
-        // inserted id in one operation instead of two.
-        if ($this->driverConnection->getDatabasePlatform() instanceof PostgreSQLPlatform) {
-            $sql .= ' RETURNING id';
-        }
-
         insert:
         $this->driverConnection->beginTransaction();
 
         try {
+            $result = $insert();
+
             if ($this->driverConnection->getDatabasePlatform() instanceof PostgreSQLPlatform) {
-                if (!$id = $this->driverConnection->fetchFirstColumn($sql, $parameters, $types)[0] ?? null) {
-                    throw new TransportException('no id was returned by PostgreSQL from RETURNING clause.');
-                }
-
                 $this->driverConnection->executeStatement('SELECT pg_notify(?, ?)', [$this->configuration['table_name'], $this->configuration['queue_name']]);
-            } elseif ($this->driverConnection->getDatabasePlatform() instanceof OraclePlatform) {
-                $sequenceName = $this->configuration['table_name'].self::ORACLE_SEQUENCES_SUFFIX;
-
-                $this->driverConnection->executeStatement($sql, $parameters, $types);
-
-                if (!$id = (int) $this->driverConnection->fetchOne('SELECT '.$sequenceName.'.CURRVAL FROM DUAL')) {
-                    throw new TransportException('no id was returned by Oracle from sequence: '.$sequenceName);
-                }
-            } else {
-                $this->driverConnection->executeStatement($sql, $parameters, $types);
-
-                if (!$id = $this->driverConnection->lastInsertId()) {
-                    throw new TransportException('lastInsertId() returned false, no id was returned.');
-                }
             }
 
             $this->driverConnection->commit();
         } catch (\Throwable $e) {
-            $this->driverConnection->rollBack();
+            if ($this->driverConnection->isTransactionActive()) {
+                $this->driverConnection->rollBack();
+            }
 
             // handle setup after transaction is no longer open
             if ($this->autoSetup && $e instanceof TableNotFoundException) {
@@ -495,7 +615,63 @@ class Connection implements ResetInterface
             throw $e;
         }
 
+        return $result;
+    }
+
+    private function insert(string $sql, array $parameters, array $types): string
+    {
+        if ($this->driverConnection->getDatabasePlatform() instanceof PostgreSQLPlatform) {
+            // Use PostgreSQL RETURNING clause instead of lastInsertId() to get the
+            // inserted id in one operation instead of two.
+            if (!$id = $this->driverConnection->fetchFirstColumn($sql.' RETURNING id', $parameters, $types)[0] ?? null) {
+                throw new TransportException('no id was returned by PostgreSQL from RETURNING clause.');
+            }
+        } elseif ($this->driverConnection->getDatabasePlatform() instanceof OraclePlatform) {
+            $sequenceName = $this->configuration['table_name'].self::ORACLE_SEQUENCES_SUFFIX;
+
+            $this->driverConnection->executeStatement($sql, $parameters, $types);
+
+            if (!$id = (int) $this->driverConnection->fetchOne('SELECT '.$sequenceName.'.CURRVAL FROM DUAL')) {
+                throw new TransportException('no id was returned by Oracle from sequence: '.$sequenceName);
+            }
+        } else {
+            $this->driverConnection->executeStatement($sql, $parameters, $types);
+
+            if (!$id = $this->driverConnection->lastInsertId()) {
+                throw new TransportException('lastInsertId() returned false, no id was returned.');
+            }
+        }
+
         return $id;
+    }
+
+    private function getInsertSql(int $rows): string
+    {
+        $sql = $this->driverConnection->createQueryBuilder()
+            ->insert($this->configuration['table_name'])
+            ->values([
+                'body' => '?',
+                'headers' => '?',
+                'queue_name' => '?',
+                'created_at' => '?',
+                'available_at' => '?',
+            ])
+            ->getSQL();
+
+        return $sql.str_repeat(', (?, ?, ?, ?, ?)', $rows - 1);
+    }
+
+    private function getInsertParameters(\DateTimeImmutable $now, string $body, array $headers, int $delay = 0): array
+    {
+        $availableAt = $now->modify(\sprintf('%+d milliseconds', $delay));
+
+        if (0 < $delay && 0 !== $availableAt->getMicrosecond()) {
+            // "available_at" is stored with second precision, so a truncated instant would make
+            // the message available before the delay elapsed
+            $availableAt = $availableAt->modify('+1 second');
+        }
+
+        return [$body, json_encode($headers), $this->configuration['queue_name'], $now, $availableAt];
     }
 
     private function getSchema(): Schema

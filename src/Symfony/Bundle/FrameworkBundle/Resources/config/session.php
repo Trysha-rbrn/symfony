@@ -12,6 +12,7 @@
 namespace Symfony\Component\DependencyInjection\Loader\Configurator;
 
 use Symfony\Bundle\FrameworkBundle\Command\SessionClearCommand;
+use Symfony\Component\HttpFoundation\Session\Attribute\AttributeBag;
 use Symfony\Component\HttpFoundation\Session\SessionFactory;
 use Symfony\Component\HttpFoundation\Session\Storage\Handler\AbstractSessionHandler;
 use Symfony\Component\HttpFoundation\Session\Storage\Handler\IdentityMarshaller;
@@ -34,6 +35,15 @@ return static function (ContainerConfigurator $container) {
                 service('request_stack'),
                 service('session.storage.factory'),
                 [service('session_listener'), 'onSessionUsage'],
+                service_closure('session.attribute_bag'),
+            ])
+
+        ->set('session.attribute_bag', AttributeBag::class)
+            ->share(false)
+            ->args([
+                '_sf2_attributes',
+                false,
+                param('kernel.debug'),
             ])
 
         ->set('session.storage.factory.native', NativeSessionStorageFactory::class)
@@ -45,6 +55,7 @@ return static function (ContainerConfigurator $container) {
                         param('session.metadata.storage_key'),
                         param('session.metadata.update_threshold'),
                         param('session.metadata.cookie_lifetime'),
+                        service('clock')->nullOnInvalid(),
                     ]),
                 false,
             ])
@@ -56,6 +67,7 @@ return static function (ContainerConfigurator $container) {
                         param('session.metadata.storage_key'),
                         param('session.metadata.update_threshold'),
                         param('session.metadata.cookie_lifetime'),
+                        service('clock')->nullOnInvalid(),
                     ]),
                 false,
             ])
@@ -68,6 +80,7 @@ return static function (ContainerConfigurator $container) {
                         param('session.metadata.storage_key'),
                         param('session.metadata.update_threshold'),
                         param('session.metadata.cookie_lifetime'),
+                        service('clock')->nullOnInvalid(),
                     ]),
             ])
 
@@ -87,6 +100,7 @@ return static function (ContainerConfigurator $container) {
         ->set('session.abstract_handler', AbstractSessionHandler::class)
             ->factory([SessionHandlerFactory::class, 'createHandler'])
             ->args([abstract_arg('A string or a connection object'), []])
+            ->tag('kernel.reset', ['method' => 'shutdown', 'on_invalid' => 'ignore', 'on_shutdown' => 'only'])
 
         ->set('session_listener', SessionListener::class)
             ->args([

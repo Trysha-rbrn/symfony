@@ -22,13 +22,25 @@ use Symfony\Component\DependencyInjection\ParameterBag\EnvPlaceholderParameterBa
 use Symfony\Component\DependencyInjection\Reference;
 use Symfony\Component\DependencyInjection\ServiceLocator;
 use Symfony\Component\Filesystem\Filesystem;
+use Symfony\Component\Lock\LockFactory;
+use Symfony\Component\Lock\Store\InMemoryStore;
+use Symfony\Component\Messenger\Envelope;
+use Symfony\Component\Messenger\Message\RedispatchMessage;
+use Symfony\Component\Messenger\Stamp\DelayStamp;
+use Symfony\Component\Messenger\Stamp\DispatchAfterCurrentBusStamp;
 use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
 use Symfony\Component\Messenger\Transport\TransportFactory;
 use Symfony\Component\Scheduler\Command\DebugCommand;
+use Symfony\Component\Scheduler\Generator\MessageContext;
 use Symfony\Component\Scheduler\Messenger\SchedulerTransport;
+use Symfony\Component\Scheduler\Messenger\ServiceCallMessage;
+use Symfony\Component\Scheduler\Schedule;
 use Symfony\Component\Scheduler\SchedulerBundle;
 use Symfony\Component\Scheduler\Tests\Fixtures\AttributeScheduleProvider;
 use Symfony\Component\Scheduler\Tests\Fixtures\AttributeTask;
+use Symfony\Component\Scheduler\Tests\Fixtures\AttributeTaskWithStamps;
+
+use function Symfony\Component\DependencyInjection\Loader\Configurator\inline_service;
 
 class SchedulerBundleTest extends TestCase
 {
@@ -54,6 +66,99 @@ class SchedulerBundleTest extends TestCase
         $this->assertInstanceOf(SchedulerTransport::class, $container->get('test.default_transport'));
         $this->assertInstanceOf(DebugCommand::class, $container->get('test.debug_command'));
         $this->assertInstanceOf(ArrayAdapter::class, $container->get('test.cache'));
+    }
+
+    public function testSchedulesAreStatelessByDefault()
+    {
+        $kernel = new TestSchedulerKernel('test', true, $this->varDir);
+        $kernel->boot();
+        $container = $kernel->getContainer();
+
+        foreach (['test.default_schedule', 'test.attributes_schedule'] as $id) {
+            $schedule = $container->get($id)->getSchedule();
+
+            $this->assertNull($schedule->getState());
+            $this->assertNull($schedule->getLock());
+            $this->assertFalse($schedule->shouldProcessOnlyLastMissedRun());
+        }
+    }
+
+    public function testConfiguredScheduleIsStatefulAndLocked()
+    {
+        $kernel = new TestSchedulerKernel('test', true, $this->varDir, [
+            'schedules' => [
+                'default' => [
+                    'cache_pool' => 'cache.scheduler',
+                    'lock_factory' => 'lock.factory',
+                    'process_only_last_missed_run' => true,
+                ],
+                'attributes' => [
+                    'cache_pool' => 'cache.scheduler',
+                ],
+            ],
+        ]);
+        $kernel->boot();
+        $container = $kernel->getContainer();
+
+        $schedule = $container->get('test.default_schedule')->getSchedule();
+        $this->assertInstanceOf(Schedule::class, $schedule);
+        $this->assertCount(1, $schedule->getRecurringMessages());
+        $this->assertSame($container->get('test.cache'), $schedule->getState());
+        $this->assertTrue($schedule->shouldProcessOnlyLastMissedRun());
+
+        $lock = $container->get('test.lock_factory')->createLock('scheduler_default');
+        $this->assertTrue($lock->acquire());
+        $this->assertFalse($schedule->getLock()->acquire());
+        $lock->release();
+
+        $schedule = $container->get('test.attributes_schedule')->getSchedule();
+        $this->assertSame($container->get('test.cache'), $schedule->getState());
+        $this->assertNull($schedule->getLock());
+        $this->assertFalse($schedule->shouldProcessOnlyLastMissedRun());
+    }
+
+    public function testStatefulScheduleUsesTheSchedulerCachePoolAndTheLockFactory()
+    {
+        $kernel = new TestSchedulerKernel('test', true, $this->varDir, [
+            'schedules' => [
+                'default' => ['stateful' => true],
+            ],
+        ]);
+        $kernel->boot();
+        $container = $kernel->getContainer();
+
+        $schedule = $container->get('test.default_schedule')->getSchedule();
+        $this->assertSame($container->get('test.cache'), $schedule->getState());
+        $this->assertFalse($schedule->shouldProcessOnlyLastMissedRun());
+
+        $lock = $container->get('test.lock_factory')->createLock('scheduler_default');
+        $this->assertTrue($lock->acquire());
+        $this->assertFalse($schedule->getLock()->acquire());
+        $lock->release();
+    }
+
+    public function testTaskStampsAreDumpedWithTheContainer()
+    {
+        $kernel = new TestSchedulerKernel('test', true, $this->varDir);
+        $kernel->boot();
+
+        $messages = [];
+        foreach ($kernel->getContainer()->get('test.stamped_schedule')->getSchedule()->getRecurringMessages() as $recurringMessage) {
+            $context = new MessageContext('stamped', $recurringMessage->getId(), $recurringMessage->getTrigger(), new \DateTimeImmutable());
+            array_push($messages, ...$recurringMessage->getMessages($context));
+        }
+
+        [$envelope, $redispatchMessage] = $messages;
+
+        $this->assertInstanceOf(Envelope::class, $envelope);
+        $this->assertInstanceOf(ServiceCallMessage::class, $envelope->getMessage());
+        $this->assertInstanceOf(DispatchAfterCurrentBusStamp::class, $envelope->last(DispatchAfterCurrentBusStamp::class));
+        $this->assertSame(5000, $envelope->last(DelayStamp::class)->getDelay());
+
+        $this->assertInstanceOf(RedispatchMessage::class, $redispatchMessage);
+        $this->assertSame('async', $redispatchMessage->transportNames);
+        $this->assertInstanceOf(ServiceCallMessage::class, $redispatchMessage->envelope->getMessage());
+        $this->assertSame(7000, $redispatchMessage->envelope->last(DelayStamp::class)->getDelay());
     }
 
     public function testServicesAreDroppedWhenMessengerIsNotAvailable()
@@ -87,6 +192,22 @@ class SchedulerBundleTest extends TestCase
         $this->assertFalse($container->hasDefinition('serializer.normalizer.scheduler_trigger'));
     }
 
+    public function testServiceCallMessageHandlerRequiresSignature()
+    {
+        $container = new ContainerBuilder();
+        new SchedulerBundle()->getContainerExtension()->load([['enabled' => true]], $container);
+
+        $this->assertSame([['sign' => true]], $container->getDefinition('scheduler.messenger.service_call_message_handler')->getTag('messenger.message_handler'));
+    }
+
+    public function testDebugCommandUsesTheClockService()
+    {
+        $container = new ContainerBuilder();
+        new SchedulerBundle()->getContainerExtension()->load([['enabled' => true]], $container);
+
+        $this->assertEquals(new Reference('clock'), $container->getDefinition('console.command.scheduler_debug')->getArgument(1));
+    }
+
     public function testUseMessengerRoutingNotSetKeepsTheParameterNull()
     {
         // no deprecation is expected here: it is only triggered lazily by SchedulerTransport,
@@ -109,7 +230,7 @@ class SchedulerBundleTest extends TestCase
         ]);
 
         $this->expectException(\InvalidArgumentException::class);
-        $this->expectExceptionMessage('The "framework.scheduler.use_messenger_routing" option is consumed at compile time and cannot use env vars (got "%env(bool:SCHEDULER_USE_MESSENGER_ROUTING)%"). Set a static boolean instead.');
+        $this->expectExceptionMessage('The "scheduler.use_messenger_routing" option is consumed at compile time and cannot use env vars (got "%env(bool:SCHEDULER_USE_MESSENGER_ROUTING)%"). Set a static boolean instead.');
 
         $container->compile();
     }
@@ -119,7 +240,7 @@ class TestSchedulerKernel extends AbstractKernel
 {
     use KernelTrait;
 
-    public function __construct(string $env, bool $debug, private string $dir)
+    public function __construct(string $env, bool $debug, private string $dir, private array $schedulerConfig = [])
     {
         parent::__construct($env, $debug);
     }
@@ -136,8 +257,14 @@ class TestSchedulerKernel extends AbstractKernel
 
     private function configureContainer(ContainerConfigurator $container): void
     {
+        if ($this->schedulerConfig) {
+            $container->extension('scheduler', $this->schedulerConfig);
+        }
+
         $services = $container->services();
         $services
+            ->set('lock.factory', LockFactory::class)
+                ->args([inline_service(InMemoryStore::class)])
             ->set('messenger.transport_factory', TransportFactory::class)
                 ->args([[new Reference('scheduler.messenger_transport_factory')]])
             ->set('messenger.default_serializer', PhpSerializer::class)
@@ -146,10 +273,15 @@ class TestSchedulerKernel extends AbstractKernel
             ->set('cache.app', ArrayAdapter::class)
             ->set(AttributeScheduleProvider::class)->autoconfigure()
             ->set(AttributeTask::class)->autoconfigure()
+            ->set(AttributeTaskWithStamps::class)->autoconfigure()
             ->alias('test.attributes_transport', 'messenger.transport.scheduler_attributes')->public()
             ->alias('test.default_transport', 'messenger.transport.scheduler_default')->public()
             ->alias('test.debug_command', 'console.command.scheduler_debug')->public()
             ->alias('test.cache', 'cache.scheduler')->public()
+            ->alias('test.lock_factory', 'lock.factory')->public()
+            ->alias('test.default_schedule', 'scheduler.provider.default')->public()
+            ->alias('test.attributes_schedule', AttributeScheduleProvider::class)->public()
+            ->alias('test.stamped_schedule', 'scheduler.provider.stamped')->public()
         ;
     }
 }

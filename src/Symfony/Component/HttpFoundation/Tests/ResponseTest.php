@@ -97,6 +97,19 @@ class ResponseTest extends ResponseTestCase
         $this->assertTrue($response->isCacheable());
     }
 
+    #[DataProvider('providePermanentRedirectStatusCodes')]
+    public function testIsCacheableWithPermanentRedirect(int $statusCode)
+    {
+        $response = new Response('', $statusCode, ['Cache-Control' => 'public, max-age=3600']);
+        $this->assertTrue($response->isCacheable());
+    }
+
+    public static function providePermanentRedirectStatusCodes(): iterable
+    {
+        yield [301];
+        yield [308];
+    }
+
     public function testMustRevalidate()
     {
         $response = new Response();
@@ -1066,16 +1079,12 @@ class ResponseTest extends ResponseTestCase
 
     protected function createDateTimeNow()
     {
-        $date = new \DateTime();
-
-        return $date->setTimestamp(time());
+        return \DateTime::createFromTimestamp(time());
     }
 
     protected function createDateTimeImmutableNow()
     {
-        $date = new \DateTimeImmutable();
-
-        return $date->setTimestamp(time());
+        return \DateTimeImmutable::createFromTimestamp(time());
     }
 
     protected function provideResponse()

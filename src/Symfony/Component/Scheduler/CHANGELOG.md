@@ -4,14 +4,21 @@ CHANGELOG
 8.2
 ---
 
+ * Use the global clock to resolve relative dates in the `$from` and `$until` arguments of `PeriodicalTrigger`
+ * Add a `$clock` argument to `DebugCommand` to resolve relative dates in the `--date` option of `debug:scheduler`
+ * Yield the message of a `RedispatchMessage` with a `RedispatchStamp`, and with a `TransportNamesStamp` when it names transports, instead of the `RedispatchMessage` itself
  * Register the listeners of `before()`, `after()` and `onFailure()` on the schedule itself, and deprecate the `$dispatcher` argument of `Schedule::__construct()`
  * Add `SchedulerBundle`, which provides the `scheduler` configuration and the services previously provided by `FrameworkBundle` under `framework.scheduler`
  * Add a "Next Run In" column to `debug:scheduler` showing the time until the next run
  * Add `env` option to `#[AsCronTask]` and `#[AsPeriodicTask]` to restrict a task to one or more environments
+ * Add `stamps` option to `#[AsCronTask]` and `#[AsPeriodicTask]` to add Messenger stamps to the message scheduling the task
+ * Add `ExcludeTimeOfDayTrigger` to exclude the same time window on every day
  * Deprecate `Schedule::with()`, use `add()` on a new `Schedule` instead
- * Add `$useMessengerRouting` constructor argument to `SchedulerTransport` and `SchedulerTransportFactory`
+ * Add the `scheduler.use_messenger_routing` option and the `$useMessengerRouting` argument of `SchedulerTransport` and `SchedulerTransportFactory`, to send scheduled messages through the Messenger senders configured for their class
+ * Deprecate not setting the `scheduler.use_messenger_routing` option, it will default to `true` in 9.0
  * Add `SerializedTrigger`, the trigger a `MessageContext` carries once its message has crossed a transport
  * Dispatch the scheduled message instead of its `RedispatchMessage` wrapper in `PreRunEvent`, `PostRunEvent` and `FailureEvent`
+ * Add the `schedules` configuration option to make a schedule stateful or locked, and to process only its last missed run
 
 8.1
 ---

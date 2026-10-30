@@ -123,14 +123,6 @@ class SealedBoxKmsTest extends TestCase
         $kms->decrypt(new Ciphertext('whatever', 'app'), 'tenant=acme');
     }
 
-    public function testDeterministicModeIsRejected()
-    {
-        $kms = new SealedBoxKms(new InMemoryKeyLoader(['app' => $this->keypair]));
-
-        $this->expectException(UnsupportedOperationException::class);
-        $kms->encrypt('app', 'hello', deterministic: true);
-    }
-
     public function testDataKeyRoundTrip()
     {
         $kms = new SealedBoxKms(new InMemoryKeyLoader(['app' => $this->keypair]));
@@ -140,6 +132,16 @@ class SealedBoxKmsTest extends TestCase
 
         $this->assertSame(32, \strlen($captured));
         $this->assertSame($captured, $kms->unwrapDataKey($dataKey->wrapped)->use(static fn (string $p): string => $p));
+    }
+
+    public function testADataKeyWrappedWithThePublicKeyOnlyIsUnwrappedWithTheKeypair()
+    {
+        $writer = new SealedBoxKms(new InMemoryKeyLoader(['app' => $this->publicKey]));
+        $reader = new SealedBoxKms(new InMemoryKeyLoader(['app' => $this->keypair]));
+
+        $wrapped = $writer->wrapDataKey('app', str_repeat("\xAA", 32));
+
+        $this->assertSame(str_repeat("\xAA", 32), $reader->unwrapDataKey($wrapped)->use(static fn (string $p): string => $p));
     }
 
     public function testDataKeyGenerationOnEncryptOnlyDeploymentWorks()

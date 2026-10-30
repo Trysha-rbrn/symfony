@@ -13,15 +13,23 @@ namespace Symfony\Component\Notifier\Tests;
 
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use Symfony\Component\DependencyInjection\Attribute\Target;
+use Symfony\Component\DependencyInjection\Compiler\AutowirePass;
 use Symfony\Component\DependencyInjection\Compiler\RemoveMissingDependenciesPass as ContainerRemoveMissingDependenciesPass;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\ContainerInterface;
+use Symfony\Component\DependencyInjection\Definition;
 use Symfony\Component\DependencyInjection\ParameterBag\ParameterBag;
 use Symfony\Component\DependencyInjection\Reference;
+use Symfony\Component\Mime\Header\Headers;
+use Symfony\Component\Notifier\AdminRecipientsProviderInterface;
+use Symfony\Component\Notifier\Bridge\Twilio\Webhook\TwilioRequestParser;
 use Symfony\Component\Notifier\ChatterInterface;
 use Symfony\Component\Notifier\DependencyInjection\RemoveMissingDependenciesPass;
 use Symfony\Component\Notifier\NotifierBundle;
+use Symfony\Component\Notifier\NotifierInterface;
 use Symfony\Component\Notifier\TexterInterface;
+use Symfony\Component\Webhook\Client\RequestParserInterface;
 
 class NotifierBundleTest extends TestCase
 {
@@ -52,6 +60,36 @@ class NotifierBundleTest extends TestCase
         $container = $this->load(self::TRANSPORTS, ['mailer', 'messenger']);
 
         $this->assertSame('sender@example.org', $container->getDefinition('notifier.channel.email')->getArgument(2));
+    }
+
+    #[DataProvider('provideEmailChannelSender')]
+    public function testTheEmailChannelFallsBackToTheFromHeaderOfTheMailer(?string $envelopeSender, array $headers, ?string $expectedSender)
+    {
+        $container = new ContainerBuilder(new ParameterBag(['kernel.debug' => false, 'kernel.bundles' => []]));
+        new NotifierBundle()->getContainerExtension()->load([self::TRANSPORTS], $container);
+        $container->register('mailer.envelope_listener')->setArguments([$envelopeSender]);
+
+        if ($headers) {
+            $definition = new Definition(Headers::class);
+            foreach ($headers as $name => $value) {
+                $definition->addMethodCall('addHeader', [$name, $value]);
+            }
+            $container->register('mailer.message_listener')->setArguments([$definition]);
+        }
+
+        new RemoveMissingDependenciesPass()->process($container);
+
+        $this->assertSame($expectedSender, $container->getDefinition('notifier.channel.email')->getArgument(2));
+    }
+
+    public static function provideEmailChannelSender(): iterable
+    {
+        yield 'From header' => [null, ['From' => ['Conferences <noreply@conferences.example>']], 'Conferences <noreply@conferences.example>'];
+        yield 'header name is case-insensitive' => [null, ['X-Foo' => 'bar', 'from' => ['noreply@conferences.example']], 'noreply@conferences.example'];
+        yield 'envelope sender wins' => ['sender@example.org', ['From' => ['noreply@conferences.example']], 'sender@example.org'];
+        yield 'several From addresses' => [null, ['From' => ['a@conferences.example', 'b@conferences.example']], null];
+        yield 'no From header' => [null, ['X-Foo' => 'bar'], null];
+        yield 'no headers' => [null, [], null];
     }
 
     public function testTheEmailChannelIsDroppedWithoutAMailer()
@@ -173,6 +211,39 @@ class NotifierBundleTest extends TestCase
         yield 'profiler and test' => [['profiler', 'test'], true, false];
     }
 
+    public function testTheWebhookRequestParsersAreAutowiredByTarget()
+    {
+        $container = $this->load();
+        $container->register('test.consumer', NotifierWebhookConsumer::class)->setAutowired(true);
+
+        new AutowirePass()->process($container);
+
+        $this->assertSame(TwilioRequestParser::class, $container->findDefinition((string) $container->getDefinition('test.consumer')->getArgument(0))->getClass());
+        $this->assertTrue($container->getAlias(TwilioRequestParser::class)->isDeprecated());
+    }
+
+    public function testTheWebhookRequestParsersAreGivenTheClock()
+    {
+        $container = $this->load();
+        $clock = new Reference('clock', ContainerInterface::NULL_ON_INVALID_REFERENCE);
+
+        foreach (['sweego', 'vonage'] as $provider) {
+            $this->assertEquals($clock, $container->getDefinition('notifier.webhook.request_parser.'.$provider)->getArgument(0), $provider);
+        }
+    }
+
+    public function testTheAdminRecipientsProviderIsAutowiredToTheNotifier()
+    {
+        $container = $this->load(self::TRANSPORTS);
+        $container->register('test.consumer', NotifierAdminRecipientsConsumer::class)->setAutowired(true);
+
+        new AutowirePass()->process($container);
+
+        [$notifier, $adminRecipients] = $container->getDefinition('test.consumer')->getArguments();
+        $this->assertSame($container->getDefinition('notifier'), $container->findDefinition((string) $notifier));
+        $this->assertSame($container->getDefinition('notifier'), $container->findDefinition((string) $adminRecipients));
+    }
+
     public function testTheDataCollectorIsDroppedWithoutAProfiler()
     {
         $this->assertFalse($this->load(self::TRANSPORTS, ['mailer', 'messenger'], true)->hasDefinition('notifier.data_collector'));
@@ -206,5 +277,22 @@ class NotifierBundleTest extends TestCase
         new RemoveMissingDependenciesPass()->process($container);
 
         return $container;
+    }
+}
+
+class NotifierWebhookConsumer
+{
+    public function __construct(
+        #[Target('notifier.twilio')] public RequestParserInterface $parser,
+    ) {
+    }
+}
+
+class NotifierAdminRecipientsConsumer
+{
+    public function __construct(
+        public NotifierInterface $notifier,
+        public AdminRecipientsProviderInterface $adminRecipients,
+    ) {
     }
 }

@@ -212,6 +212,63 @@ class GlobResourceTest extends TestCase
         $this->assertEquals($p->getValue($resource), $p->getValue($newResource));
     }
 
+    #[TestWith([['prefix', 'pattern', 'recursive', 'hash', 'forExclusion', 'excludedPrefixes', 'directories'], true])]
+    #[TestWith([[0, 1, 2, 3, 4, 5, 6], true])]
+    #[TestWith([[2, 4, 6, 8, 10, 12, 14], true])]
+    #[TestWith([['prefix', 'pattern', 'recursive', 'hash', 'forExclusion', 'excludedPrefixes'], false])]
+    public function testUnserializePreservesValueOrder(array $keys, bool $withDirectories)
+    {
+        $resource = new GlobResource(__DIR__, '/*.php', true, true, [__DIR__.'/excluded' => true]);
+        $expected = $resource->__serialize();
+        $data = $expected;
+        if (!$withDirectories) {
+            unset($data['directories']);
+            $expected['directories'] = null;
+        }
+        $data = array_combine($keys, array_values($data));
+        if ($withDirectories) {
+            $data['extra'] = 'ignored';
+        }
+
+        $restored = (new \ReflectionClass(GlobResource::class))->newInstanceWithoutConstructor();
+        $restored->__unserialize($data);
+
+        $this->assertSame($expected, $restored->__serialize());
+    }
+
+    public function testUnserializePayloadWrittenBySleep()
+    {
+        $resource = new GlobResource(__DIR__, '/*.php', true, true, [__DIR__.'/excluded' => true]);
+        $expected = $resource->__serialize();
+        $expected['directories'] = null;
+
+        $data = [];
+        foreach (['prefix', 'pattern', 'recursive', 'hash', 'forExclusion', 'excludedPrefixes'] as $name) {
+            $data["\0".GlobResource::class."\0".$name] = $expected[$name];
+        }
+
+        $restored = unserialize('O:'.\strlen(GlobResource::class).':"'.GlobResource::class.'"'.substr(serialize($data), 1));
+
+        $this->assertSame($expected, $restored->__serialize());
+    }
+
+    public function testUnserializeRejectsStringableExtraValue()
+    {
+        $resource = new GlobResource(__DIR__, '/*.php', true);
+        $data = $resource->__serialize();
+        $data['extra'] = new class implements \Stringable {
+            public function __toString(): string
+            {
+                throw new \LogicException('Must not be called.');
+            }
+        };
+
+        $this->expectException(\BadMethodCallException::class);
+        $this->expectExceptionMessage('Cannot unserialize '.GlobResource::class);
+
+        $resource->__unserialize($data);
+    }
+
     public function testPhar()
     {
         $s = \DIRECTORY_SEPARATOR;
@@ -445,6 +502,30 @@ class GlobResourceTest extends TestCase
 
         touch($dir.'/Foo/E.php');
         touch($dir.'/Foo', $mtime);
+
+        $this->assertFalse($resource->isFresh(0));
+    }
+
+    public function testSerializedFormDoesNotDependOnDirectoryMtimesWhenSourceDateEpochIsSet()
+    {
+        $dir = $this->createTree(time() - 10);
+        $_SERVER['SOURCE_DATE_EPOCH'] = '1700000000';
+
+        try {
+            $serialized = serialize(new GlobResource($dir, '', true));
+
+            foreach (['', '/Foo', '/Foo/Bar', '/Excluded', '/Empty'] as $path) {
+                touch($dir.$path, time() - 20);
+            }
+            clearstatcache();
+
+            $this->assertSame($serialized, serialize(new GlobResource($dir, '', true)));
+        } finally {
+            unset($_SERVER['SOURCE_DATE_EPOCH']);
+        }
+
+        $resource = unserialize($serialized);
+        touch($dir.'/Foo/E.php');
 
         $this->assertFalse($resource->isFresh(0));
     }

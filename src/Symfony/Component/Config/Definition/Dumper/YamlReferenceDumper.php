@@ -123,6 +123,10 @@ class YamlReferenceDumper
             $comments[] = \sprintf('Deprecated (%s)', $node->getDeprecationMessage($parentNode));
         }
 
+        if ($node instanceof BaseNode && null !== $alias = $node->getAttribute('alias_of')) {
+            $comments[] = \sprintf('Alias of the "%s" configuration', $alias);
+        }
+
         // example
         if ($example && !\is_array($example)) {
             $comments[] = 'Example: '.Inline::dump($example);
@@ -151,6 +155,9 @@ class YamlReferenceDumper
 
             $this->writeLine('# '.$message.':', $depth * 4 + 4);
 
+            array_walk_recursive($defaultArray, static function (&$value) {
+                $value = Inline::dump($value);
+            });
             $this->writeArray($defaultArray, $depth + 1);
         }
 
@@ -188,7 +195,7 @@ class YamlReferenceDumper
 
         foreach ($array as $key => $value) {
             if (\is_array($value)) {
-                $val = '';
+                $val = $value ? '' : '[]';
             } else {
                 $val = $value;
             }
@@ -198,7 +205,7 @@ class YamlReferenceDumper
             if ($isIndexed) {
                 $this->writeLine($prefix.'- '.$val, $depth * 4);
             } else {
-                $this->writeLine(\sprintf('%s%-20s %s', $prefix, $key.':', $val), $depth * 4);
+                $this->writeLine(\sprintf('%s%-20s %s', $prefix, Inline::dump($key).':', $val), $depth * 4);
             }
 
             if (\is_array($value)) {

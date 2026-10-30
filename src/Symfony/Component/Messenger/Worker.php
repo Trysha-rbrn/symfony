@@ -15,6 +15,8 @@ use Psr\EventDispatcher\EventDispatcherInterface;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Clock\Clock;
 use Symfony\Component\Clock\ClockInterface;
+use Symfony\Component\Messenger\Cooldown\CooldownStatus;
+use Symfony\Component\Messenger\Cooldown\CooldownStrategyInterface;
 use Symfony\Component\Messenger\Event\WorkerMessageFailedEvent;
 use Symfony\Component\Messenger\Event\WorkerMessageHandledEvent;
 use Symfony\Component\Messenger\Event\WorkerMessageReceivedEvent;
@@ -22,9 +24,13 @@ use Symfony\Component\Messenger\Event\WorkerRateLimitedEvent;
 use Symfony\Component\Messenger\Event\WorkerRunningEvent;
 use Symfony\Component\Messenger\Event\WorkerStartedEvent;
 use Symfony\Component\Messenger\Event\WorkerStoppedEvent;
+use Symfony\Component\Messenger\Event\WorkerTransportCoolingDownEvent;
+use Symfony\Component\Messenger\Exception\DelayedMessageHandlingException;
 use Symfony\Component\Messenger\Exception\EnvelopeAwareExceptionInterface;
+use Symfony\Component\Messenger\Exception\HandlerFailedException;
 use Symfony\Component\Messenger\Exception\RejectRedeliveredMessageException;
 use Symfony\Component\Messenger\Exception\RuntimeException;
+use Symfony\Component\Messenger\Exception\TransportException;
 use Symfony\Component\Messenger\Execution\DeferredBatchMessageQueue;
 use Symfony\Component\Messenger\Execution\MessageExecutionStrategyInterface;
 use Symfony\Component\Messenger\Execution\SyncMessageExecutionStrategy;
@@ -32,6 +38,7 @@ use Symfony\Component\Messenger\Stamp\AckStamp;
 use Symfony\Component\Messenger\Stamp\BusNameStamp;
 use Symfony\Component\Messenger\Stamp\ConsumedByWorkerStamp;
 use Symfony\Component\Messenger\Stamp\FlushBatchHandlersStamp;
+use Symfony\Component\Messenger\Stamp\HandledStamp;
 use Symfony\Component\Messenger\Stamp\NoAutoAckStamp;
 use Symfony\Component\Messenger\Stamp\ReceivedStamp;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
@@ -56,11 +63,16 @@ class Worker
      * @var \SplObjectStorage<object, array{0: string, 1: Envelope}>
      */
     private \SplObjectStorage $keepalives;
+    /**
+     * @var array<string, CooldownStatus> The statuses of the transports the worker skips because they are cooling down
+     */
+    private array $coolingDownTransports = [];
 
     private readonly MessageExecutionStrategyInterface $messageExecutionStrategy;
 
     /**
-     * @param ReceiverInterface[] $receivers Where the key is the transport name
+     * @param ReceiverInterface[]         $receivers          Where the key is the transport name
+     * @param CooldownStrategyInterface[] $cooldownStrategies Where the key is the transport name
      */
     public function __construct(
         private array $receivers,
@@ -70,6 +82,7 @@ class Worker
         private ?array $rateLimiters = null,
         private ClockInterface $clock = new Clock(),
         ?MessageExecutionStrategyInterface $messageExecutionStrategy = null,
+        private array $cooldownStrategies = [],
     ) {
         $this->metadata = new WorkerMetadata([
             'transportNames' => array_keys($receivers),
@@ -84,6 +97,7 @@ class Worker
      * Valid options are:
      *  * sleep (default: 1000000): Time in microseconds to sleep after no messages are found
      *  * time_limit: The time limit in seconds the worker can handle new messages
+     *  * stop_when_empty (default: false): Whether to stop once the receivers have no message left (a receiver cooling down or failing to fetch counts as having none), after handling the messages in flight and the pending batches
      *  * queues: The queue names to consume from, instead of consuming from all queues. When this is used, all receivers must implement the QueueReceiverInterface
      */
     public function run(array $options = []): void
@@ -91,13 +105,15 @@ class Worker
         $options = array_merge([
             'sleep' => 1000000,
             'time_limit' => null,
+            'stop_when_empty' => false,
         ], $options);
         $queueNames = $options['queues'] ?? null;
-        $endTime = null !== $options['time_limit'] ? $this->clock->now()->format('U.u') + $options['time_limit'] : null;
+        $endTime = null !== $options['time_limit'] ? $this->now() + $options['time_limit'] : null;
         $bufferedEnvelopes = [];
 
         $this->metadata->set(['queueNames' => $queueNames]);
 
+        $this->logger?->info('Starting worker.', ['transport_names' => $this->metadata->getTransportNames()]);
         $this->eventDispatcher?->dispatch(new WorkerStartedEvent($this, null === $endTime ? null : (float) $endTime, $options['sleep']));
 
         if ($queueNames) {
@@ -110,13 +126,13 @@ class Worker
         }
 
         while (!$this->shouldStop) {
-            if (null !== $endTime && $this->clock->now()->format('U.u') >= $endTime) {
+            if (null !== $endTime && $this->now() >= $endTime) {
                 $this->logger?->info('Worker stopped due to time limit of {timeLimit}s exceeded', ['timeLimit' => $options['time_limit']]);
                 break;
             }
 
             $envelopeHandled = false;
-            $envelopeHandledStart = $this->clock->now();
+            $envelopeHandledStart = $this->now();
             $fetchSize = max(1, $options['fetch_size'] ?? 1);
 
             if ($this->messageExecutionStrategy->shouldPauseConsumption()
@@ -139,15 +155,27 @@ class Worker
                     // advance past the last handled envelope now that the worker is ready
                     // again; lazy receivers fetch from the broker only at this point
                     $envelopes->next();
+
+                    // the buffer is drained: poll the receivers again, in their order of priority
+                    if (!$envelopes->valid()) {
+                        continue 2;
+                    }
                 } else {
-                    if ($queueNames) {
-                        /** @var QueueReceiverInterface $receiver */
-                        $envelopes = $receiver->getFromQueues($queueNames, $fetchSize);
-                    } else {
-                        $envelopes = $receiver->get($fetchSize);
+                    $status = ($this->cooldownStrategies[$transportName] ?? null)?->checkStatus($transportName);
+
+                    if ($status?->isCoolingDown()) {
+                        if (!isset($this->coolingDownTransports[$transportName])) {
+                            $this->eventDispatcher?->dispatch(new WorkerTransportCoolingDownEvent($transportName, $status));
+                        }
+
+                        $this->coolingDownTransports[$transportName] = $status;
+
+                        continue;
                     }
 
-                    $envelopes = (static fn () => yield from $envelopes)();
+                    unset($this->coolingDownTransports[$transportName]);
+
+                    $envelopes = $this->fetch($transportName, $receiver, $queueNames, $fetchSize);
                     $envelopes->rewind();
                 }
 
@@ -187,19 +215,49 @@ class Worker
             }
 
             if (!$this->flush(30.0) && !$envelopeHandled) {
+                if ($options['stop_when_empty']) {
+                    // the messages in flight and the pending batches can dispatch new messages
+                    if ($this->flush(true)) {
+                        continue;
+                    }
+
+                    if ($this->coolingDownTransports) {
+                        $this->logger?->info('Worker stopped because no message was available outside of the transports that are cooling down: {transports}', ['transports' => implode(', ', array_keys($this->coolingDownTransports))]);
+                    } else {
+                        $this->logger?->info('Worker stopped because no message was available');
+                    }
+
+                    break;
+                }
+
                 $this->eventDispatcher?->dispatch(new WorkerRunningEvent($this, true));
 
                 if ($this->shouldStop) {
                     continue;
                 }
 
-                if (0 < $sleep = (int) ($options['sleep'] - 1e6 * ($this->clock->now()->format('U.u') - $envelopeHandledStart->format('U.u')))) {
+                if (0 < $sleep = (int) ($options['sleep'] - 1e6 * ($this->now() - $envelopeHandledStart))) {
                     if (null !== $endTime) {
-                        $sleep = min($sleep, (int) (1e6 * ($endTime - $this->clock->now()->format('U.u'))));
+                        $sleep = min($sleep, (int) ceil(1e6 * ($endTime - $this->now())));
+                    }
+
+                    foreach ($this->coolingDownTransports as $status) {
+                        if ($end = $status->getEnd()) {
+                            $sleep = (int) min($sleep, ceil(1e6 * ((float) $end->format('U.u') - $this->now())));
+                        }
                     }
 
                     if (0 < $sleep) {
-                        $this->clock->sleep($sleep / 1e6);
+                        $sleepStart = $this->now();
+
+                        // messages in flight are acknowledged as soon as they are handled, instead of after the sleep
+                        if (!$this->messageExecutionStrategy->wait($this->preAck(...), $sleep / 1e6)) {
+                            $sleep -= (int) (1e6 * ($this->now() - $sleepStart));
+
+                            if (0 < $sleep) {
+                                $this->clock->sleep($sleep / 1e6);
+                            }
+                        }
                     }
                 }
             }
@@ -207,6 +265,30 @@ class Worker
 
         $this->flush(true);
         $this->eventDispatcher?->dispatch(new WorkerStoppedEvent($this));
+    }
+
+    /**
+     * @return \Generator<Envelope>
+     */
+    private function fetch(string $transportName, ReceiverInterface $receiver, ?array $queueNames, int $fetchSize): \Generator
+    {
+        try {
+            if ($queueNames) {
+                /** @var QueueReceiverInterface $receiver */
+                $envelopes = $receiver->getFromQueues($queueNames, $fetchSize);
+            } else {
+                $envelopes = $receiver->get($fetchSize);
+            }
+
+            yield from $envelopes;
+        } catch (TransportException $e) {
+            if (!$cooldownStrategy = $this->cooldownStrategies[$transportName] ?? null) {
+                throw $e;
+            }
+
+            $this->logger?->warning('Fetching messages from transport {transport} failed: {error}', ['transport' => $transportName, 'error' => $e->getMessage(), 'exception' => $e]);
+            $cooldownStrategy->recordFailure($transportName, null, $e);
+        }
     }
 
     private function handleMessage(Envelope $envelope, string $transportName, ?string $busName = null): void
@@ -230,9 +312,9 @@ class Worker
         );
     }
 
-    private function enqueueAck(string $transportName, Envelope $envelope, ?\Throwable $e = null): void
+    private function enqueueAck(string $transportName, Envelope $envelope, ?\Throwable $e = null, ?\Closure $combine = null): void
     {
-        $this->acks[] = [$transportName, $envelope, $e];
+        $this->acks[] = [$transportName, $envelope, $e, $combine];
     }
 
     private function preAck(Envelope $envelope, string $transportName, bool &$acked, ?\Throwable $e = null): void
@@ -243,7 +325,9 @@ class Worker
             $this->acks[] = [$transportName, $envelope, $e];
         } elseif ($noAutoAckStamp) {
             $this->unacks ??= new DeferredBatchMessageQueue();
-            $this->unacks->add($noAutoAckStamp->getHandlerDescriptor()->getBatchHandler(), $transportName, $envelope->withoutAll(AckStamp::class), $acked, (float) $this->clock->now()->format('U.u'));
+            foreach ($envelope->all(NoAutoAckStamp::class) as $stamp) {
+                $this->unacks->add($stamp->getHandlerDescriptor()->getBatchHandler(), $transportName, $envelope, $acked, $this->now());
+            }
         }
 
         $this->ack();
@@ -254,7 +338,12 @@ class Worker
         $acks = $this->acks;
         $this->acks = [];
 
-        foreach ($acks as [$transportName, $envelope, $e]) {
+        foreach ($acks as $ack) {
+            if (isset($ack[3]) && !$ack = $ack[3]([$ack])) {
+                continue;
+            }
+
+            [$transportName, $envelope, $e] = $ack;
             $receiver = $this->receivers[$transportName];
 
             if (null !== $e) {
@@ -269,6 +358,11 @@ class Worker
                     $envelope = $e->getEnvelope();
                 }
 
+                if ($e instanceof DelayedMessageHandlingException) {
+                    // a retry must run the handlers again, so that they dispatch the delayed messages that failed again
+                    $envelope = $envelope->withoutAll(HandledStamp::class);
+                }
+
                 $failedEvent = new WorkerMessageFailedEvent($envelope, $transportName, $e);
 
                 $this->eventDispatcher?->dispatch($failedEvent);
@@ -276,8 +370,16 @@ class Worker
 
                 if (!$rejectFirst) {
                     unset($this->keepalives[$envelope->getMessage()]);
-                    $receiver->reject($envelope);
+
+                    if ($failedEvent->willRetry()) {
+                        $receiver->ack($envelope);
+                    } else {
+                        $receiver->reject($envelope);
+                    }
                 }
+
+                // the strategy gets the envelope stamped by the listeners of the failed event, the retry listener included
+                ($this->cooldownStrategies[$transportName] ?? null)?->recordFailure($transportName, $envelope, $e);
 
                 continue;
             }
@@ -297,6 +399,7 @@ class Worker
 
             unset($this->keepalives[$envelope->getMessage()]);
             $receiver->ack($envelope);
+            ($this->cooldownStrategies[$transportName] ?? null)?->recordSuccess($transportName, $envelope);
         }
 
         return (bool) $acks;
@@ -333,7 +436,7 @@ class Worker
             return $flushed;
         }
 
-        $unacks = $this->unacks->popFlushable($force, (float) $this->clock->now()->format('U.u'));
+        $unacks = $this->unacks->popFlushable($force, $this->now());
 
         if (!$unacks->count()) {
             return $flushed;
@@ -347,12 +450,29 @@ class Worker
             }
             $transportName = $deferredMessage->context;
             $envelope = $deferredMessage->envelope;
+            $heldAcks = \count($this->acks);
             try {
                 $e = null;
-                $this->bus->dispatch($envelope->with(new FlushBatchHandlersStamp(true === $force || !\is_bool($force))));
+                $this->bus->dispatch($envelope->withoutAll(AckStamp::class)->with(new FlushBatchHandlersStamp(true === $force || !\is_bool($force))));
             } catch (\Throwable $e) {
+                $this->failHeldAcks($heldAcks);
+
                 if (!$deferredMessage->acked) {
-                    $this->acks[] = [$transportName, $envelope->withoutAll(NoAutoAckStamp::class), $e];
+                    $envelope = $envelope->withoutAll(NoAutoAckStamp::class);
+
+                    if ($e instanceof HandlerFailedException) {
+                        // a retry must run the batch handlers whose flush failed
+                        $failed = $e->getWrappedExceptions();
+                        $envelope = $envelope->withoutAll(HandledStamp::class)->with(...array_filter($envelope->all(HandledStamp::class), static fn (HandledStamp $stamp) => !isset($failed[$stamp->getHandlerName()])));
+                        $e = new HandlerFailedException($envelope, $failed);
+                    }
+
+                    if ($ackStamp = $envelope->last(AckStamp::class)) {
+                        // the acks that the batch sent during the flush come first, and this failure is ignored when they already gave the message its outcome
+                        $ackStamp->ack($envelope, $e);
+                    } else {
+                        $this->acks[] = [$transportName, $envelope, $e];
+                    }
                 }
                 continue;
             }
@@ -366,7 +486,7 @@ class Worker
                 $this->acks[] = [$transportName, $envelope, $e];
             } elseif ($noAutoAckStamp) {
                 $this->unacks ??= new DeferredBatchMessageQueue();
-                $this->unacks->add($noAutoAckStamp->getHandlerDescriptor()->getBatchHandler(), $transportName, $envelope->withoutAll(AckStamp::class), $deferredMessage->acked, (float) $this->clock->now()->format('U.u'));
+                $this->unacks->add($noAutoAckStamp->getHandlerDescriptor()->getBatchHandler(), $transportName, $envelope, $deferredMessage->acked, $this->now());
             }
         }
 
@@ -410,5 +530,33 @@ class Worker
     public function getMetadata(): WorkerMetadata
     {
         return $this->metadata;
+    }
+
+    private function now(): float
+    {
+        $now = $this->clock->now();
+
+        return \PHP_INT_SIZE >= 8 ? $now->getTimestamp() + $now->getMicrosecond() / 1e6 : (float) $now->format('U.u');
+    }
+
+    /**
+     * Turns the acks that messages sent during a failed dispatch into failures.
+     *
+     * Their batch was flushed during that dispatch, so what the batch did for them may have been undone.
+     * The acks held from $offset on are the ones sent during that dispatch.
+     */
+    private function failHeldAcks(int $offset): void
+    {
+        foreach (\array_slice($this->acks, $offset, null, true) as $i => [$transportName, $envelope, $e]) {
+            if (null !== $e || !$stamp = $envelope->last(HandledStamp::class)) {
+                continue;
+            }
+
+            $stamps = $envelope->all(HandledStamp::class);
+            array_pop($stamps);
+            $envelope = $envelope->withoutAll(HandledStamp::class)->with(...$stamps);
+            $e = new RuntimeException(\sprintf('The batch of "%s" was flushed during the dispatch of another message, and that dispatch failed.', $stamp->getHandlerName()));
+            $this->acks[$i] = [$transportName, $envelope, new HandlerFailedException($envelope, [$stamp->getHandlerName() => $e])] + $this->acks[$i];
+        }
     }
 }

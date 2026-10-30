@@ -57,6 +57,7 @@ class HttpKernel implements HttpKernelInterface, TerminableInterface
     protected RequestStack $requestStack;
     private ArgumentResolverInterface $argumentResolver;
     private bool $terminating = false;
+    private ?\WeakReference $terminateException = null;
 
     public function __construct(
         protected EventDispatcherInterface $dispatcher,
@@ -115,6 +116,10 @@ class HttpKernel implements HttpKernelInterface, TerminableInterface
         try {
             $this->terminating = true;
             $this->dispatcher->dispatch(new TerminateEvent($this, $request, $response), KernelEvents::TERMINATE);
+        } catch (\Throwable $e) {
+            $this->terminateException = \WeakReference::create($e);
+
+            throw $e;
         } finally {
             $this->terminating = false;
         }
@@ -133,9 +138,14 @@ class HttpKernel implements HttpKernelInterface, TerminableInterface
             $this->requestStack->push($request);
         }
 
+        $terminating = $this->terminating;
+        $this->terminating = $terminating || $exception === $this->terminateException?->get();
+
         try {
             $response = $this->handleThrowable($exception, $request, self::MAIN_REQUEST);
         } finally {
+            $this->terminating = $terminating;
+
             if ($pop) {
                 $this->requestStack->pop();
             }
@@ -196,6 +206,8 @@ class HttpKernel implements HttpKernelInterface, TerminableInterface
 
             if ($event->hasResponse()) {
                 $response = $event->getResponse();
+            } elseif (null === $response && 'void' === (string) $controllerMetadata->getReflector()->getReturnType()) {
+                $response = new Response('', Response::HTTP_NO_CONTENT);
             } else {
                 $msg = \sprintf('The controller must return a "Symfony\Component\HttpFoundation\Response" object but it returned %s.', $this->varToString($response));
 
@@ -204,7 +216,7 @@ class HttpKernel implements HttpKernelInterface, TerminableInterface
                     $msg .= ' Did you forget to add a return statement somewhere in your controller?';
                 }
 
-                throw new ControllerDoesNotReturnResponseException($msg, $controller, __FILE__, __LINE__ - 17);
+                throw new ControllerDoesNotReturnResponseException($msg, $controller, __FILE__, __LINE__ - 19);
             }
         }
 

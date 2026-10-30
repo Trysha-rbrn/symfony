@@ -13,7 +13,6 @@ namespace Symfony\Component\KeyManagement;
 
 use Symfony\Component\KeyManagement\Exception\DecryptionFailedException;
 use Symfony\Component\KeyManagement\Exception\LogicException;
-use Symfony\Component\KeyManagement\Exception\RuntimeException;
 
 /**
  * High-level envelope encryption helper.
@@ -51,26 +50,15 @@ use Symfony\Component\KeyManagement\Exception\RuntimeException;
  * Backends declining {@see DataKeyGeneratorInterface} are only usable through
  * the direct path.
  *
- * Envelopes are always randomized, and there is no deterministic counterpart
- * to {@see EncrypterInterface::encrypt()}'s `$deterministic` flag here. Stable
- * output would require a stable data key, which `generateDataKey()` refuses to
- * return by contract, and a deterministic wrapping, which AWS KMS, Azure Key
- * Vault, Google Cloud KMS and Vault Transit all decline since they draw a
- * random nonce when they wrap. Deriving the nonce alone would leave the
- * envelope varying from call to call anyway. When equal plaintexts must yield
- * equal ciphertexts, for instance to look up an encrypted column, encrypt
- * through the direct path on a backend that offers the flag, or keep a blind
- * index (an HMAC of the plaintext) in a sibling column.
+ * Envelopes use a fresh data key and random nonce for each payload.
+ * Use a blind index in a sibling column for equality lookups.
  *
- * AAD handling: the `$aad` argument is forwarded BOTH to the KMS (binding
- * the wrapped data key) and to the local AEAD (binding the bulk ciphertext).
- * The double binding is defense in depth: the local AEAD always catches
- * AAD mismatches even on backends where the KMS can't enforce them. Note
- * that some backends require a specific key shape for KMS-side AAD: e.g.
- * Vault Transit only accepts a `context` for keys created with
- * `derived=true` and rejects it on plain symmetric keys. Passing a
- * non-empty `$aad` to a non-derived Vault key will surface as a
- * RuntimeException at encrypt time.
+ * The `$aad` argument authenticates the bulk ciphertext through the local AEAD.
+ * The AEAD also authenticates the format id, master key id and wrapped data key.
+ * The AAD isn't forwarded to the KMS, so wrapping the data key doesn't authenticate the AAD.
+ * A mismatch is refused on every backend, including backends that don't support AAD.
+ * A self-contained envelope can't use a KMS policy conditioned on the AAD, such as AWS KMS `kms:EncryptionContext`.
+ * A data key store can bind a context at the backend, {@see DataKeyStoreInterface}.
  *
  * @author Florent Morselli <florent.morselli@spomky-labs.com>
  *
@@ -95,10 +83,10 @@ final class EnvelopeEncrypter implements EnvelopeEncrypterInterface, EnvelopeDec
     public function encrypt(string $key, #[\SensitiveParameter] string $plaintext, string $aad = ''): Envelope
     {
         $format = $this->format;
-        $dataKey = $this->kms->generateDataKey($key, $format->keyBytes(), $aad);
+        $dataKey = $this->kms->generateDataKey($key, $format->keyBytes());
         $iv = random_bytes($format->ivBytes());
 
-        [$ciphertext, $tag] = $dataKey->use(static fn (#[\SensitiveParameter] string $dek): array => self::seal($format, $dek, $plaintext, $iv, $aad));
+        [$ciphertext, $tag] = $dataKey->use(static fn (#[\SensitiveParameter] string $dek): array => self::seal($format, $dek, $plaintext, $iv, $aad, $dataKey->wrapped->keyId, $dataKey->wrapped->blob));
 
         return Envelope::selfContained($dataKey->wrapped->keyId, $dataKey->wrapped->blob, $iv, $tag, $ciphertext);
     }
@@ -113,7 +101,7 @@ final class EnvelopeEncrypter implements EnvelopeEncrypterInterface, EnvelopeDec
             throw new LogicException(\sprintf('The envelope refers to a stored data key, which "%s" cannot resolve.', self::class));
         }
 
-        $dataKey = $this->kms->unwrapDataKey(new Ciphertext($envelope->wrappedDek, $envelope->keyId), $aad);
+        $dataKey = $this->kms->unwrapDataKey(new Ciphertext($envelope->wrappedDek, $envelope->keyId));
 
         return $dataKey->use(static fn (#[\SensitiveParameter] string $dek): string => self::open($envelope, $dek, $aad));
     }

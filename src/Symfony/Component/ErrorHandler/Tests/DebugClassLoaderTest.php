@@ -618,6 +618,40 @@ class DebugClassLoaderTest extends TestCase
         ], $deprecations);
     }
 
+    public function testReturnTypeFromTemplate()
+    {
+        $deprecations = [];
+        set_error_handler(static function ($type, $msg) use (&$deprecations) { $deprecations[] = $msg; });
+        $e = error_reporting(\E_USER_DEPRECATED);
+
+        class_exists('Test\\'.TemplatedReturnType::class, true);
+
+        error_reporting($e);
+        restore_error_handler();
+
+        $this->assertSame([
+            'Method "Symfony\Component\ErrorHandler\Tests\Fixtures\TemplatedReturnTypeInterface::arrayOfTemplates()" might add "array" as a native return type declaration in the future. Do the same in implementation "Test\Symfony\Component\ErrorHandler\Tests\TemplatedReturnType" now to avoid errors or add an explicit @return annotation to suppress this message.',
+            'Method "Symfony\Component\ErrorHandler\Tests\Fixtures\TemplatedReturnTypeInterface::notTemplated()" might add "string" as a native return type declaration in the future. Do the same in implementation "Test\Symfony\Component\ErrorHandler\Tests\TemplatedReturnType" now to avoid errors or add an explicit @return annotation to suppress this message.',
+        ], $deprecations);
+    }
+
+    public function testReturnTypeFromTemplateOverridingAnInheritedOne()
+    {
+        $deprecations = [];
+        set_error_handler(static function ($type, $msg) use (&$deprecations) { $deprecations[] = $msg; });
+        $e = error_reporting(\E_USER_DEPRECATED);
+
+        class_exists('Test\\'.ExtendsTemplatedReturnTypeParent::class, true);
+        class_exists(ExtendsTemplatedReturnTypeParent::class, true);
+
+        error_reporting($e);
+        restore_error_handler();
+
+        $this->assertSame([
+            'Method "Test\Symfony\Component\ErrorHandler\Tests\TemplatedReturnTypeParent::current()" might add "mixed" as a native return type declaration in the future. Do the same in child class "Symfony\Component\ErrorHandler\Tests\ExtendsTemplatedReturnTypeParent" now to avoid errors or add an explicit @return annotation to suppress this message.',
+        ], $deprecations);
+    }
+
     public function testReturnTypePhp83()
     {
         $deprecations = [];
@@ -692,6 +726,109 @@ class DebugClassLoaderTest extends TestCase
         $this->assertSame([
             'The "Symfony\Component\ErrorHandler\Tests\Fixtures\FinalConstant\FinalConstantsInterface::OVERRIDDEN_FINAL_INTERFACE" constant is considered final. You should not override it in "Symfony\Component\ErrorHandler\Tests\Fixtures\FinalConstant\OverrideFinalConstant81".',
             'The "Symfony\Component\ErrorHandler\Tests\Fixtures\FinalConstant\FinalConstantsInterface2::OVERRIDDEN_FINAL_INTERFACE_2" constant is considered final. You should not override it in "Symfony\Component\ErrorHandler\Tests\Fixtures\FinalConstant\OverrideFinalConstant81".',
+        ], $deprecations);
+    }
+
+    public function testAttributeWithMissingUse()
+    {
+        $deprecations = [];
+        set_error_handler(static function ($type, $msg) use (&$deprecations) { $deprecations[] = $msg; });
+        $e = error_reporting(\E_USER_DEPRECATED);
+        $autoloaded = [];
+        $spy = static function ($class) use (&$autoloaded) { $autoloaded[] = $class; };
+        spl_autoload_register($spy, true, true);
+
+        try {
+            class_exists(Fixtures\AttributeWithMissingUse::class, true);
+        } finally {
+            spl_autoload_unregister($spy);
+            error_reporting($e);
+            restore_error_handler();
+        }
+
+        $this->assertSame([
+            'Attribute "Symfony\Component\ErrorHandler\Tests\Fixtures\MissingClassAttribute" used on "Symfony\Component\ErrorHandler\Tests\Fixtures\AttributeWithMissingUse" does not exist. Did you forget a "use" statement?',
+            'Attribute "Symfony\Component\ErrorHandler\Tests\Fixtures\MissingConstantAttribute" used on "Symfony\Component\ErrorHandler\Tests\Fixtures\AttributeWithMissingUse::FOO" does not exist. Did you forget a "use" statement?',
+            'Attribute "Symfony\Component\ErrorHandler\Tests\Fixtures\MissingPropertyAttribute" used on "Symfony\Component\ErrorHandler\Tests\Fixtures\AttributeWithMissingUse::$prop" does not exist. Did you forget a "use" statement?',
+            'Attribute "Symfony\Component\ErrorHandler\Tests\Fixtures\MissingParameterAttribute" used on "Symfony\Component\ErrorHandler\Tests\Fixtures\AttributeWithMissingUse::method($param)" does not exist. Did you forget a "use" statement?',
+        ], $deprecations);
+        $this->assertNotContains('Some\Vendor\MissingAttribute', $autoloaded);
+    }
+
+    public function testAttributeWithMissingAliasUse()
+    {
+        $deprecations = [];
+        set_error_handler(static function ($type, $msg) use (&$deprecations) { $deprecations[] = $msg; });
+        $e = error_reporting(\E_USER_DEPRECATED);
+
+        class_exists(Fixtures\AttributeWithMissingAliasUse::class, true);
+
+        error_reporting($e);
+        restore_error_handler();
+
+        $this->assertSame([
+            'Attribute "Symfony\Component\ErrorHandler\Tests\Fixtures\Assert\NotBlank" used on "Symfony\Component\ErrorHandler\Tests\Fixtures\AttributeWithMissingAliasUse::$prop" does not exist. Did you forget a "use" statement?',
+        ], $deprecations);
+    }
+
+    public function testAttributeWhoseFileDeclaresAnotherClassThrows()
+    {
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('The autoloader expected class "Symfony\Component\ErrorHandler\Tests\Fixtures\MisnamedAttribute" to be defined in file');
+
+        class_exists(Fixtures\AttributeWithMisnamedClass::class, true);
+    }
+
+    public function testAttributeWhoseClassCannotBeDeclaredIsReported()
+    {
+        $deprecations = [];
+        set_error_handler(static function ($type, $msg) use (&$deprecations) { $deprecations[] = $msg; });
+        $e = error_reporting(\E_USER_DEPRECATED);
+
+        class_exists(Fixtures\AttributeWithUnloadableClass::class, true);
+
+        error_reporting($e);
+        restore_error_handler();
+
+        $this->assertSame([
+            'Attribute "Symfony\Component\ErrorHandler\Tests\Fixtures\UnloadableAttribute" used on "Symfony\Component\ErrorHandler\Tests\Fixtures\AttributeWithUnloadableClass" cannot be loaded: Class "Some\Vendor\MissingParent" not found',
+        ], $deprecations);
+    }
+
+    public function testAttributeWithMissingUseInTraitIsReportedOnTheTraitOnly()
+    {
+        $deprecations = [];
+        set_error_handler(static function ($type, $msg) use (&$deprecations) { $deprecations[] = $msg; });
+        $e = error_reporting(\E_USER_DEPRECATED);
+
+        class_exists(Fixtures\UsesAttributeWithMissingUseTrait::class, true);
+
+        error_reporting($e);
+        restore_error_handler();
+
+        $this->assertSame([
+            'Attribute "Symfony\Component\ErrorHandler\Tests\Fixtures\MissingInheritedConstantAttribute" used on "Symfony\Component\ErrorHandler\Tests\Fixtures\AttributeWithMissingUseTrait::INHERITED_CONSTANT" does not exist. Did you forget a "use" statement?',
+            'Attribute "Symfony\Component\ErrorHandler\Tests\Fixtures\MissingTraitPropertyAttribute" used on "Symfony\Component\ErrorHandler\Tests\Fixtures\AttributeWithMissingUseTrait::$traitProperty" does not exist. Did you forget a "use" statement?',
+            'Attribute "Symfony\Component\ErrorHandler\Tests\Fixtures\MissingInheritedPropertyAttribute" used on "Symfony\Component\ErrorHandler\Tests\Fixtures\AttributeWithMissingUseTrait::$inheritedProperty" does not exist. Did you forget a "use" statement?',
+            'Attribute "Symfony\Component\ErrorHandler\Tests\Fixtures\MissingTraitMethodAttribute" used on "Symfony\Component\ErrorHandler\Tests\Fixtures\AttributeWithMissingUseTrait::traitMethod()" does not exist. Did you forget a "use" statement?',
+            'Attribute "Symfony\Component\ErrorHandler\Tests\Fixtures\MissingOwnPropertyAttribute" used on "Symfony\Component\ErrorHandler\Tests\Fixtures\UsesAttributeWithMissingUseTrait::$traitProperty" does not exist. Did you forget a "use" statement?',
+            'Attribute "Symfony\Component\ErrorHandler\Tests\Fixtures\MissingOwnMethodAttribute" used on "Symfony\Component\ErrorHandler\Tests\Fixtures\UsesAttributeWithMissingUseTrait::traitMethod()" does not exist. Did you forget a "use" statement?',
+        ], $deprecations);
+    }
+
+    public function testAttributeWithMissingUseOnPromotedPropertyIsReportedOnce()
+    {
+        $deprecations = [];
+        set_error_handler(static function ($type, $msg) use (&$deprecations) { $deprecations[] = $msg; });
+        $e = error_reporting(\E_USER_DEPRECATED);
+
+        class_exists(Fixtures\AttributeWithMissingUseOnPromotedProperty::class, true);
+
+        error_reporting($e);
+        restore_error_handler();
+
+        $this->assertSame([
+            'Attribute "Symfony\Component\ErrorHandler\Tests\Fixtures\MissingPromotedPropertyAttribute" used on "Symfony\Component\ErrorHandler\Tests\Fixtures\AttributeWithMissingUseOnPromotedProperty::__construct($promoted)" does not exist. Did you forget a "use" statement?',
         ], $deprecations);
     }
 }
@@ -795,6 +932,32 @@ class ClassLoader
             return $fixtureDir.\DIRECTORY_SEPARATOR.'ReturnType.php';
         } elseif ('Test\\'.ReturnTypePhp83::class === $class) {
             return $fixtureDir.\DIRECTORY_SEPARATOR.'ReturnTypePhp83.php';
+        } elseif ('Test\\'.TemplatedReturnType::class === $class) {
+            eval('namespace Test\\'.__NAMESPACE__.'; class TemplatedReturnType implements \\'.__NAMESPACE__.'\Fixtures\TemplatedReturnTypeInterface {
+                public function classTemplate() { }
+                public function nullableClassTemplate() { }
+                public function methodTemplate($value) { }
+                public function phpStanClassTemplate() { }
+                public function psalmClassTemplate() { }
+                public function psalmMethodTemplate($value) { }
+                public function arrayOfTemplates() { }
+                public function notTemplated() { }
+                public function virtualMethod() { }
+            }');
+        } elseif ('Test\\'.TemplatedReturnTypeParent::class === $class) {
+            return $fixtureDir.'TemplatedReturnTypeParent.php';
+        } elseif ('Test\\'.ExtendsTemplatedReturnTypeParent::class === $class) {
+            eval('namespace Test\\'.__NAMESPACE__.'; class ExtendsTemplatedReturnTypeParent extends TemplatedReturnTypeParent implements \\'.__NAMESPACE__.'\Fixtures\ReturnTypeParentInterface {
+                #[\ReturnTypeWillChange]
+                public function current() { }
+                public function returnTypeGrandParent() { }
+                public function returnTypeParentInterface() { }
+            }');
+        } elseif (ExtendsTemplatedReturnTypeParent::class === $class) {
+            eval('namespace '.__NAMESPACE__.'; class ExtendsTemplatedReturnTypeParent extends \Test\\'.__NAMESPACE__.'\TemplatedReturnTypeParent {
+                #[\ReturnTypeWillChange]
+                public function current() { }
+            }');
         } elseif ('Test\\'.Fixtures\OutsideInterface::class === $class) {
             return $fixtureDir.\DIRECTORY_SEPARATOR.'OutsideInterface.php';
         } elseif ('Test\\'.OverrideOutsideFinalProperty::class === $class) {

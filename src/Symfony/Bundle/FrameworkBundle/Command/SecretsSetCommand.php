@@ -50,7 +50,7 @@ final class SecretsSetCommand extends Command
             ->setHelp(<<<'EOF'
                 The <info>%command.name%</info> command stores a secret in the vault.
 
-                    <info>%command.full_name% <name></info>
+                    <info>%command.invocation% <name></info>
 
                 To reference secrets in services.yaml or any other config
                 files, use <info>"%env(<name>)%"</info>.
@@ -58,11 +58,11 @@ final class SecretsSetCommand extends Command
                 By default, the secret value should be entered interactively.
                 Alternatively, provide a file where to read the secret from:
 
-                    <info>php %command.full_name% <name> filename</info>
+                    <info>%command.invocation% <name> filename</info>
 
                 Use "-" as a file name to read from STDIN:
 
-                    <info>cat filename | php %command.full_name% <name> -</info>
+                    <info>cat filename | %command.invocation% <name> -</info>
 
                 Use <info>--local</info> to override secrets for local needs.
                 EOF
@@ -138,6 +138,8 @@ final class SecretsSetCommand extends Command
     {
         if ($input->mustSuggestArgumentValuesFor('name')) {
             $suggestions->suggestValues(array_keys($this->vault->list(false)));
+        } elseif ($input->mustSuggestArgumentValuesFor('file') && method_exists($suggestions, 'suggestPaths')) {
+            $suggestions->suggestPaths();
         }
     }
 }

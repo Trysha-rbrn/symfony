@@ -12,6 +12,8 @@
 namespace Symfony\Bridge\Twig\Extension;
 
 use Symfony\Component\Security\Http\Logout\LogoutUrlGenerator;
+use Twig\Attribute\AsTwigFunction;
+use Twig\Environment;
 use Twig\Extension\AbstractExtension;
 use Twig\TwigFunction;
 
@@ -22,8 +24,12 @@ use Twig\TwigFunction;
  */
 final class LogoutUrlExtension extends AbstractExtension
 {
+    /**
+     * @param array<string, mixed> $csrfFieldAttr The HTML attributes of the hidden field that contains the CSRF token
+     */
     public function __construct(
         private LogoutUrlGenerator $generator,
+        private array $csrfFieldAttr = [],
     ) {
     }
 
@@ -33,6 +39,7 @@ final class LogoutUrlExtension extends AbstractExtension
             new TwigFunction('logout_url', $this->getLogoutUrl(...)),
             new TwigFunction('logout_path', $this->getLogoutPath(...)),
             new TwigFunction('logout_form', $this->getLogoutForm(...)),
+            new TwigFunction('logout_button', $this->renderLogoutButton(...), ['needs_environment' => true, 'is_safe' => ['html']]),
         ];
     }
 
@@ -41,6 +48,7 @@ final class LogoutUrlExtension extends AbstractExtension
      *
      * @param string|null $key The firewall key or null to use the current firewall key
      */
+    #[AsTwigFunction('logout_path')]
     public function getLogoutPath(?string $key = null): string
     {
         return $this->generator->getLogoutPath($key);
@@ -51,6 +59,7 @@ final class LogoutUrlExtension extends AbstractExtension
      *
      * @param string|null $key The firewall key or null to use the current firewall key
      */
+    #[AsTwigFunction('logout_url')]
     public function getLogoutUrl(?string $key = null): string
     {
         return $this->generator->getLogoutUrl($key);
@@ -61,10 +70,25 @@ final class LogoutUrlExtension extends AbstractExtension
      *
      * @param string|null $key The firewall key or null to use the current firewall key
      *
-     * @return array{action: string, fields: array<string, string>}
+     * @return array{action: string, fields: array<string, string>, csrf_field: string|null}
      */
+    #[AsTwigFunction('logout_form')]
     public function getLogoutForm(?string $key = null): array
     {
         return $this->generator->getLogoutForm($key);
+    }
+
+    /**
+     * Renders a form that triggers the logout with a POST.
+     *
+     * @param string|\Stringable   $label    The label of the button, escaped unless it is a Twig Markup
+     * @param string|null          $key      The firewall key or null to use the current firewall key
+     * @param array<string, mixed> $attr     The HTML attributes of the button
+     * @param array<string, mixed> $formAttr The HTML attributes of the form
+     */
+    #[AsTwigFunction('logout_button', isSafe: ['html'])]
+    public function renderLogoutButton(Environment $env, string|\Stringable $label = 'Log out', ?string $key = null, array $attr = [], array $formAttr = []): string
+    {
+        return PostFormRenderer::render($env, $this->generator->getLogoutForm($key), $label, $attr, $formAttr, $this->csrfFieldAttr);
     }
 }

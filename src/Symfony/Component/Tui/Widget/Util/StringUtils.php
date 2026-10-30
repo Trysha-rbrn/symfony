@@ -51,9 +51,8 @@ final class StringUtils
             return $value;
         }
 
-        $sanitized = @iconv('UTF-8', 'UTF-8//IGNORE', $value);
-
-        return false === $sanitized ? '' : $sanitized;
+        // Keep the well-formed multibyte sequences and drop every other non-ASCII byte. iconv() with //IGNORE would return false on a sequence cut at the end of the string, or on any invalid byte with musl.
+        return preg_replace('/([\xC2-\xDF][\x80-\xBF]|\xE0[\xA0-\xBF][\x80-\xBF]|[\xE1-\xEC\xEE\xEF][\x80-\xBF]{2}|\xED[\x80-\x9F][\x80-\xBF]|\xF0[\x90-\xBF][\x80-\xBF]{2}|[\xF1-\xF3][\x80-\xBF]{3}|\xF4[\x80-\x8F][\x80-\xBF]{2})|[\x80-\xFF]/', '$1', $value);
     }
 
     /**
@@ -73,5 +72,28 @@ final class StringUtils
     public static function stripControlBytes(string $value): string
     {
         return preg_replace("/[\x00-\x08\x0b-\x1f\x7f]|\xc2[\x80-\x9f]/", '', $value) ?? '';
+    }
+
+    /**
+     * Decode the Ctrl+letter keys of a paste back to their control bytes.
+     *
+     * A tmux popup whose program enabled modifyOtherKeys mode 2, like a nested tmux client, sends the control bytes of a paste as Ctrl+letter keys: a newline arrives as ESC [ 27 ; 5 ; 106 ~, or as ESC [ 106 ; 5 u with extended-keys-format=csi-u.
+     * Stripping the ESC would otherwise leave the rest of the sequence, like "[106;5u", in the text.
+     */
+    public static function decodeCtrlLetterKeys(string $value): string
+    {
+        if (!str_contains($value, "\x1b[")) {
+            return $value;
+        }
+
+        return preg_replace_callback('/\x1b\[(?|(\d+);5u|27;5;(\d+)~)/', static function (array $match): string {
+            $codepoint = (int) $match[1];
+
+            return match (true) {
+                $codepoint >= 97 && $codepoint <= 122 => \chr($codepoint - 96),
+                $codepoint >= 65 && $codepoint <= 90 => \chr($codepoint - 64),
+                default => $match[0],
+            };
+        }, $value) ?? $value;
     }
 }

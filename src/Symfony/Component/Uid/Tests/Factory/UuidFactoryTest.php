@@ -61,14 +61,14 @@ final class UuidFactoryTest extends TestCase
         $uuidFactory = new UuidFactory(6, 6, 5, 4, '6f80c216-0492-4421-bd82-c10ab929ae84');
 
         // Test custom timestamp
-        $uuid1 = $uuidFactory->timeBased()->create(new \DateTimeImmutable('@1611076938.057800'));
+        $uuid1 = $uuidFactory->timeBased()->create(\DateTimeImmutable::createFromTimestamp(1611076938.0578));
         $this->assertInstanceOf(UuidV6::class, $uuid1);
         $this->assertSame('1611076938.057800', $uuid1->getDateTime()->format('U.u'));
         $this->assertSame('c10ab929ae84', $uuid1->getNode());
 
         // Test default node override
         $uuid2Factory = $uuidFactory->timeBased('7c1ede70-3586-48ed-a984-23c8018d9174');
-        $this->assertSame('1eb5a7ae-17e1-62d0-a984-23c8018d9174', (string) $uuid2Factory->create(new \DateTimeImmutable('@1611076938.057800')));
+        $this->assertSame('1eb5a7ae-17e1-62d0-a984-23c8018d9174', (string) $uuid2Factory->create(\DateTimeImmutable::createFromTimestamp(1611076938.0578)));
         $this->assertSame('23c8018d9174', substr($uuid2Factory->create(), 24));
         $this->assertNotSame('a984', substr($uuid2Factory->create(), 19, 4));
 
@@ -86,7 +86,7 @@ final class UuidFactoryTest extends TestCase
         $this->expectException(InvalidArgumentException::class);
         $this->expectExceptionMessage('The timestamp must be positive.');
 
-        (new UuidFactory())->timeBased()->create(new \DateTimeImmutable('@-12219292800.001000'));
+        (new UuidFactory())->timeBased()->create(new \DateTimeImmutable('1582-10-14 23:59:59.999 UTC'));
     }
 
     public function testCreateRandom()

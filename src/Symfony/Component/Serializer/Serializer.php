@@ -22,6 +22,7 @@ use Symfony\Component\Serializer\Exception\LogicException;
 use Symfony\Component\Serializer\Exception\NotNormalizableValueException;
 use Symfony\Component\Serializer\Exception\PartialDenormalizationException;
 use Symfony\Component\Serializer\Exception\UnsupportedFormatException;
+use Symfony\Component\Serializer\Internal\WeakSerializer;
 use Symfony\Component\Serializer\Normalizer\AbstractObjectNormalizer;
 use Symfony\Component\Serializer\Normalizer\DenormalizerAwareInterface;
 use Symfony\Component\Serializer\Normalizer\DenormalizerInterface;
@@ -63,6 +64,16 @@ class Serializer implements SerializerInterface, NormalizerInterface, Denormaliz
     protected ChainDecoder $decoder;
 
     /**
+     * @var array<string, array<string, array<string, array<bool>>>>
+     */
+    private static array $sharedDenormalizerCache = [];
+
+    /**
+     * @var array<string, array<string, array<string, array<bool>>>>
+     */
+    private static array $sharedNormalizerCache = [];
+
+    /**
      * @var array<string, array<string, array<bool>>>
      */
     private array $denormalizerCache = [];
@@ -76,11 +87,13 @@ class Serializer implements SerializerInterface, NormalizerInterface, Denormaliz
      * @param array<NormalizerInterface|DenormalizerInterface> $normalizers
      * @param array<EncoderInterface|DecoderInterface>         $encoders
      * @param array<string, mixed>                             $defaultContext
+     * @param string|null                                      $sharedCacheKey Serializers created with the same key and normalizers of the same classes share which normalizers support which types
      */
     public function __construct(
         private array $normalizers = [],
-        array $encoders = [],
+        private array $encoders = [],
         private array $defaultContext = [],
+        private ?string $sharedCacheKey = null,
     ) {
         foreach ($normalizers as $normalizer) {
             if ($normalizer instanceof SerializerAwareInterface) {
@@ -98,6 +111,11 @@ class Serializer implements SerializerInterface, NormalizerInterface, Denormaliz
             if (!($normalizer instanceof NormalizerInterface || $normalizer instanceof DenormalizerInterface)) {
                 throw new InvalidArgumentException(\sprintf('The class "%s" neither implements "%s" nor "%s".', get_debug_type($normalizer), NormalizerInterface::class, DenormalizerInterface::class));
             }
+        }
+
+        if (null !== $sharedCacheKey) {
+            // a service can inherit the key from its parent definition and still use other normalizers
+            $this->sharedCacheKey .= ':'.hash('xxh128', serialize(array_map(get_class(...), $normalizers)));
         }
 
         $decoders = [];
@@ -286,37 +304,45 @@ class Serializer implements SerializerInterface, NormalizerInterface, Denormaliz
         }
 
         if (!isset($this->normalizerCache[$format ?? ''][$type])) {
-            $this->normalizerCache[$format ?? ''][$type] = [];
+            if (null !== $this->sharedCacheKey && isset(self::$sharedNormalizerCache[$this->sharedCacheKey][$format ?? ''][$type])) {
+                $this->normalizerCache[$format ?? ''][$type] = self::$sharedNormalizerCache[$this->sharedCacheKey][$format ?? ''][$type];
+            } else {
+                $this->normalizerCache[$format ?? ''][$type] = [];
 
-            foreach ($this->normalizers as $k => $normalizer) {
-                if (!$normalizer instanceof NormalizerInterface) {
-                    continue;
-                }
-
-                $supportedTypes = $normalizer->getSupportedTypes($format);
-
-                foreach ($supportedTypes as $supportedType => $isCacheable) {
-                    if (\in_array($supportedType, ['*', 'object'], true)
-                        || $type !== $supportedType && ('object' !== $genericType || !is_subclass_of($type, $supportedType))
-                    ) {
+                foreach ($this->normalizers as $k => $normalizer) {
+                    if (!$normalizer instanceof NormalizerInterface) {
                         continue;
                     }
 
-                    if (null === $isCacheable) {
-                        unset($supportedTypes['*'], $supportedTypes['object']);
-                    } elseif ($this->normalizerCache[$format ?? ''][$type][$k] = $isCacheable && $normalizer->supportsNormalization($data, $format, $context)) {
-                        break 2;
+                    $supportedTypes = $normalizer->getSupportedTypes($format);
+
+                    foreach ($supportedTypes as $supportedType => $isCacheable) {
+                        if (\in_array($supportedType, ['*', 'object'], true)
+                            || $type !== $supportedType && ('object' !== $genericType || !is_subclass_of($type, $supportedType))
+                        ) {
+                            continue;
+                        }
+
+                        if (null === $isCacheable) {
+                            unset($supportedTypes['*'], $supportedTypes['object']);
+                        } elseif ($this->normalizerCache[$format ?? ''][$type][$k] = $isCacheable && $normalizer->supportsNormalization($data, $format, $context)) {
+                            break 2;
+                        }
+
+                        break;
                     }
 
-                    break;
+                    if (null === $isCacheable = $supportedTypes[\array_key_exists($genericType, $supportedTypes) ? $genericType : '*'] ?? null) {
+                        continue;
+                    }
+
+                    if ($this->normalizerCache[$format ?? ''][$type][$k] ??= $isCacheable && $normalizer->supportsNormalization($data, $format, $context)) {
+                        break;
+                    }
                 }
 
-                if (null === $isCacheable = $supportedTypes[\array_key_exists($genericType, $supportedTypes) ? $genericType : '*'] ?? null) {
-                    continue;
-                }
-
-                if ($this->normalizerCache[$format ?? ''][$type][$k] ??= $isCacheable && $normalizer->supportsNormalization($data, $format, $context)) {
-                    break;
+                if (null !== $this->sharedCacheKey) {
+                    self::$sharedNormalizerCache[$this->sharedCacheKey][$format ?? ''][$type] = $this->normalizerCache[$format ?? ''][$type];
                 }
             }
         }
@@ -342,41 +368,49 @@ class Serializer implements SerializerInterface, NormalizerInterface, Denormaliz
     private function getDenormalizer(mixed $data, string $class, ?string $format, array $context): ?DenormalizerInterface
     {
         if (!isset($this->denormalizerCache[$format ?? ''][$class])) {
-            $this->denormalizerCache[$format ?? ''][$class] = [];
-            $genericType = class_exists($class) || interface_exists($class, false) ? 'object' : '*';
+            if (null !== $this->sharedCacheKey && isset(self::$sharedDenormalizerCache[$this->sharedCacheKey][$format ?? ''][$class])) {
+                $this->denormalizerCache[$format ?? ''][$class] = self::$sharedDenormalizerCache[$this->sharedCacheKey][$format ?? ''][$class];
+            } else {
+                $this->denormalizerCache[$format ?? ''][$class] = [];
+                $genericType = class_exists($class) || interface_exists($class, false) ? 'object' : '*';
 
-            foreach ($this->normalizers as $k => $normalizer) {
-                if (!$normalizer instanceof DenormalizerInterface) {
-                    continue;
-                }
-
-                $supportedTypes = $normalizer->getSupportedTypes($format);
-
-                $doesClassRepresentCollection = str_ends_with($class, '[]');
-
-                foreach ($supportedTypes as $supportedType => $isCacheable) {
-                    if (\in_array($supportedType, ['*', 'object'], true)
-                        || $class !== $supportedType && ('object' !== $genericType || !is_subclass_of($class, $supportedType))
-                        && !($doesClassRepresentCollection && str_ends_with($supportedType, '[]') && is_subclass_of(strstr($class, '[]', true), strstr($supportedType, '[]', true)))
-                    ) {
+                foreach ($this->normalizers as $k => $normalizer) {
+                    if (!$normalizer instanceof DenormalizerInterface) {
                         continue;
                     }
 
-                    if (null === $isCacheable) {
-                        unset($supportedTypes['*'], $supportedTypes['object']);
-                    } elseif ($this->denormalizerCache[$format ?? ''][$class][$k] = $isCacheable && $normalizer->supportsDenormalization(null, $class, $format, $context)) {
-                        break 2;
+                    $supportedTypes = $normalizer->getSupportedTypes($format);
+
+                    $doesClassRepresentCollection = str_ends_with($class, '[]');
+
+                    foreach ($supportedTypes as $supportedType => $isCacheable) {
+                        if (\in_array($supportedType, ['*', 'object'], true)
+                            || $class !== $supportedType && ('object' !== $genericType || !is_subclass_of($class, $supportedType))
+                            && !($doesClassRepresentCollection && str_ends_with($supportedType, '[]') && is_subclass_of(strstr($class, '[]', true), strstr($supportedType, '[]', true)))
+                        ) {
+                            continue;
+                        }
+
+                        if (null === $isCacheable) {
+                            unset($supportedTypes['*'], $supportedTypes['object']);
+                        } elseif ($this->denormalizerCache[$format ?? ''][$class][$k] = $isCacheable && $normalizer->supportsDenormalization(null, $class, $format, $context)) {
+                            break 2;
+                        }
+
+                        break;
                     }
 
-                    break;
+                    if (null === $isCacheable = $supportedTypes[\array_key_exists($genericType, $supportedTypes) ? $genericType : '*'] ?? null) {
+                        continue;
+                    }
+
+                    if ($this->denormalizerCache[$format ?? ''][$class][$k] ??= $isCacheable && $normalizer->supportsDenormalization(null, $class, $format, $context)) {
+                        break;
+                    }
                 }
 
-                if (null === $isCacheable = $supportedTypes[\array_key_exists($genericType, $supportedTypes) ? $genericType : '*'] ?? null) {
-                    continue;
-                }
-
-                if ($this->denormalizerCache[$format ?? ''][$class][$k] ??= $isCacheable && $normalizer->supportsDenormalization(null, $class, $format, $context)) {
-                    break;
+                if (null !== $this->sharedCacheKey) {
+                    self::$sharedDenormalizerCache[$this->sharedCacheKey][$format ?? ''][$class] = $this->denormalizerCache[$format ?? ''][$class];
                 }
             }
         }
@@ -409,5 +443,35 @@ class Serializer implements SerializerInterface, NormalizerInterface, Denormaliz
     public function supportsDecoding(string $format, array $context = []): bool
     {
         return $this->decoder->supportsDecoding($format, $context);
+    }
+
+    /**
+     * Gives the normalizers and the encoders a weak reference to this serializer.
+     *
+     * This lets PHP free them together with the serializer, without waiting for the garbage collector.
+     */
+    public function shutdown(): void
+    {
+        $serializer = new WeakSerializer($this);
+
+        foreach ($this->normalizers as $normalizer) {
+            if ($normalizer instanceof SerializerAwareInterface) {
+                $normalizer->setSerializer($serializer);
+            }
+
+            if ($normalizer instanceof DenormalizerAwareInterface) {
+                $normalizer->setDenormalizer($serializer);
+            }
+
+            if ($normalizer instanceof NormalizerAwareInterface) {
+                $normalizer->setNormalizer($serializer);
+            }
+        }
+
+        foreach ($this->encoders as $encoder) {
+            if ($encoder instanceof SerializerAwareInterface) {
+                $encoder->setSerializer($serializer);
+            }
+        }
     }
 }

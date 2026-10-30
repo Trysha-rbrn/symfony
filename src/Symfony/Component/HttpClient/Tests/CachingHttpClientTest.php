@@ -28,6 +28,8 @@ use Symfony\Component\HttpClient\MockHttpClient;
 use Symfony\Component\HttpClient\NativeHttpClient;
 use Symfony\Component\HttpClient\Response\AsyncResponse;
 use Symfony\Component\HttpClient\Response\MockResponse;
+use Symfony\Component\HttpClient\Tests\Fixtures\ResettableClient;
+use Symfony\Component\HttpClient\Tests\Fixtures\ShutdownAwareClient;
 use Symfony\Component\HttpClient\TraceableHttpClient;
 use Symfony\Contracts\HttpClient\Test\TestHttpServer;
 
@@ -1884,17 +1886,17 @@ class CachingHttpClientTest extends TestCase
 
     public function testRevalidationRetainsStoredFreshnessWhen304OmitsCacheDirectives()
     {
-        $mockClient = new MockHttpClient([
-            new MockResponse('foo', [
+        $mockClient = new MockHttpClient((static function () {
+            yield new MockResponse('foo', [
                 'http_code' => 200,
                 'response_headers' => ['ETag' => '"abc123"', 'Cache-Control' => 'max-age=60'],
-            ]),
-            new MockResponse('', [
+            ]);
+            yield new MockResponse('', [
                 'http_code' => 304,
                 'response_headers' => ['ETag' => '"abc123"'],
-            ]),
-            new MockResponse('should not be served'),
-        ]);
+            ]);
+            yield new MockResponse('should not be served');
+        })());
 
         $client = new CachingHttpClient($mockClient, $this->cacheAdapter);
 
@@ -2029,6 +2031,27 @@ class CachingHttpClientTest extends TestCase
         $this->assertSame(200, $response->getStatusCode());
         $this->assertSame('foo', $response->getContent());
         $this->assertSame('3', $response->getHeaders()['age'][0]);
+    }
+
+    public function testStartTimeInfoDoesNotAgeTheStoredResponse()
+    {
+        $mockClient = new MockHttpClient([
+            new MockResponse('foo', [
+                'http_code' => 200,
+                'response_headers' => ['Cache-Control' => 'max-age=300'],
+                // replayed responses report the start time of the recording
+                'start_time' => time() - 86400 * 90,
+            ]),
+            new MockResponse('should not be served'),
+        ]);
+
+        $client = new CachingHttpClient($mockClient, $this->cacheAdapter);
+
+        $this->assertSame('foo', $client->request('GET', 'http://example.com/replayed')->getContent());
+
+        $response = $client->request('GET', 'http://example.com/replayed');
+        $this->assertSame('foo', $response->getContent());
+        $this->assertSame('0', $response->getHeaders()['age'][0]);
     }
 
     public function testOldDateWithShortMaxAgeIsImmediatelyStale()
@@ -2755,5 +2778,19 @@ class CachingHttpClientTest extends TestCase
             $sharedCache,
             $maxTtl,
         );
+    }
+
+    public function testResetForwardsTheShutdownFlagToShutdownAwareClientsOnly()
+    {
+        $client = new CachingHttpClient($inner = new ShutdownAwareClient(), $this->cacheAdapter);
+        $client->reset();
+        $client->reset(true);
+
+        $this->assertSame([false, true], $inner->resets);
+
+        $client = new CachingHttpClient($inner = new ResettableClient(), $this->cacheAdapter);
+        $client->reset(true);
+
+        $this->assertSame([[]], $inner->resets);
     }
 }

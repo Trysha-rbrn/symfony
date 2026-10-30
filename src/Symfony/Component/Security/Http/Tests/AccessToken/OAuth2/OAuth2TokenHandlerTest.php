@@ -21,7 +21,9 @@ use Jose\Component\Signature\JWSBuilder;
 use Jose\Component\Signature\Serializer\CompactSerializer;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\RequiresPhpExtension;
+use PHPUnit\Framework\Attributes\RunInSeparateProcess;
 use PHPUnit\Framework\TestCase;
+use Symfony\Bridge\PhpUnit\ClockMock;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
 use Symfony\Component\Clock\MockClock;
 use Symfony\Component\HttpClient\MockHttpClient;
@@ -512,6 +514,25 @@ class OAuth2TokenHandlerTest extends TestCase
         $this->assertContains($metadataUrl, $requested);
     }
 
+    #[RequiresPhpExtension('openssl')]
+    public function testCachesTheMetadataKeysUntilTheirExpiresOnTheClock()
+    {
+        $client = new MockHttpClient(static fn (string $method, string $url): MockResponse => match (true) {
+            str_contains($url, '/.well-known/') => new JsonMockResponse(['issuer' => self::ISSUER, 'jwks_uri' => 'https://as.example.com/jwks']),
+            str_contains($url, '/jwks') => new JsonMockResponse(['keys' => [self::publicJwk()->all() + ['use' => 'sig']]], ['response_headers' => ['Expires' => 'Fri, 21 Jun 2024 20:10:00 GMT']]),
+            default => self::jwtResponse(self::signedResponsePayload(self::activeClaims(['sub' => 'jdoe']))),
+        }, self::ENDPOINT);
+
+        $handler = self::createHandler($client, [self::AUDIENCE], self::ISSUER);
+        $handler->enableSignedResponse(new AlgorithmManager([new ES256()]), null);
+        $handler->enableSignedResponseDiscovery($cache = new ArrayAdapter(), $client, 'metadata.');
+
+        $this->assertSame('jdoe', $handler->getUserBadgeFrom('a-secret-token')->getUserIdentifier());
+
+        $item = $cache->getItem('metadata.');
+        $this->assertEqualsWithDelta(600, $item->getMetadata()[$item::METADATA_EXPIRY] - microtime(true), 2);
+    }
+
     /**
      * The options are asserted after the call: the handler turns every exception the response
      * factory raises into a BadCredentialsException, a failed assertion included.
@@ -714,6 +735,24 @@ class OAuth2TokenHandlerTest extends TestCase
         $client = new MockHttpClient([self::jwtResponse(self::signedResponsePayload(self::activeClaims(['sub' => 'jdoe'])))], self::ENDPOINT);
 
         $this->assertBadCredentials('The authorization server returned a JWT introspection response, which this resource server is not configured to verify.', self::createHandler($client));
+    }
+
+    #[RequiresPhpExtension('openssl')]
+    #[RunInSeparateProcess]
+    public function testChecksTheDatesAgainstTheSystemTimeWithoutAClock()
+    {
+        ClockMock::register(Oauth2TokenHandler::class);
+        ClockMock::withClockMock(1719000000);
+
+        $client = new MockHttpClient([
+            self::jwtResponse(self::signedResponsePayload(self::activeClaims(['sub' => 'jdoe', 'exp' => 1719000000 + 10]))),
+            self::jwtResponse(['iat' => 1719000001] + self::signedResponsePayload(self::activeClaims(['sub' => 'jdoe']))),
+        ], self::ENDPOINT);
+        $handler = new Oauth2TokenHandler($client, null, [self::AUDIENCE], self::ISSUER);
+        $handler->enableSignedResponse(new AlgorithmManager([new ES256()]), new JWKSet([self::publicJwk()]));
+
+        $this->assertSame('jdoe', $handler->getUserBadgeFrom('a-secret-token')->getUserIdentifier());
+        $this->assertBadCredentials('The JWT is issued in the future.', $handler);
     }
 
     private function assertBadCredentials(string $message, Oauth2TokenHandler $handler): void

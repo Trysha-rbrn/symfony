@@ -16,6 +16,7 @@ use Symfony\Component\Config\Definition\BaseNode;
 use Symfony\Component\Config\Definition\ConfigurationInterface;
 use Symfony\Component\Config\Definition\Processor;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
+use Symfony\Component\DependencyInjection\Exception\ExceptionInterface;
 use Symfony\Component\DependencyInjection\Exception\InvalidArgumentException;
 use Symfony\Component\DependencyInjection\Exception\LogicException;
 use Symfony\Component\DependencyInjection\Exception\ParameterNotFoundException;
@@ -104,6 +105,25 @@ class MergeExtensionConfigurationPass implements CompilerPassInterface
                     $tmpContainer->addExpressionLanguageProvider($provider);
                 }
 
+                $inlinedOptions = [];
+
+                if ($configAvailable) {
+                    BaseNode::setPlaceholderResolver(static function (mixed $value, string $path) use ($tmpContainer, &$inlinedOptions): mixed {
+                        try {
+                            $usedEnvs = [];
+                            $value = $tmpContainer->resolveStaticValue($value, $usedEnvs);
+
+                            foreach ($usedEnvs as $env) {
+                                $inlinedOptions[$env][$path] = $path;
+                            }
+
+                            return $value;
+                        } catch (ExceptionInterface $e) {
+                            throw new RuntimeException(\sprintf('The value of the configuration option "%s" must be known when the container is compiled: ', $path).$e->getMessage(), 0, $e);
+                        }
+                    });
+                }
+
                 $extension->load($config, $tmpContainer);
             } catch (\Exception $e) {
                 if ($resolvingBag instanceof MergeExtensionConfigurationParameterBag) {
@@ -111,6 +131,19 @@ class MergeExtensionConfigurationPass implements CompilerPassInterface
                 }
 
                 throw $e;
+            } finally {
+                if ($configAvailable) {
+                    BaseNode::setPlaceholderResolver(null);
+                }
+            }
+
+            foreach ($inlinedOptions as $env => $paths) {
+                foreach ($paths as $path) {
+                    $container->log($this, \sprintf('Inlined env var "%%env(%s)%%" into option "%s".', $env, $path));
+                }
+            }
+            foreach (array_diff($tmpContainer->getInlinedEnvVars(), array_keys($inlinedOptions)) as $env) {
+                $container->log($this, \sprintf('Inlined env var "%%env(%s)%%" while loading extension "%s".', $env, $name));
             }
 
             if ($resolvingBag instanceof MergeExtensionConfigurationParameterBag) {
@@ -120,6 +153,18 @@ class MergeExtensionConfigurationPass implements CompilerPassInterface
 
             $container->merge($tmpContainer);
             $container->getParameterBag()->add($parameters);
+        }
+
+        foreach ($container->getDefinitions() as $id => $definition) {
+            if (isset($aliases[$id]) || (isset($definitions[$id]) && $definitions[$id] !== $definition)) {
+                // count the env vars of extension definitions that user-defined services or aliases replace
+                try {
+                    $value = serialize($definition);
+                } catch (\Throwable) {
+                    $value = $definition;
+                }
+                $container->resolveEnvPlaceholders($value);
+            }
         }
 
         $container->addDefinitions($definitions);
@@ -220,7 +265,7 @@ class MergeExtensionConfigurationPass implements CompilerPassInterface
                         throw new InvalidArgumentException(\sprintf('The "%s.%s" configuration must be an array or null, "%s" given.', $name, $key, get_debug_type($value)));
                     }
 
-                    $forwarded[$alias][] = $value;
+                    $forwarded[] = [$i, $alias, $value];
                     unset($config[$configKey]);
                 }
 
@@ -233,10 +278,8 @@ class MergeExtensionConfigurationPass implements CompilerPassInterface
 
             $container->setExtensionConfig($name, $configs);
 
-            foreach ($forwarded as $alias => $values) {
-                foreach (array_reverse($values) as $value) {
-                    $container->prependExtensionConfig($alias, $value);
-                }
+            foreach ($forwarded as [$i, $alias, $value]) {
+                $container->forwardExtensionConfig($name, $i, $alias, $value);
             }
         }
 
@@ -327,6 +370,14 @@ class MergeExtensionConfigurationContainerBuilder extends ContainerBuilder
     public function compile(bool $resolveEnvPlaceholders = false): void
     {
         throw new LogicException(\sprintf('Cannot compile the container in extension "%s".', $this->extensionClass));
+    }
+
+    /**
+     * Resolves the env vars referenced by $value, ignoring the restriction that applies to extensions.
+     */
+    public function resolveStaticValue(mixed $value, ?array &$usedEnvs = null): mixed
+    {
+        return parent::resolveEnvPlaceholders($value, true, $usedEnvs);
     }
 
     public function resolveEnvPlaceholders(mixed $value, string|bool|null $format = null, ?array &$usedEnvs = null): mixed

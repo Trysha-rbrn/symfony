@@ -22,11 +22,14 @@ use Jose\Component\Signature\JWSBuilder;
 use Jose\Component\Signature\Serializer\CompactSerializer as JwsCompactSerializer;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\RequiresPhpExtension;
+use PHPUnit\Framework\Attributes\TestWith;
 use Symfony\Bundle\SecurityBundle\Tests\Functional\Bundle\AccessTokenBundle\Security\Handler\IntrospectionResponseFactory;
 use Symfony\Component\Config\Definition\Exception\InvalidConfigurationException;
 use Symfony\Component\HttpClient\MockHttpClient;
 use Symfony\Component\HttpClient\Response\MockResponse;
 use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\Security\Core\User\InMemoryUser;
+use Symfony\Component\Security\Http\Authenticator\AccessTokenAuthenticator;
 
 class AccessTokenTest extends AbstractWebTestCase
 {
@@ -53,6 +56,8 @@ class AccessTokenTest extends AbstractWebTestCase
 
         $this->assertSame(401, $response->getStatusCode());
         $this->assertSame('Bearer realm="My API",error="invalid_token",error_description="Invalid credentials.",resource_metadata="http://localhost/.well-known/oauth-protected-resource"', $response->headers->get('WWW-Authenticate'));
+        $this->assertSame('text/plain; charset=UTF-8', $response->headers->get('Content-Type'));
+        $this->assertSame('Invalid credentials.', $response->getContent());
 
         // the primary RFC 9728 discovery flow: a client holding no token yet is told where
         // the document is, which the firewall can only answer as its entry point
@@ -61,6 +66,8 @@ class AccessTokenTest extends AbstractWebTestCase
 
         $this->assertSame(401, $response->getStatusCode());
         $this->assertSame('Bearer realm="My API",resource_metadata="http://localhost/.well-known/oauth-protected-resource"', $response->headers->get('WWW-Authenticate'));
+        $this->assertSame('text/plain; charset=UTF-8', $response->headers->get('Content-Type'));
+        $this->assertSame('Not privileged to request the resource.', $response->getContent());
 
         $client->request('GET', '/.well-known/oauth-protected-resource');
         $response = $client->getResponse();
@@ -77,6 +84,28 @@ class AccessTokenTest extends AbstractWebTestCase
         ], json_decode($response->getContent(), true));
     }
 
+    public function testTheProtectedResourceMetadataCanBeReadFromAnyOrigin()
+    {
+        $client = $this->createClient(['test_case' => 'AccessToken', 'root_config' => 'config_resource_metadata.yml']);
+
+        $client->request('OPTIONS', '/.well-known/oauth-protected-resource', [], [], [
+            'HTTP_ORIGIN' => 'https://client.example.org',
+            'HTTP_ACCESS_CONTROL_REQUEST_METHOD' => 'GET',
+            'HTTP_ACCESS_CONTROL_REQUEST_HEADERS' => 'mcp-protocol-version',
+        ]);
+        $response = $client->getResponse();
+
+        $this->assertSame(204, $response->getStatusCode());
+        $this->assertSame('*', $response->headers->get('Access-Control-Allow-Origin'));
+        $this->assertSame('*', $response->headers->get('Access-Control-Allow-Headers'));
+
+        $client->request('GET', '/.well-known/oauth-protected-resource', [], [], ['HTTP_ORIGIN' => 'https://client.example.org']);
+        $response = $client->getResponse();
+
+        $this->assertSame(200, $response->getStatusCode());
+        $this->assertSame('*', $response->headers->get('Access-Control-Allow-Origin'));
+    }
+
     public function testNoProtectedResourceMetadataRouteWithoutTheConfiguration()
     {
         $client = $this->createClient(['test_case' => 'AccessToken', 'root_config' => 'config_header_default.yml']);
@@ -84,6 +113,51 @@ class AccessTokenTest extends AbstractWebTestCase
         $client->request('GET', '/.well-known/oauth-protected-resource');
 
         $this->assertSame(404, $client->getResponse()->getStatusCode());
+    }
+
+    #[TestWith(['config_resource_metadata_env.yml', 'RESOURCE_URL', 'http://localhost/foo'])]
+    #[TestWith(['config_resource_metadata_env_host.yml', 'RESOURCE_HOST', 'localhost'])]
+    public function testTheEnvVarsOfTheResourceAreResolvedWhenTheContainerIsCompiled(string $rootConfig, string $name, string $value)
+    {
+        $_ENV[$name] = $value;
+
+        try {
+            // in debug mode, the routes of the other configurations of this test case are not reused
+            $client = $this->createClient(['test_case' => 'AccessToken', 'root_config' => $rootConfig, 'debug' => true]);
+        } finally {
+            unset($_ENV[$name]);
+        }
+
+        $client->request('GET', '/foo');
+
+        $this->assertSame('Bearer resource_metadata="http://localhost/.well-known/oauth-protected-resource/foo"', $client->getResponse()->headers->get('WWW-Authenticate'));
+
+        $client->request('GET', '/.well-known/oauth-protected-resource/foo');
+
+        $this->assertSame(200, $client->getResponse()->getStatusCode());
+        $this->assertSame('http://localhost/foo', json_decode($client->getResponse()->getContent(), true)['resource']);
+    }
+
+    #[TestWith(['http://localhost'])]
+    #[TestWith(['https://api.example.com'])]
+    public function testAResourcePathIsResolvedAgainstTheOriginOfTheRequest(string $origin)
+    {
+        // in debug mode, the routes of the other configurations of this test case are not reused
+        $client = $this->createClient(['test_case' => 'AccessToken', 'root_config' => 'config_resource_metadata_path.yml', 'debug' => true]);
+
+        $client->request('GET', $origin.'/foo');
+
+        $this->assertSame(401, $client->getResponse()->getStatusCode());
+        $this->assertSame('Bearer resource_metadata="'.$origin.'/.well-known/oauth-protected-resource/foo"', $client->getResponse()->headers->get('WWW-Authenticate'));
+
+        $client->request('GET', $origin.'/.well-known/oauth-protected-resource/foo');
+
+        $this->assertSame(200, $client->getResponse()->getStatusCode());
+        $this->assertSame([
+            'resource' => $origin.'/foo',
+            'authorization_servers' => ['https://accounts.example.com'],
+            'bearer_methods_supported' => ['header'],
+        ], json_decode($client->getResponse()->getContent(), true));
     }
 
     public function testAccessControlGrantedOnTheScopesTheTokenCarries()
@@ -118,6 +192,8 @@ class AccessTokenTest extends AbstractWebTestCase
 
         $this->assertSame(403, $response->getStatusCode());
         $this->assertSame('Bearer realm="My API",error="insufficient_scope",error_description="The request requires higher privileges than provided by the access token.",scope="openid profile:read"', $response->headers->get('WWW-Authenticate'));
+        $this->assertSame('text/plain; charset=UTF-8', $response->headers->get('Content-Type'));
+        $this->assertSame('The request requires higher privileges than provided by the access token.', $response->getContent());
     }
 
     /**
@@ -217,7 +293,6 @@ class AccessTokenTest extends AbstractWebTestCase
 
         $this->assertInstanceOf(Response::class, $response);
         $this->assertSame(401, $response->getStatusCode());
-        $this->assertSame('', $response->getContent());
         $this->assertSame('Bearer realm="My API",error="invalid_token",error_description="Invalid credentials."', $response->headers->get('WWW-Authenticate'));
     }
 
@@ -306,7 +381,6 @@ class AccessTokenTest extends AbstractWebTestCase
 
         $this->assertInstanceOf(Response::class, $response);
         $this->assertSame(401, $response->getStatusCode());
-        $this->assertSame('', $response->getContent());
         $this->assertSame('Bearer realm="My API",error="invalid_token",error_description="Invalid credentials."', $response->headers->get('WWW-Authenticate'));
     }
 
@@ -398,7 +472,6 @@ class AccessTokenTest extends AbstractWebTestCase
 
         $this->assertInstanceOf(Response::class, $response);
         $this->assertSame(401, $response->getStatusCode());
-        $this->assertSame('', $response->getContent());
         $this->assertSame('Bearer realm="My API",error="invalid_token",error_description="Invalid credentials."', $response->headers->get('WWW-Authenticate'));
     }
 
@@ -516,6 +589,38 @@ class AccessTokenTest extends AbstractWebTestCase
         $this->assertInstanceOf(Response::class, $response);
         $this->assertSame(401, $response->getStatusCode());
         $this->assertSame('Bearer realm="My API",error="invalid_token",error_description="Invalid credentials."', $response->headers->get('WWW-Authenticate'));
+    }
+
+    #[RequiresPhpExtension('openssl')]
+    public function testDpopBoundTokenIsAcceptedOnceWithItsProof()
+    {
+        $key = self::createDpopKey();
+        $token = self::createDpopBoundToken($key);
+        $server = ['HTTP_AUTHORIZATION' => 'DPoP '.$token, 'HTTP_DPOP' => self::createDpopProof($key, $token, 'http://localhost/foo')];
+
+        $client = $this->createClient(['test_case' => 'AccessToken', 'root_config' => 'config_dpop.yml']);
+        $client->request('GET', '/foo', [], [], $server);
+
+        $this->assertSame(200, $client->getResponse()->getStatusCode());
+        $this->assertSame(['message' => 'Welcome @dunglas!'], json_decode($client->getResponse()->getContent(), true));
+
+        $client->request('GET', '/foo', [], [], $server);
+
+        $this->assertSame(401, $client->getResponse()->getStatusCode());
+        $this->assertSame('DPoP realm="My API",error="invalid_dpop_proof",error_description="Invalid credentials.",algs="ES256 PS256 RS256"', $client->getResponse()->headers->get('WWW-Authenticate'));
+    }
+
+    #[RequiresPhpExtension('openssl')]
+    public function testDpopFirewallDoesNotReadABearerToken()
+    {
+        $key = self::createDpopKey();
+        $token = self::createDpopBoundToken($key);
+
+        $client = $this->createClient(['test_case' => 'AccessToken', 'root_config' => 'config_dpop.yml']);
+        $client->request('GET', '/foo', [], [], ['HTTP_AUTHORIZATION' => 'Bearer '.$token, 'HTTP_DPOP' => self::createDpopProof($key, $token, 'http://localhost/foo')]);
+
+        $this->assertSame(401, $client->getResponse()->getStatusCode());
+        $this->assertSame('DPoP realm="My API",algs="ES256 PS256 RS256"', $client->getResponse()->headers->get('WWW-Authenticate'));
     }
 
     #[RequiresPhpExtension('openssl')]
@@ -646,6 +751,77 @@ class AccessTokenTest extends AbstractWebTestCase
         $this->assertSame(['message' => 'Welcome @dunglas!'], json_decode($response->getContent(), true));
     }
 
+    public function testLoginUserOnAStatelessFirewallSurvivesKernelReboots()
+    {
+        $client = $this->createClient(['test_case' => 'AccessToken', 'root_config' => 'config_login_user.yml']);
+        $client->loginUser(new InMemoryUser('dunglas', null, ['ROLE_USER']), 'api');
+
+        $client->request('GET', '/foo');
+
+        $this->assertSame(200, $client->getResponse()->getStatusCode());
+        $this->assertSame(['message' => 'Welcome @dunglas!'], json_decode($client->getResponse()->getContent(), true));
+
+        $client->request('GET', '/foo');
+
+        $this->assertSame(200, $client->getResponse()->getStatusCode());
+        $this->assertSame(['message' => 'Welcome @dunglas!'], json_decode($client->getResponse()->getContent(), true));
+    }
+
+    public function testLoginUserOnAStatelessFirewallGivesTheTokenAttributes()
+    {
+        $client = $this->createClient(['test_case' => 'AccessToken', 'root_config' => 'config_login_user.yml']);
+
+        $client->loginUser(new InMemoryUser('dunglas', null, ['ROLE_USER']), 'api', [AccessTokenAuthenticator::SCOPE_ATTRIBUTE => ['profile:write']]);
+        $client->request('GET', '/scoped');
+
+        $this->assertSame(200, $client->getResponse()->getStatusCode());
+        $this->assertSame(['message' => 'Welcome @dunglas!'], json_decode($client->getResponse()->getContent(), true));
+
+        $client->loginUser(new InMemoryUser('dunglas', null, ['ROLE_USER']), 'api', [AccessTokenAuthenticator::SCOPE_ATTRIBUTE => ['profile:read']]);
+        $client->request('GET', '/scoped');
+
+        $this->assertSame(403, $client->getResponse()->getStatusCode());
+        $this->assertSame('Bearer realm="My API",error="insufficient_scope",error_description="The request requires higher privileges than provided by the access token.",scope="profile:write"', $client->getResponse()->headers->get('WWW-Authenticate'));
+    }
+
+    public function testLoginUserOnAStatelessFirewallLoadsTheUserFromItsUserProvider()
+    {
+        $client = $this->createClient(['test_case' => 'AccessToken', 'root_config' => 'config_login_user.yml']);
+        $client->loginUser(new InMemoryUser('unknown', null, ['ROLE_USER']), 'api');
+
+        $client->request('GET', '/foo');
+
+        $this->assertSame(401, $client->getResponse()->getStatusCode());
+        $this->assertSame('Bearer realm="My API",error="invalid_token",error_description="Invalid credentials."', $client->getResponse()->headers->get('WWW-Authenticate'));
+    }
+
+    public function testAnAccessTokenSentWithTheRequestPrevailsOverLoginUser()
+    {
+        $client = $this->createClient(['test_case' => 'AccessToken', 'root_config' => 'config_login_user.yml']);
+        $client->loginUser(new InMemoryUser('dunglas', null, ['ROLE_USER']), 'api');
+
+        $client->request('GET', '/foo', [], [], ['HTTP_AUTHORIZATION' => 'Bearer INVALID_ACCESS_TOKEN']);
+
+        $this->assertSame(401, $client->getResponse()->getStatusCode());
+        $this->assertSame('Bearer realm="My API",error="invalid_token",error_description="Invalid credentials."', $client->getResponse()->headers->get('WWW-Authenticate'));
+    }
+
+    public function testRestartLogsOutOfAStatelessFirewall()
+    {
+        $client = $this->createClient(['test_case' => 'AccessToken', 'root_config' => 'config_login_user.yml']);
+        $client->loginUser(new InMemoryUser('dunglas', null, ['ROLE_USER']), 'api');
+
+        $client->request('GET', '/foo');
+
+        $this->assertSame(200, $client->getResponse()->getStatusCode());
+
+        $client->restart();
+        $client->request('GET', '/foo');
+
+        $this->assertSame(401, $client->getResponse()->getStatusCode());
+        $this->assertSame('Bearer realm="My API"', $client->getResponse()->headers->get('WWW-Authenticate'));
+    }
+
     public static function validAccessTokens(): array
     {
         if (!\extension_loaded('openssl')) {
@@ -696,6 +872,46 @@ class AccessTokenTest extends AbstractWebTestCase
             [static fn () => self::createJws($claims, ['typ' => 'JWT'])],
             [static fn () => self::createJws($claims, [])],
         ];
+    }
+
+    private static function createDpopKey(): JWK
+    {
+        return new JWK([
+            'kty' => 'EC',
+            'crv' => 'P-256',
+            'x' => 'WVnRsXoNEpNEzsNLkmDjaEtKkhpcP-KkihslW781L-I',
+            'y' => '2KbDKglsg62x9FWBk740sp1etkmwoD_Dv416SQG3_mA',
+            'd' => 'dYp0PmjMg_xzq-J3Srfzpghejc38uVOaoOOHQXgEhpw',
+        ]);
+    }
+
+    private static function createDpopBoundToken(JWK $key): string
+    {
+        return self::createJws([
+            'iat' => time() - 1,
+            'nbf' => time() - 1,
+            'exp' => time() + 3600,
+            'iss' => 'https://www.example.com',
+            'aud' => 'Symfony OIDC',
+            'sub' => 'e21bf182-1538-406e-8ccb-e25a17aba39f',
+            'username' => 'dunglas',
+            'cnf' => ['jkt' => $key->toPublic()->thumbprint('sha256')],
+        ]);
+    }
+
+    private static function createDpopProof(JWK $key, string $token, string $url): string
+    {
+        return (new JwsCompactSerializer())->serialize((new JWSBuilder(new AlgorithmManager([new ES256()])))
+            ->withPayload(json_encode([
+                'jti' => bin2hex(random_bytes(16)),
+                'htm' => 'GET',
+                'htu' => $url,
+                'iat' => time(),
+                'ath' => rtrim(strtr(base64_encode(hash('sha256', $token, true)), '+/', '-_'), '='),
+            ]))
+            ->addSignature($key, ['typ' => 'dpop+jwt', 'alg' => 'ES256', 'jwk' => $key->toPublic()->all()])
+            ->build()
+        );
     }
 
     private static function createJws(array $claims, array $header = ['typ' => 'at+jwt']): string

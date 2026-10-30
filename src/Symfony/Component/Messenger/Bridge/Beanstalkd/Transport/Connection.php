@@ -45,7 +45,7 @@ class Connection
     private int $ttr;
     private bool $buryOnReject;
 
-    private bool $usingTube = false;
+    private ?string $usedTube = null;
     private bool $watchingTube = false;
     private bool $busy = false;
 
@@ -126,13 +126,16 @@ class Connection
     }
 
     /**
-     * @param int  $delay    The delay in milliseconds
-     * @param ?int $priority The priority at which the message will be reserved
+     * @param int     $delay    The delay in milliseconds
+     * @param ?int    $priority The priority at which the message will be reserved
+     * @param ?string $tube     The tube to put the message in instead of the configured one
      *
      * @return string The inserted id
      */
-    public function send(string $body, array $headers, int $delay = 0, ?int $priority = null): string
+    public function send(string $body, array $headers, int $delay = 0, ?int $priority = null, ?string $tube = null): string
     {
+        $tube = null !== $tube ? new TubeName($tube) : $this->tube;
+
         try {
             $message = json_encode([
                 'body' => $body,
@@ -142,8 +145,8 @@ class Connection
             throw new TransportException($exception->getMessage(), 0, $exception);
         }
 
-        return $this->withReconnect(function () use ($message, $delay, $priority) {
-            $this->useTube();
+        return $this->withReconnect(function () use ($message, $delay, $priority, $tube) {
+            $this->useTube($tube);
             $job = $this->client->put(
                 $message,
                 $priority ?? PheanstalkPublisherInterface::DEFAULT_PRIORITY,
@@ -242,14 +245,25 @@ class Connection
         });
     }
 
-    private function useTube(): void
+    public function close(): void
     {
-        if ($this->usingTube) {
+        $this->client->disconnect();
+
+        // the next command opens a new session, which uses and watches the "default" tube
+        $this->usedTube = null;
+        $this->watchingTube = false;
+    }
+
+    private function useTube(?TubeName $tube = null): void
+    {
+        $tube ??= $this->tube;
+
+        if ((string) $tube === $this->usedTube) {
             return;
         }
 
-        $this->client->useTube($this->tube);
-        $this->usingTube = true;
+        $this->client->useTube($tube);
+        $this->usedTube = (string) $tube;
     }
 
     private function watchTube(): void
@@ -285,10 +299,7 @@ class Connection
                 try {
                     return $command();
                 } catch (ConnectionException) {
-                    $this->client->disconnect();
-
-                    $this->usingTube = false;
-                    $this->watchingTube = false;
+                    $this->close();
 
                     if (null !== $reservedJobId) {
                         try {
@@ -301,6 +312,12 @@ class Connection
                     return $command();
                 }
             } catch (Exception $exception) {
+                if ($exception instanceof ConnectionException) {
+                    // the next command opens a new session, which uses and watches the "default" tube
+                    $this->usedTube = null;
+                    $this->watchingTube = false;
+                }
+
                 throw new TransportException($exception->getMessage(), 0, $exception);
             } finally {
                 $this->busy = false;
@@ -321,7 +338,7 @@ class Connection
      */
     private function holdSignals(callable $command): mixed
     {
-        $asyncSignals = \function_exists('pcntl_async_signals') && pcntl_async_signals(false);
+        $asyncSignals = \function_exists('pcntl_async_signals') && \function_exists('pcntl_signal_dispatch') && pcntl_async_signals(false);
 
         try {
             return $command();

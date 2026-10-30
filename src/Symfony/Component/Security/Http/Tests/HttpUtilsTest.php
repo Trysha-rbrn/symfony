@@ -13,6 +13,7 @@ namespace Symfony\Component\Security\Http\Tests;
 
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use Psr\Log\LoggerInterface;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Session\Session;
 use Symfony\Component\HttpFoundation\Session\Storage\MockArraySessionStorage;
@@ -25,6 +26,7 @@ use Symfony\Component\Routing\Matcher\UrlMatcherInterface;
 use Symfony\Component\Routing\RequestContext;
 use Symfony\Component\Routing\Route;
 use Symfony\Component\Routing\RouteCollection;
+use Symfony\Component\Routing\Router;
 use Symfony\Component\Security\Http\HttpUtils;
 use Symfony\Component\Security\Http\SecurityRequestAttributes;
 
@@ -490,6 +492,52 @@ class HttpUtilsTest extends TestCase
         $this->assertTrue($utils->checkRequestPath($request, 'App\Controller\FooBarController'));
     }
 
+    public function testCheckRequestPathWithParametersNotMatchingTheRequirementsDoesNotLog()
+    {
+        $request = $this->getRequest('/cart');
+        $request->attributes->set('_route', 'cart');
+        $request->attributes->set('_route_params', ['id' => null]);
+
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->expects($this->never())->method('error');
+
+        $generator = new UrlGenerator($this->getRoutesWithRequirements(), (new RequestContext())->fromRequest($request), $logger);
+        $generator->setStrictRequirements(false);
+
+        $utils = new HttpUtils($generator);
+
+        $this->assertFalse($utils->checkRequestPath($request, 'check'));
+        $this->assertFalse($generator->isStrictRequirements());
+    }
+
+    public function testCheckRequestPathThroughARouterWithParametersNotMatchingTheRequirementsDoesNotLog()
+    {
+        $request = $this->getRequest('/cart');
+        $request->attributes->set('_route', 'cart');
+        $request->attributes->set('_route_params', ['id' => null]);
+
+        $logger = $this->createMock(LoggerInterface::class);
+        $logger->expects($this->never())->method('error');
+
+        $generator = new UrlGenerator($this->getRoutesWithRequirements(), (new RequestContext())->fromRequest($request), $logger);
+        $generator->setStrictRequirements(false);
+
+        $router = $this->createStub(Router::class);
+        $router->method('getGenerator')->willReturn($generator);
+        $router->method('generate')->willReturnCallback($generator->generate(...));
+
+        $utils = new HttpUtils($router);
+
+        $this->assertFalse($utils->checkRequestPath($request, 'check'));
+        $this->assertFalse($generator->isStrictRequirements());
+
+        $request = $this->getRequest('/check/5');
+        $request->attributes->set('_route', 'check');
+        $request->attributes->set('_route_params', ['id' => '5']);
+
+        $this->assertTrue($utils->checkRequestPath($request, 'check_alias'));
+    }
+
     public function testCheckPathWithoutRouteParam()
     {
         $urlMatcher = $this->createStub(UrlMatcherInterface::class);
@@ -520,6 +568,37 @@ class HttpUtilsTest extends TestCase
         $this->assertEquals('/foo/bar#fragment', $utils->generateUri(new Request(), 'route_name'));
     }
 
+    public function testGenerateUriIgnoresAttributesThatCannotBeRouteParameters()
+    {
+        $object = new \stdClass();
+        $object->self = $object;
+
+        $user = new class($object) implements \Stringable {
+            public function __construct(public object $object)
+            {
+            }
+
+            public function __toString(): string
+            {
+                return 'jane';
+            }
+        };
+
+        $request = $this->getRequest('/fr/protected');
+        $request->attributes->set('_locale', 'fr');
+        $request->attributes->set('user', $user);
+        $request->attributes->set('owner', $user);
+        $request->attributes->set('objects', [$object]);
+        $request->attributes->set('object', $object);
+
+        $routes = new RouteCollection();
+        $routes->add('login', new Route('/{_locale}/login/{user}'));
+
+        $utils = new HttpUtils(new UrlGenerator($routes, (new RequestContext())->fromRequest($request)));
+
+        $this->assertSame('http://localhost/fr/login/jane', $utils->generateUri($request, 'login'));
+    }
+
     public function testUrlGeneratorIsRequiredToGenerateUrl()
     {
         $this->expectException(\LogicException::class);
@@ -541,5 +620,15 @@ class HttpUtilsTest extends TestCase
     private function getRequest($path = '/')
     {
         return Request::create($path, 'get');
+    }
+
+    private function getRoutesWithRequirements(): RouteCollection
+    {
+        $routes = new RouteCollection();
+        $routes->add('check', new Route('/check/{id}'));
+        $routes->addAlias('check_alias', 'check');
+        $routes->add('cart', new Route('/cart/{id}', ['id' => null], ['id' => '\\d+']));
+
+        return $routes;
     }
 }

@@ -1,0 +1,38 @@
+<?php
+
+return [
+    'Names' => [
+        'Ỹnoha Kufy-sĩ', 'Ẽmĩrano Arame Jãnkamu', 'Afeganĩ (1927–2002)', 'Afeganĩ afegỹv', 'Arámánja Rég (1946–1965)', 'Arámánja Rég', 'Arámẽnja Daram', 'Ỹtiria Orỹnesa Kafejsĩ', 'Ỹgora Kwanza', 'Ỹgora Cuanza (1977–1990)', 'Ỹgora cuanza tãg (1990–2000)', 'Ỹgora cuanza ki hynhan ka nĩ (1990–2000)', 'Arjẽtinỹ Asufraw', 'Arjẽtinỹ Kufy Rej (1970–1983)', 'Arjẽtinỹ Kufy (1881–1970)', 'Arjẽtinỹ Kufy (1983–1985)', 'Arjẽtinỹ Kufy // Arjẽntĩnỹ Kufy', 'Agtirija Serĩm', 'Awotyraria Nórar Si', 'Aruma Kafejsĩ',
+        'Ajermajjáv Manati (1993–2006)', 'Manati aseri', 'Mósinĩja-Hersegovĩna Ninỹ (1992–1994)', 'Mósinĩja Hersegovĩna-mré Mỹrko ta ũn há', 'Mósinĩja-Hersegovĩna Ninỹ Tãg (1994–1997)', 'Juvã-mág Nórar', 'Mágranési Taka', 'Mérjika Vĩpir (conv)', 'Mérjika Vĩpir', 'Mérjika Vĩpir (financ)', 'Mugarja Rev Tar', 'Mugarja Ver kynkar', 'Mugarja Rev', 'Mugarja Rev (1879–1952)', 'Marẽnh Ninỹ', 'Murũni Vĩpir', 'Karsa-ror-ag Nórar', 'Mrunẽj Nórar', 'Morivija Jãnkamu', 'Morivijanũ (1863–1963)',
+        'Morivija Kufy', 'Morivija Munór', 'Mrasir Krujeru Tãg (1967–1986)', 'Mrasir Krusanu (1986–1989)', 'Mrasir Krujeru (1990–1993)', 'Mrasir Rejar', 'Mrasir Krusanu Tãg (1989–1990)', 'Mrasir Krujeru (1993–1994)', 'Mrasir Krujeru (1942–1967)', 'Mahamỹ Nórar', 'Butỹ Guturũm', 'Mirmỹnja Kyate', 'Monsuvỹnỹ Pura', 'Miero-Husija Humro Tãg (1994–1999)', 'Miero-Husija Humro', 'Miero-Husija Humro (2000–2016)', 'Merise Nórar', 'Kanỹna Nórar', 'Kãgu Vĩpir', 'WIR Evoro',
+        'Suvisa Vĩpir', 'WIR Vĩpir', 'Sire Vẽjuven', 'Sirenũ ag vẽnhkãmur ũ', 'Sire Kufy', 'Sĩnỹ Yvỹn (offshore)', 'Sĩnỹ Yvỹn', 'Kolãmja Kufy', 'Vẽnhkãmun ũ kaja uri', 'Kotahika Korãn', 'Sérvija Ninỹ (2002–2006)', 'Sékorovaka Rãgre Tar', 'Kuma Kufy conv', 'Kuma Kufy', 'Pu-Tánh Vẽjuven', 'Sipre Rimra', 'Séka Rãgre', 'Aremỹja Rãjur tá Jãnkamu', 'Aremỹnhỹ Mỹrko', 'Nhimuti Vĩpir',
+        'Ninỹmỹrka Rãgre', 'Nomĩnĩka Kufy', 'Argerija Ninỹ', 'Ekuvanor Sukri', 'Ekuvanor UVC', 'Enhtonĩja Rãgre', 'Ejimto Rimra', 'Eriteréja Nagfa', 'Esipỹnja Kufy-sĩ (kãtá A)', 'Esipỹnja Kufy-sĩ (kãtá conv)', 'Esipỹnja Kufy-sĩ', 'Etiópija Mir', 'Evoro', 'Fĩrỹnija Mỹrka', 'Fiji Nórar', 'Mỹrvinỹ Rimra', 'Frỹsa Vĩpir', 'Rimra Eterĩnỹ', 'Jiórja Kupãni Rari', 'Jiórja Rari',
+        'Gỹnỹ Senhi (1979–2007)', 'Gỹnỹ Senhi', 'Nhimratar Rimra', 'Gỹmija Narasi', 'Ginẽ Vĩpir', 'Ginẽ Syri', 'Ginẽ Ekuvanor Ekuvele', 'Grésija Narakymỹ', 'Guvỹtemỹra Kensav', 'Fóg tỹ Ginẽ Vẽjuven', 'Ginẽ-Misav Kufy', 'Gijỹnỹ Nórar', 'Hãg-Kãg Nórar', 'Ãnura Rẽpirá', 'Krovasija Ninỹ', 'Krovasija Kuna', 'Ajti Runja', 'Ũgrija Kafejsĩ', 'Ĩnonẽsija Rupija', 'Irỹna Rimra',
+        'Isihaé Rimra', 'Isihaé Sekév Si', 'Isihaé Sekév Tãg', 'Ĩnija Rupija', 'Iraki Ninỹ', 'Irỹ Hi’av', 'Kukryr-ga Rãgre Si', 'Kukryr-ga Rãgre', 'Itarija Rira', 'Jamỹjka Nórar', 'Jornánĩja Ninỹ', 'Japã Jenẽ', 'Kẽnja Serĩm', 'Kirgi-Ga Kyr', 'Kỹmósa Hijév', 'Komor Vĩpir', 'Nãrti-Koréja Vãn', 'Koréja Sur Huvỹ (1953–1962)', 'Koréja Sur Vãn (1945–1953)', 'Koréja Sur Vãn',
+        'Kuvajti Ninỹ', 'Kanhmỹ Vãsogso Nórar', 'Kajakinhtỹv Tẽge', 'Ravusi Kim', 'Rimanũ Rimra', 'Sirijỹká Rupija', 'Rimérijỹ Nórar', 'Resotu Roti', 'Rituvỹnja Ritasi', 'Rituvỹnja Taronỹ', 'Rusẽmurgo Vĩpir conv.', 'Rusẽmurgo Vĩpir', 'Rusẽmurgo Vĩpir Jãnkamu', 'Rativija Rati', 'Rativija Humro', 'Rimija Ninỹ', 'Ar-Magrim Nirham', 'Ar-Magrim Vĩpir', 'Mõnỹku Vĩpir', 'Mãrnova Kopã',
+        'Mãrnova Revu', 'Mỹna-Gasikar Ari-ary', 'Mỹna-Gasikar Vĩpir', 'Mỹsenonĩja Ninỹ', 'Mỹsenonĩja Ninỹ (1992–1993)', 'Mỹri Vĩpir', 'Mijẽn-Mỹ Kijate', 'Mãgórija Tugrig', 'Mỹkav Pataka', 'Mũritỹni Ov-Gija (1973–2017)', 'Mũritỹni Ov-Gija', 'Mỹrta Rirá', 'Mỹrta Rimra', 'Mãriso Rupija', 175 => 'Mỹrniva Rupija', 'Mỹravi Kuvasa', 'Mẽsiku Kufy', 'Mẽsiku Kufy Kupri (1861–1992)', 'Mẽsiku Pir Rãg (UDI)',
+        'Mỹraja Rĩggin', 'Mãsỹmiki Vẽjuven', 'Mãsỹmiki Mẽtikar (1980–2006)', 'Mãsỹmiki Mẽtikar', 'Nỹmĩmija Nórar', 'Nĩjérija Nỹjra', 'Nĩkaraguva Kórnoma (1988–1991)', 'Nĩkaraguva Kórnoma', 'Orỹna Kafejsĩ', 'Nãrovéga Rãgre', 'Nẽpar Rupija', 'Zirỹnija Tãg Nórar', 'Omỹ Hijar', 'Panỹmỹ Mavo-Mova', 'Peru Ĩnti', 'Peru Rã Tãg', 'Peru Rã (1863–1965)', 'Papuva Kinỹ', 'Firipinỹ Kufy', 'Pakinhtỹv Rupiya',
+        'Poronĩja Rẽrĩr', 'Poronĩja Rẽrĩr (1950–1995)', 'Purutuga Vẽjuven', 'Paraguvaj Garnĩ', 'Katar Hijar', 'Ronésija Nórar', 'Romẽnija Rev (1952–2006)', 'Romẽnija Rev', 'Séruvija Ninỹ', 'Husija Humro', 'Husija Humro (1991–1998)', 'Huvỹna Vĩpir', 'Aramija Savnita Hijar', 'Saromỹ Vẽsogso Nórar', 'Sejséri Rupija', 'Suná Ninỹ (1992–2007)', 'Suná Rimbra', 'Suná Rimbra (1957–1998)', 'Suvésija Rãgre', 'Sĩgapur Nórar',
+        'Sỹta Herenỹ Rimra', 'Enhrovenĩja Torar Há', 'Enhrovakija Rãgre', 'Krĩ Mĩgkusũg-fi Re’onĩ', 'Krĩ Mĩgkusũg-fi Re’onĩ (1964—2022)', 'Somỹrija Serĩm', 'Surinỹm Nórar', 'Surinỹm Kafejsĩ', 'Suná-Sur Rimra', 'Sỹtomẽ Prĩsipi-mré Nómra (1977–2017)', 'Sỹtomẽ Prĩsipi-mré Nómra', 'Sovijéti Humro', 'Er Sarvanor Korãn', 'Sirija Rimra', 'Suvasi-Ga Rirỹgenĩ', 'Taj-Ga Mati', 'Tanijikinhtỹv Humro', 'Tanijikinhtỹv Somãnĩ', 'Turkomẽnisitỹ Manati (1993–2009)', 'Tukomẽnũ Manati',
+        'Tunĩsija Ninỹ', 'Tãga Pa’ỹga', 'Timor Vẽjuven', 'Turkija Rira (1922–2005)', 'Turkija Rira', 'Tirinĩna Tomago-mré Nórar', 'Tajvỹ Nórar Tãg', 'Tỹnjỹnĩja Serĩm', 'Ukrỹnĩja Hyryvinja', 'Ukrỹnĩja Karbovanẽ', 'Ugỹna Serĩm (1966–1987)', 'Ugỹna Serĩm', 'Nãrti-Amẽrikỹ Nórar', 'Nãrti-Amẽrikỹ Nórar (kurã ũ kã)', 'Nãrti-Amẽrikỹ Nórar (kurã hã)', 'Uruguvaj Kufy vẽkãmur ũ', 'Uruguvaj Kufy (1975–1993)', 'Uruguvaj Kufy', 259 => 'Unhmekinhtỹv Kyr',
+        'Venẽjuvéra Morivar (1871–2008)', 262 => 'Venẽjuvéra Morivar (2008–2018)', 'Venẽjuvéra Morivar', 'Vijétinỹm Nãg', 'Vijétinỹm Nãg (1978–1985)', 'Vanũvatu Vatu', 'Samãva Tara', 'Vĩpir CFA tỹ BEAC', 'Karime Rãjur Nórar', 271 => 'Orópa Nĩkri ũ-pir', 'Frỹsa Vĩpir-Oro', 'Frỹsa UIC Vĩpir', 'Vĩpir CFA tỹ BCEAO', 'Vĩpir CFP', 'RINET Kãryjgy', 'Jemẽn Ninỹ', 'Jemẽn Hijar', 'Jugusiravija Ninỹ Tar (1966–1990)',
+        'Jugusiravija Ninỹ Tãg (1994–2002)', 'Jugusiravija Ninỹ ta ũn há (1990–1992)', 'Jugusiravija Ninỹ han mãn tãg (1992–1993)', 'Ran surafrikỹnũ (virhár)', 'Ran surafrikỹnũ', 'Kuvasa Jỹmijanũ (1968–2012)', 'Kuvasa jỹmijanũ', 'Jajre Tãg Sajrẽse', 'Jajre Sajrẽse (1971–1993)', 'Jimamuvé Nórar (1980– 2008)', 291 => 'Jimamuvé Nórar (2009)', 'Jimamuvé Nórar (2008)',
+    ],
+    'Symbols' => [
+        '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', 'AU$', '',
+        '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+        '', '', '', '', '', 'R$', '', '', '', '', '', '', '', '', '', '', '', 'CA$', '', '',
+        '', '', '', '', '', '', 'CN¥', '', '', '', '', '', '', '', '', '', '', '', '', '',
+        '', '', '', '', '', '', '', '', '', '', '', '', '€', '', 'FJC', '', '', '£', '', '',
+        '', '', '', '', '', '', '', '', '', '', '', '', 'HK$', '', '', '', '', '', '', '',
+        '', '', '₪', '₹', '', '', '', '', '', '', '', 'JP¥', '', '', '', '', '', '', '', '₩',
+        '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+        '', '', '', '', '', '', '', '', '', '', '', '', '', '', 175 => '', '', 'MX$', '', '',
+        '', '', '', '', '', '', '', '', '', '', '', 'NZ$', '', '', '', '', '', '', '', '',
+        '', '', 'Vẽj.', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+        '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '฿', '', '', '', '',
+        '', '', '', '', '', '', 'NT$', '', '', '', '', '', 'US$', '', '', '', '', '', 259 => '',
+        '', 262 => '', '', '₫', '', '', '', 'FCFA', 'EC$', 271 => '', '', '', 'CFA', 'CFPF', '', '', '', '',
+        '', '', '', '', '', 'SMK', '', '', '', '', 291 => '', '',
+    ],
+];

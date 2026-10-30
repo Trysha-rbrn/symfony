@@ -322,6 +322,10 @@ class MockHttpClientTest extends HttpClientTestCase
 
     protected function getHttpClient(string $testCase): HttpClientInterface
     {
+        if (str_starts_with($testCase, 'testBackpressure')) {
+            $this->markTestSkipped('Backpressure requires a transport client.');
+        }
+
         $responses = [];
 
         $headers = [
@@ -397,6 +401,12 @@ class MockHttpClientTest extends HttpClientTestCase
             case 'testPause':
             case 'testPauseReplace':
             case 'testPauseDuringBody':
+            case 'testPauseBeforeTheRequestIsSent':
+            case 'testPauseLongerThanTimeout':
+            case 'testPauseDuringBodyLongerThanTimeout':
+            case 'testPauseCountsTowardMaxDuration':
+            case 'testTransferAfterPauseCountsTowardMaxDuration':
+            case 'testPauseDoesNotDelayTheTimeoutOfOtherResponses':
                 $this->markTestSkipped("MockHttpClient doesn't support pauses by default");
                 break;
 
@@ -518,6 +528,11 @@ class MockHttpClientTest extends HttpClientTestCase
         return new MockHttpClient($responses);
     }
 
+    public function testGetContentThrowsWhenCanceledDuringTheBody()
+    {
+        $this->markTestSkipped('MockResponse calls "on_progress" for the whole body before returning the headers.');
+    }
+
     public function testHttp2PushVulcain()
     {
         $this->markTestSkipped('MockHttpClient doesn\'t support HTTP/2 PUSH.');
@@ -526,6 +541,11 @@ class MockHttpClientTest extends HttpClientTestCase
     public function testHttp2PushVulcainWithUnusedResponse()
     {
         $this->markTestSkipped('MockHttpClient doesn\'t support HTTP/2 PUSH.');
+    }
+
+    public function testHttp2WithPriorKnowledge()
+    {
+        $this->markTestSkipped('MockHttpClient doesn\'t support HTTP/2.');
     }
 
     public function testUnixSocket()

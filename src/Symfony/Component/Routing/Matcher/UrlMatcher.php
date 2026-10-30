@@ -11,6 +11,7 @@
 
 namespace Symfony\Component\Routing\Matcher;
 
+use Symfony\Component\ExpressionLanguage\ConstantFunctionProvider;
 use Symfony\Component\ExpressionLanguage\ExpressionFunctionProviderInterface;
 use Symfony\Component\ExpressionLanguage\ExpressionLanguage;
 use Symfony\Component\HttpFoundation\Request;
@@ -43,6 +44,14 @@ class UrlMatcher implements UrlMatcherInterface, RequestMatcherInterface
      * @internal
      */
     protected array $allowSchemes = [];
+
+    /**
+     * Collects URI schemes that would be allowed for the request before a trailing slash redirection took precedence.
+     *
+     * @internal
+     */
+    protected array $trailingSlashSchemes = [];
+
     protected ?Request $request = null;
     protected ExpressionLanguage $expressionLanguage;
 
@@ -69,7 +78,7 @@ class UrlMatcher implements UrlMatcherInterface, RequestMatcherInterface
 
     public function match(string $pathinfo): array
     {
-        $this->allow = $this->allowSchemes = [];
+        $this->allow = $this->allowSchemes = $this->trailingSlashSchemes = [];
         $pathinfo = '' === ($pathinfo = rawurldecode($pathinfo)) ? '/' : $pathinfo;
 
         if ($ret = $this->matchCollection($pathinfo, $this->routes)) {
@@ -114,7 +123,7 @@ class UrlMatcher implements UrlMatcherInterface, RequestMatcherInterface
     protected function matchCollection(string $pathinfo, RouteCollection $routes): array
     {
         // HEAD and GET are equivalent as per RFC
-        if ('HEAD' === $method = $this->context->getMethod()) {
+        if ('HEAD' === $method = $requestMethod = $this->context->getMethod()) {
             $method = 'GET';
         }
         $supportsTrailingSlash = 'GET' === $method && $this instanceof RedirectableUrlMatcherInterface;
@@ -164,6 +173,8 @@ class UrlMatcher implements UrlMatcherInterface, RequestMatcherInterface
 
             if ('/' !== $pathinfo && !$hasTrailingVar && $hasTrailingSlash === ($trimmedPathinfo === $pathinfo)) {
                 if ($supportsTrailingSlash && (!$requiredMethods || \in_array('GET', $requiredMethods, true))) {
+                    $this->trailingSlashSchemes = $this->allowSchemes;
+
                     return $this->allow = $this->allowSchemes = [];
                 }
                 continue;
@@ -174,7 +185,7 @@ class UrlMatcher implements UrlMatcherInterface, RequestMatcherInterface
                 continue;
             }
 
-            if ($requiredMethods && !\in_array($method, $requiredMethods, true)) {
+            if ($requiredMethods && !\in_array($method, $requiredMethods, true) && !\in_array($requestMethod, $requiredMethods, true)) {
                 $this->allow = array_merge($this->allow, $requiredMethods);
                 continue;
             }
@@ -216,7 +227,7 @@ class UrlMatcher implements UrlMatcherInterface, RequestMatcherInterface
     protected function handleRouteRequirements(string $pathinfo, string $name, Route $route, array $routeParameters): array
     {
         // expression condition
-        if ($route->getCondition() && !$this->getExpressionLanguage()->evaluate($route->getCondition(), [
+        if ('' !== $route->getCondition() && !$this->getExpressionLanguage()->evaluate($route->getCondition(), [
             'context' => $this->context,
             'request' => $this->request ?: $this->createRequest($pathinfo),
             'params' => $routeParameters,
@@ -247,7 +258,7 @@ class UrlMatcher implements UrlMatcherInterface, RequestMatcherInterface
             if (!class_exists(ExpressionLanguage::class)) {
                 throw new \LogicException('Unable to use expressions as the Symfony ExpressionLanguage component is not installed. Try running "composer require symfony/expression-language".');
             }
-            $this->expressionLanguage = new ExpressionLanguage(null, $this->expressionLanguageProviders);
+            $this->expressionLanguage = new ExpressionLanguage(null, class_exists(ConstantFunctionProvider::class) ? [new ConstantFunctionProvider(['*', '*::*']), ...$this->expressionLanguageProviders] : $this->expressionLanguageProviders);
         }
 
         return $this->expressionLanguage;

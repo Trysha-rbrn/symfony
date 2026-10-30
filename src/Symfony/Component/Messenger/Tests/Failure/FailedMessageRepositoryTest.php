@@ -11,23 +11,36 @@
 
 namespace Symfony\Component\Messenger\Tests\Failure;
 
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\Group;
+use PHPUnit\Framework\Attributes\IgnoreDeprecations;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\DependencyInjection\ServiceLocator;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Exception\InvalidArgumentException;
 use Symfony\Component\Messenger\Exception\LogicException;
+use Symfony\Component\Messenger\Exception\MessageDecodingFailedException;
 use Symfony\Component\Messenger\Failure\FailedMessageFilter;
 use Symfony\Component\Messenger\Failure\FailedMessageRepository;
+use Symfony\Component\Messenger\MessageBus;
 use Symfony\Component\Messenger\MessageBusInterface;
+use Symfony\Component\Messenger\Middleware\DecodeFailedMessageMiddleware;
+use Symfony\Component\Messenger\Middleware\SendMessageMiddleware;
 use Symfony\Component\Messenger\Stamp\BusNameStamp;
 use Symfony\Component\Messenger\Stamp\ReceivedStamp;
 use Symfony\Component\Messenger\Stamp\RedeliveryStamp;
 use Symfony\Component\Messenger\Stamp\SentToFailureTransportStamp;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
+use Symfony\Component\Messenger\Stamp\TrustStamp;
 use Symfony\Component\Messenger\Tests\Fixtures\DummyMessage;
+use Symfony\Component\Messenger\Transport\InMemory\InMemoryTransport;
 use Symfony\Component\Messenger\Transport\Receiver\ListableReceiverInterface;
 use Symfony\Component\Messenger\Transport\Receiver\MessageCountAwareInterface;
 use Symfony\Component\Messenger\Transport\Receiver\ReceiverInterface;
+use Symfony\Component\Messenger\Transport\Sender\SendersLocator;
+use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
+use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
+use Symfony\Component\Messenger\Transport\Serialization\SigningSerializer;
 
 class FailedMessageRepositoryTest extends TestCase
 {
@@ -105,6 +118,66 @@ class FailedMessageRepositoryTest extends TestCase
         $this->assertSame([], iterator_to_array($repository->all(null, null, 10), false));
     }
 
+    public function testAllAppliesTheLimitToTheMessagesThatMatchTheFilter()
+    {
+        $calls = [];
+        $read = 0;
+        $receiver = $this->createListableReceiver(250, [120, 230, 240, 250], $calls, $read);
+        $repository = new FailedMessageRepository(new ServiceLocator(['global' => static fn () => $receiver]), 'global');
+
+        $envelopes = iterator_to_array($repository->all(null, new FailedMessageFilter(DummyMessage::class), 2), false);
+
+        $this->assertSame(['120', '230'], array_map(static fn (Envelope $envelope) => $envelope->getMessage()->getMessage(), $envelopes));
+        $this->assertSame([[null]], $calls);
+        $this->assertSame(230, $read);
+    }
+
+    public function testAllWithAFilterReadsTheReceiverOnce()
+    {
+        $calls = [];
+        $read = 0;
+        $receiver = $this->createListableReceiver(250, [120, 230, 240, 250], $calls, $read);
+        $repository = new FailedMessageRepository(new ServiceLocator(['global' => static fn () => $receiver]), 'global');
+
+        $envelopes = iterator_to_array($repository->all(null, new FailedMessageFilter(DummyMessage::class)), false);
+
+        $this->assertSame(['120', '230', '240', '250'], array_map(static fn (Envelope $envelope) => $envelope->getMessage()->getMessage(), $envelopes));
+        $this->assertSame([[null]], $calls);
+        $this->assertSame(250, $read);
+    }
+
+    public function testAllStopsReadingWhenTheCallerStops()
+    {
+        $calls = [];
+        $read = 0;
+        $receiver = $this->createListableReceiver(250, [10, 230], $calls, $read);
+        $repository = new FailedMessageRepository(new ServiceLocator(['global' => static fn () => $receiver]), 'global');
+
+        foreach ($repository->all(null, new FailedMessageFilter(DummyMessage::class)) as $envelope) {
+            break;
+        }
+
+        $this->assertSame('10', $envelope->getMessage()->getMessage());
+        $this->assertSame(10, $read);
+    }
+
+    #[DataProvider('provideLimitsThatSelectNothing')]
+    public function testAllDoesNotReadTheTransportWhenTheLimitSelectsNoMatchingMessage(int $limit)
+    {
+        $receiver = $this->createMock(ListableReceiverInterface::class);
+        $receiver->expects($this->never())->method('all');
+
+        $repository = new FailedMessageRepository(new ServiceLocator(['global' => static fn () => $receiver]), 'global');
+
+        $this->assertSame([], iterator_to_array($repository->all(null, new FailedMessageFilter(DummyMessage::class), $limit), false));
+    }
+
+    public static function provideLimitsThatSelectNothing(): iterable
+    {
+        yield [0];
+        yield [-1];
+    }
+
     public function testAllRejectsANonListableTransportEagerly()
     {
         $repository = new FailedMessageRepository(new ServiceLocator([
@@ -180,6 +253,58 @@ class FailedMessageRepositoryTest extends TestCase
         $this->assertCount(1, $prepared->all(BusNameStamp::class));
     }
 
+    public function testPrepareForRedispatchKeepsTellingWhetherTheEnvelopeIsTrusted()
+    {
+        $trust = TrustStamp::trusted();
+
+        $this->assertSame($trust, FailedMessageRepository::prepareForRedispatch(new Envelope(new DummyMessage('a'), [new ReceivedStamp('failed'), $trust]))->last(TrustStamp::class));
+        $this->assertFalse(FailedMessageRepository::prepareForRedispatch(new Envelope(new DummyMessage('a'), [new ReceivedStamp('failed')]))->last(TrustStamp::class)?->isTrusted());
+        $this->assertFalse(FailedMessageRepository::prepareForRedispatch(new Envelope(new DummyMessage('a')))->last(TrustStamp::class)?->isTrusted());
+    }
+
+    #[DataProvider('provideFailureTransportSerializers')]
+    public function testRedispatchToATransportThatSignsEverythingIsAcceptedOnlyWhenTheFailureTransportVerifiedTheMessage(SerializerInterface $failureSerializer, bool $expectAccepted)
+    {
+        $this->assertRedispatchToATransportThatSignsEverythingIsAccepted($failureSerializer, $expectAccepted);
+    }
+
+    #[DataProvider('provideFailureTransportSerializersThatSignMessageTypes')]
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
+    public function testRedispatchToATransportThatSignsEverythingFromAFailureTransportThatSignsMessageTypes(\Closure $createFailureSerializer, bool $expectAccepted)
+    {
+        $this->assertRedispatchToATransportThatSignsEverythingIsAccepted($createFailureSerializer(), $expectAccepted);
+    }
+
+    private function assertRedispatchToATransportThatSignsEverythingIsAccepted(SerializerInterface $failureSerializer, bool $expectAccepted): void
+    {
+        $serializer = new SigningSerializer(new PhpSerializer(), 'signing-key');
+        $envelope = $failureSerializer->decode($failureSerializer->encode(new Envelope(new DummyMessage('a'), [new SentToFailureTransportStamp('async')])))->with(new ReceivedStamp('failed'));
+
+        $async = new InMemoryTransport($serializer);
+        $bus = new MessageBus([
+            new SendMessageMiddleware(new SendersLocator([DummyMessage::class => ['async']], new ServiceLocator(['async' => static fn () => $async]))),
+        ]);
+
+        $repository = new FailedMessageRepository(new ServiceLocator(['global' => fn () => $this->createStub(ListableReceiverInterface::class)]), 'global', null, $bus);
+        $repository->redispatch($envelope);
+
+        $this->assertCount(1, $sent = $async->getSent());
+        $this->assertInstanceOf($expectAccepted ? DummyMessage::class : MessageDecodingFailedException::class, $sent[0]->getMessage());
+    }
+
+    public static function provideFailureTransportSerializers(): iterable
+    {
+        yield 'signing every message' => [new SigningSerializer(new PhpSerializer(), 'signing-key'), true];
+        yield 'not signing' => [new PhpSerializer(), false];
+    }
+
+    public static function provideFailureTransportSerializersThatSignMessageTypes(): iterable
+    {
+        yield 'signing the message type' => [static fn () => new SigningSerializer(new PhpSerializer(), 'signing-key', [DummyMessage::class]), true];
+        yield 'signing other message types' => [static fn () => new SigningSerializer(new PhpSerializer(), 'signing-key', [\stdClass::class]), false];
+    }
+
     public function testRedispatchDispatchesTheStrippedEnvelopeThenAcksTheOriginal()
     {
         $envelope = new Envelope(new DummyMessage('a'), [
@@ -206,6 +331,54 @@ class FailedMessageRepositoryTest extends TestCase
         $this->assertSame($envelope->getMessage(), $dispatched->getMessage());
     }
 
+    public function testRedispatchDecodesADecodingFailureWithTheSerializerOfItsOriginalTransport()
+    {
+        $serializer = new PhpSerializer();
+        $envelope = MessageDecodingFailedException::wrap($serializer->encode(new Envelope(new DummyMessage('a'))), 'Could not decode.')
+            ->with(new SentToFailureTransportStamp('async'), new TransportMessageIdStamp(15));
+
+        $async = new InMemoryTransport();
+        $bus = new MessageBus([
+            new DecodeFailedMessageMiddleware(new ServiceLocator(['async' => static fn () => $serializer])),
+            new SendMessageMiddleware(new SendersLocator([DummyMessage::class => ['async']], new ServiceLocator(['async' => static fn () => $async]))),
+        ]);
+
+        $receiver = $this->createMock(ListableReceiverInterface::class);
+        $receiver->expects($this->once())->method('ack')->with($envelope);
+
+        $repository = new FailedMessageRepository(new ServiceLocator(['global' => static fn () => $receiver]), 'global', null, $bus);
+        $repository->redispatch($envelope);
+
+        $this->assertCount(1, $sent = $async->getSent());
+        $this->assertEquals(new DummyMessage('a'), $sent[0]->getMessage());
+        $this->assertSame([], $sent[0]->all(SentToFailureTransportStamp::class));
+    }
+
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
+    public function testRedispatchDoesNotPutTheStampsOfAnUnverifiedFailureOnTheSignedMessageItDecodesTo()
+    {
+        $phpSerializer = new PhpSerializer();
+        $encodedFailure = $phpSerializer->encode(new Envelope(new MessageDecodingFailedException('Could not retrieve the claim.', 0, null, ['body' => 'claim']), [new SentToFailureTransportStamp('async'), new RedeliveryStamp(3)]));
+        $envelope = (new SigningSerializer($phpSerializer, 'signing-key', [DummyMessage::class]))->decode($encodedFailure)->with(new TransportMessageIdStamp(15));
+
+        $serializer = $this->createStub(SerializerInterface::class);
+        $serializer->method('decode')->willReturn(new Envelope(new DummyMessage('a'), [new BusNameStamp('the_bus')]));
+
+        $async = new InMemoryTransport();
+        $bus = new MessageBus([
+            new DecodeFailedMessageMiddleware(new ServiceLocator(['async' => static fn () => $serializer])),
+            new SendMessageMiddleware(new SendersLocator([DummyMessage::class => ['async']], new ServiceLocator(['async' => static fn () => $async]))),
+        ]);
+
+        $repository = new FailedMessageRepository(new ServiceLocator(['global' => fn () => $this->createStub(ListableReceiverInterface::class)]), 'global', null, $bus);
+        $repository->redispatch($envelope);
+
+        $this->assertCount(1, $sent = $async->getSent());
+        $this->assertSame(['the_bus'], array_map(static fn (BusNameStamp $stamp): string => $stamp->getBusName(), $sent[0]->all(BusNameStamp::class)));
+        $this->assertSame([], $sent[0]->all(RedeliveryStamp::class));
+    }
+
     public function testRedispatchWithoutABusIsRejected()
     {
         $repository = new FailedMessageRepository(new ServiceLocator([
@@ -216,6 +389,22 @@ class FailedMessageRepositoryTest extends TestCase
         $this->expectExceptionMessage('Cannot redispatch a failed message without a message bus.');
 
         $repository->redispatch(new Envelope(new DummyMessage('a')));
+    }
+
+    private function createListableReceiver(int $count, array $matching, array &$calls, int &$read): ListableReceiverInterface
+    {
+        $receiver = $this->createStub(ListableReceiverInterface::class);
+        $receiver->method('all')->willReturnCallback(static function () use ($count, $matching, &$calls, &$read) {
+            $calls[] = \func_get_args();
+
+            foreach (range(1, $count) as $i) {
+                ++$read;
+
+                yield new Envelope(\in_array($i, $matching, true) ? new DummyMessage((string) $i) : new \stdClass(), [new TransportMessageIdStamp($i)]);
+            }
+        });
+
+        return $receiver;
     }
 }
 

@@ -87,24 +87,55 @@ class ArrayNodeDefinition extends NodeDefinition implements ParentNodeDefinition
     /**
      * Allows alternative types and wraps them into arrays.
      *
-     * @param list<ExprBuilder::TYPE_INT|ExprBuilder::TYPE_STRING|ExprBuilder::TYPE_BOOL|ExprBuilder::TYPE_NULL|ExprBuilder::TYPE_BACKED_ENUM> $allowedTypes
-     * @param string|null                                                                                                                      $key          The key to wrap the value in
+     * An array is wrapped into the child named by the key when it does not set this child, except for its keys that name other children.
+     * For a list of arrays, a map is accepted too: each of its keys goes into the child named by the key of its item, unless the item sets this child.
+     *
+     * @param list<ExprBuilder::TYPE_INT|ExprBuilder::TYPE_STRING|ExprBuilder::TYPE_BOOL|ExprBuilder::TYPE_NULL|ExprBuilder::TYPE_BACKED_ENUM|ExprBuilder::TYPE_ARRAY> $allowedTypes
+     * @param string|null                                                                                                                                              $key          The key to wrap the value in
      *
      * @return $this
      */
     public function acceptAndWrap(array $allowedTypes, ?string $key = null): static
     {
-        $this->allowedTypes = $allowedTypes;
+        // arrays are accepted anyway, so they do not replace the types declared by the normalization closures
+        $this->allowedTypes = array_values(array_diff($allowedTypes, [ExprBuilder::TYPE_ARRAY]));
 
         foreach ($allowedTypes as $type) {
+            if (ExprBuilder::TYPE_ARRAY === $type) {
+                $this->attribute('wraps_arrays_into', $key ?? throw new \InvalidArgumentException('Wrapping arrays requires the name of the child to wrap them into.'));
+
+                continue;
+            }
+
             $this->beforeNormalization()->ifTrue(match ($type) {
                 ExprBuilder::TYPE_INT => is_int(...),
                 ExprBuilder::TYPE_STRING => is_string(...),
                 ExprBuilder::TYPE_BOOL => is_bool(...),
                 ExprBuilder::TYPE_NULL => is_null(...),
                 ExprBuilder::TYPE_BACKED_ENUM => static fn ($v) => $v instanceof \BackedEnum,
-            })->then(static fn ($v) => [$key ?? 0 => $v]);
+            })->then(static fn ($v) => [$key ?? 0 => $v])->allowedTypes = $type;
         }
+
+        return $this;
+    }
+
+    /**
+     * Declares that the elements of this node can also be given in the parent node.
+     *
+     * The parent node must have a beforeNormalization() closure that rewrites those keys into the elements of this node.
+     * The declaration is descriptive: it tells JsonSchemaDumper and ArrayShapeGenerator that the parent accepts the keys of the elements of this node, so that they dump a shape for them instead of accepting any value.
+     *
+     * The key that names the elements, if any, is not part of their shape, as the child consumes it.
+     * The keys of the parent node cannot be declared by the elements too, as they could not be told apart when they are given at the level of the parent.
+     *
+     * The prototype of this node must be an array with children.
+     * Only one child of the parent node can make this declaration, and the parent node cannot also wrap arrays with acceptAndWrap().
+     *
+     * @return $this
+     */
+    public function acceptElementsAtParentLevel(): static
+    {
+        $this->attribute('elements_at_parent_level', true);
 
         return $this;
     }
@@ -364,6 +395,7 @@ class ArrayNodeDefinition extends NodeDefinition implements ParentNodeDefinition
             ->children()
                 ->booleanNode('enabled')
                     ->defaultFalse()
+                    ->resolvesAtCompileTime()
         ;
 
         if ($info) {
@@ -393,6 +425,7 @@ class ArrayNodeDefinition extends NodeDefinition implements ParentNodeDefinition
             ->children()
                 ->booleanNode('enabled')
                     ->defaultTrue()
+                    ->resolvesAtCompileTime()
         ;
 
         if ($info) {
@@ -529,7 +562,13 @@ class ArrayNodeDefinition extends NodeDefinition implements ParentNodeDefinition
         $normalizedTypes = $this->allowedTypes ?? [];
 
         if (isset($this->normalization)) {
-            $normalizedTypes = $normalizedTypes ?: $this->normalization->declaredTypes;
+            if (!$normalizedTypes) {
+                $normalizedTypes = $this->normalization->declaredTypes;
+            } elseif (\in_array(ExprBuilder::TYPE_ANY, $this->normalization->declaredTypes, true)) {
+                // the types listed by acceptAndWrap() replace the declared ones, but cannot tell what a closure accepting any value does
+                $normalizedTypes[] = ExprBuilder::TYPE_ANY;
+            }
+
             $node->setNormalizationClosures($this->normalization->before);
             $node->setXmlRemappings($this->normalization->remappings);
         }
@@ -552,6 +591,8 @@ class ArrayNodeDefinition extends NodeDefinition implements ParentNodeDefinition
         if (isset($this->validation)) {
             $node->setFinalValidationClosures($this->validation->rules);
         }
+
+        $this->validateElementsAtParentLevel($node);
 
         return $node;
     }
@@ -584,6 +625,14 @@ class ArrayNodeDefinition extends NodeDefinition implements ParentNodeDefinition
         if (false !== $this->addDefaultChildren) {
             throw new InvalidDefinitionException(\sprintf('->addDefaultChildrenIfNoneSet() is not applicable to concrete nodes at path "%s".', $path));
         }
+
+        if (isset($this->attributes['elements_at_parent_level'])) {
+            throw new InvalidDefinitionException(\sprintf('->acceptElementsAtParentLevel() is not applicable to concrete nodes at path "%s".', $path));
+        }
+
+        if (isset($this->attributes['wraps_arrays_into']) && !isset($this->children[$this->attributes['wraps_arrays_into']])) {
+            throw new InvalidDefinitionException(\sprintf('->acceptAndWrap() cannot wrap arrays into "%s" as it is not a child of the node at path "%s".', $this->attributes['wraps_arrays_into'], $path));
+        }
     }
 
     /**
@@ -597,6 +646,20 @@ class ArrayNodeDefinition extends NodeDefinition implements ParentNodeDefinition
 
         if ($this->addDefaults) {
             throw new InvalidDefinitionException(\sprintf('->addDefaultsIfNotSet() is not applicable to prototype nodes at path "%s".', $path));
+        }
+
+        if (isset($this->attributes['wraps_arrays_into'])) {
+            if (null !== $this->key) {
+                throw new InvalidDefinitionException(\sprintf('->acceptAndWrap() cannot wrap arrays into a prototype node that uses ->useAttributeAsKey() at path "%s".', $path));
+            }
+
+            if (!$this->prototype instanceof self || !isset($this->prototype->children[$this->attributes['wraps_arrays_into']])) {
+                throw new InvalidDefinitionException(\sprintf('->acceptAndWrap() cannot wrap arrays into "%s" as it is not a child of the items of the node at path "%s".', $this->attributes['wraps_arrays_into'], $path));
+            }
+        }
+
+        if (isset($this->attributes['elements_at_parent_level']) && (!$this->prototype instanceof self || isset($this->prototype->prototype) || !$this->prototype->children)) {
+            throw new InvalidDefinitionException(\sprintf('->acceptElementsAtParentLevel() requires the prototype of the node at path "%s" to be an array with children.', $path));
         }
 
         if (false !== $this->addDefaultChildren) {
@@ -642,5 +705,54 @@ class ArrayNodeDefinition extends NodeDefinition implements ParentNodeDefinition
         }
 
         return $node->find(substr($nodePath, $pathSeparatorPos + \strlen($this->pathSeparator)));
+    }
+
+    /**
+     * Validates the child that declares its elements as accepted at the level of the given node.
+     *
+     * A beforeNormalization() closure of the node must rewrite the elements into the child.
+     * The keys of the node cannot be declared by the elements too, as they could not be told apart when they are given at the level of the node.
+     *
+     * @throws InvalidDefinitionException
+     */
+    private function validateElementsAtParentLevel(ArrayNode $node): void
+    {
+        $children = array_filter($node->getChildren(), static fn (NodeInterface $child) => $child instanceof PrototypedArrayNode && null !== $child->getAttribute('elements_at_parent_level'));
+
+        if (!$children) {
+            return;
+        }
+
+        if (1 < \count($children)) {
+            throw new InvalidDefinitionException(\sprintf('Only one child of the node "%s" can declare ->acceptElementsAtParentLevel(), found "%s".', $node->getPath(), implode('", "', array_keys($children))));
+        }
+
+        $child = reset($children);
+
+        if (isset($this->attributes['wraps_arrays_into'])) {
+            throw new InvalidDefinitionException(\sprintf('The node "%s" cannot both wrap arrays into "%s" with ->acceptAndWrap() and accept the elements of "%s" at its level.', $node->getPath(), $this->attributes['wraps_arrays_into'], $child->getName()));
+        }
+
+        if (!$node->hasNormalizationClosures()) {
+            throw new InvalidDefinitionException(\sprintf('The node "%s" accepts the elements of "%s" at its level but has no beforeNormalization() closure to rewrite them.', $node->getPath(), $child->getName()));
+        }
+
+        $element = $child->getPrototype();
+        $elementKeys = $element instanceof ArrayNode ? array_keys($element->getChildren()) : [];
+
+        if ($element instanceof ArrayNode) {
+            foreach ($element->getXmlRemappings() as [$singular, $plural]) {
+                $elementKeys[] = $singular;
+            }
+        }
+
+        $nodeKeys = array_keys($node->getChildren());
+        foreach ($node->getXmlRemappings() as [$singular, $plural]) {
+            $nodeKeys[] = $singular;
+        }
+
+        if ($duplicatedKeys = array_intersect($nodeKeys, $elementKeys)) {
+            throw new InvalidDefinitionException(\sprintf('The node "%s" and the elements of "%s" both declare the key(s) "%s", so they cannot be told apart when they are given at the level of the node.', $node->getPath(), $child->getName(), implode('", "', $duplicatedKeys)));
+        }
     }
 }

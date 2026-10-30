@@ -31,6 +31,7 @@ use Symfony\Component\Messenger\MessengerBundle;
 use Symfony\Component\Mime\Header\Headers;
 use Symfony\Component\Process\Process;
 use Symfony\Component\RateLimiter\LimiterInterface;
+use Symfony\Component\Webhook\Client\RequestParserInterface;
 use Symfony\Component\Webhook\Controller\WebhookController;
 
 /**
@@ -394,6 +395,7 @@ class MailerBundle extends AbstractBundle
             Bridge\Amazon\Transport\SesTransportFactory::class => ['symfony/amazon-mailer', 'mailer.transport_factory.amazon'],
             Bridge\Sweego\Transport\SweegoTransportFactory::class => ['symfony/sweego-mailer', 'mailer.transport_factory.sweego'],
             Bridge\TurboSmtp\Transport\TurboSmtpTransportFactory::class => ['symfony/turbo-smtp-mailer', 'mailer.transport_factory.turbosmtp'],
+            Bridge\ZohoCpaas\Transport\ZohoCpaasTransportFactory::class => ['symfony/zoho-cpaas-mailer', 'mailer.transport_factory.zohocpaas'],
         ];
 
         foreach ($classToServices as $class => [$package, $service]) {
@@ -530,9 +532,17 @@ class MailerBundle extends AbstractBundle
             ];
 
             foreach ($webhookRequestParsers as $class => [$package, $service]) {
+                $target = 'mailer.'.substr(strrchr($service, '.'), 1);
+                $container->getAlias($class)->setDeprecated('symfony/mailer', '8.2', 'The "%alias_id%" alias is deprecated, use #[Target(\''.$target.'\')] with "'.RequestParserInterface::class.'" instead.');
+
                 if (!ContainerBuilder::willBeAvailable($package, $class, ['symfony/mailer'])) {
                     $container->removeDefinition($service);
-                } elseif ($debug && \defined($class.'::PROVIDER_IPS')) {
+                    continue;
+                }
+
+                $container->registerAliasForArgument($service, RequestParserInterface::class, $target.'.request_parser', $target);
+
+                if ($debug && \defined($class.'::PROVIDER_IPS')) {
                     $container->getDefinition($service)->setArgument('$allowedIPs', [...$class::PROVIDER_IPS, '127.0.0.1']);
                 }
             }

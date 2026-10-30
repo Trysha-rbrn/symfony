@@ -13,6 +13,7 @@ namespace Symfony\Component\HttpFoundation\Session\Storage\Handler;
 
 use Predis\Response\ErrorInterface;
 use Relay\Relay;
+use Symfony\Contracts\Service\ResetInterface;
 
 /**
  * Redis based session storage handler based on the Redis class
@@ -51,9 +52,11 @@ class RedisSessionHandler extends AbstractSessionHandler implements ClearableSes
         $this->ttl = $options['ttl'] ?? null;
     }
 
-    protected function doRead(#[\SensitiveParameter] string $sessionId): string
+    protected function doRead(#[\SensitiveParameter] string $sessionId): string|false
     {
-        return $this->redis->get($this->prefix.$sessionId) ?: '';
+        $data = $this->redis->get($this->prefix.$sessionId);
+
+        return $data instanceof ErrorInterface ? false : ($data ?: '');
     }
 
     protected function doWrite(#[\SensitiveParameter] string $sessionId, string $data): bool
@@ -96,6 +99,11 @@ class RedisSessionHandler extends AbstractSessionHandler implements ClearableSes
 
     public function updateTimestamp(#[\SensitiveParameter] string $sessionId, string $data): bool
     {
+        // PHP 8.6 calls updateTimestamp() instead of write() for a session that is still empty
+        if ('' === $data || (\function_exists('igbinary_serialize') && igbinary_serialize([]) === $data)) {
+            return $this->destroy($sessionId);
+        }
+
         $ttl = ($this->ttl instanceof \Closure ? ($this->ttl)() : $this->ttl) ?? \ini_get('session.gc_maxlifetime');
 
         return $this->redis->expire($this->prefix.$sessionId, (int) $ttl);
@@ -151,5 +159,15 @@ class RedisSessionHandler extends AbstractSessionHandler implements ClearableSes
                 $this->redis->del(...$keys);
             }
         } while ($cursor);
+    }
+
+    /**
+     * Closes the connection when it reconnects lazily on next use.
+     */
+    public function shutdown(): void
+    {
+        if ($this->redis instanceof ResetInterface) {
+            $this->redis->reset();
+        }
     }
 }

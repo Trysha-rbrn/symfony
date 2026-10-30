@@ -62,7 +62,7 @@ final class StreamReaderGenerator
      */
     public function generate(Type $type, bool $decodeFromStream, array $options = []): string
     {
-        $path = \sprintf('%s%s%s.%s%s.php', $this->streamReadersDir, \DIRECTORY_SEPARATOR, hash('xxh128', (string) $type), self::cacheVariant($options), $decodeFromStream ? '.stream' : '');
+        $path = \sprintf('%s%s%s.%s%s.php', $this->streamReadersDir, \DIRECTORY_SEPARATOR, hash('xxh128', StreamerDumper::FORMAT_VERSION.$type), self::cacheVariant($options), $decodeFromStream ? '.stream' : '');
         $generateContent = function () use ($type, $decodeFromStream, $options): string {
             $this->phpGenerator ??= new PhpGenerator($this->transformers);
 
@@ -103,7 +103,12 @@ final class StreamReaderGenerator
         }
 
         if ($type instanceof UnionType) {
-            return new CompositeNode(array_map(fn (Type $t): DataModelNodeInterface => $this->createDataModel($t, $options, $context), $type->getTypes()));
+            $nodes = [];
+            foreach ($type->getTypes() as $t) {
+                $nodes[] = $this->createDataModel($t, $options, $context);
+            }
+
+            return new CompositeNode($nodes);
         }
 
         if ($type instanceof BuiltinType) {

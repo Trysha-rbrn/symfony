@@ -54,7 +54,7 @@ class BoundsType extends AbstractType
         }
 
         // Append generic carry-along options. A bound that bubbles its errors moves them to
-        // the range, which "bounds_row" does not render, so error_bubbling goes down too.
+        // the range, away from the bound they are about, so error_bubbling goes down too.
         foreach (['required', 'translation_domain', 'error_bubbling'] as $passOpt) {
             $fromOptions[$passOpt] = $toOptions[$passOpt] = $options[$passOpt];
         }
@@ -63,7 +63,8 @@ class BoundsType extends AbstractType
             ->add('from', $options['type'], array_merge($fromOptions, $options['options'], $options['from_options']))
             ->add('to', $options['type'], array_merge($toOptions, $options['options'], $options['to_options']))
             ->addEventListener(FormEvents::SUBMIT, static function (FormEvent $event): void {
-                if (null === $event->getData()) {
+                // an object is kept even when both bounds are empty, as FormType does
+                if (!\is_array($event->getData())) {
                     return;
                 }
 

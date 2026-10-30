@@ -1,0 +1,38 @@
+<?php
+
+return [
+    'Names' => [
+        'Andorranischi Peseete', 'UAE Dirham', 'Afghani (1927–2002)', 'Afghani', 5 => 'Lek', 'Dram', 'Niderländischi-Antille-Gulde', 'Kwanza', 'Angolanische Kwanza (1977–1990)', 'Nöie Kwanza', 'Kwanza Reajustado', 'Argentinische Auschtral', 15 => 'Argentinische Peso (1983–1985)', 'Argentinische Peso', 'Öschtriichische Schilling', 'Auschtralische Dollar', 'Aruba Florin', 'Aserbeidschanische Manat (1993–2006)',
+        'Aserbeidschanische Manat', 'Bosnie-und-Herzegowina-Dinar', 'Konvertierbari Mark vo Bosnie und Herzegowina', 25 => 'Barbados-Dollar', 'Taka', 'Belgische Franc (konvertibel)', 'Belgische Franc', 'Belgische Finanz-Franc', 'Lew (1962–1999)', 32 => 'Bulgarische Lew', 34 => 'Bahrain-Dinar', 'Burundi-Franc', 'Bermuda-Dollar', 'Brunei-Dollar', 'Boliviano', 40 => 'Bolivianische Peso',
+        'Bolivianische Mvdol', 'Brasilianische Cruzeiro Novo (1967–1986)', 'Brasilianische Cruzado', 'Brasilianische Cruzeiro (1990–1993)', 'Brasilianische Real', 'Brasilianische Cruzado Novo', 'Brasilianische Cruzeiro', 49 => 'Bahama-Dollar', 'Bhutanische Ngultrum', 'Birmanische Kyat', 'Botswanische Pula', 'Belarus-Rubel (1994–1999)', 'Belarus Rubel', 'Belarus Rubel (2000–2016)', 'Belize-Dollar', 'Kanadische Dollar', 'Kongolesische Franc', 'WIR-Euro', 'Schwiizer Franke',
+        'WIR-Franke', 63 => 'Tschileenische Unidad de Fomento', 'Tschileenische Peso', 66 => 'Renminbi Yuan', 'Kolumbianische Peso', 'Unidad de Valor Real', 'Costa Rica Colon', 'Alte Serbische Dinar', 'Tschechoslowakischi Chroone', 73 => 'Kubanische Peso', 'Kap Verde Escudo', 'Zypere-Pfund', 'Tschechischi Chroone', 'DDR-Mark', 'Tüütschi Mark', 'Dschibuti-Franc', 'Tänischi Chroone',
+        'Tominikanische Peso', 'Algeerischi Dinar', 'Ecuadorianische Sucre', 'Verrächnigsäiheit für EC', 'Eestnischi Chroone', 'Ägüptischs Pfund', 'Eritreische Nakfa', 'Schpanischi Peseeta (A–Kontene)', 'Schpanischi Peseeta (konvertibel)', 'Schpanischi Peseeta', 'Äthiopische Birr', 'Euro', 'Finnischi Mark', 'Fidschi Dollar', 'Falkland-Pfund', 'Französische Franc', 'Pfund Schtörling', 'Georgische Kupon Larit', 'Georgische Lari', 'Ghanaische Cedi (GHC)',
+        'Ghanaische Cedi (GHS)', 'Gibraltar-Pfund', 'Gambische Dalasi', 'Guinea-Franc', 'Guineische Syli', 'Äquatorialguinea-Ekwele', 'Griechische Trachme', 'Quetzal', 'Portugiisische Guinea Escudo', 'Guinea-Bissau-Peso', 'Guyana-Dollar', 'Hongkong-Dollar', 'Lempira', 'Kroazische Dinar', 'Kuna', 'Gourde', 'Forint', 'Indonesischi Rupie', 'Iirischs Pfund', 'Israelischs Pfund',
+        122 => 'Schekel', 'Indischi Rupie', 'Irak-Dinar', 'Rial', 127 => 'Iisländischi Chroone', 'Italiänischi Lira', 'Jamaika-Dollar', 'Jordaanische Dinar', 'Yen', 'Kenia-Schilling', 'Som', 'Riel', 'Komore-Franc', 'Nordkoreanische Won', 139 => 'Süüdkoreanische Won', 'Kuwait-Dinar', 'Kaiman-Dollar',
+        'Tenge', 'Kip', 'Libaneesischs Pfund', 'Sri-Lanka-Rupie', 'Liberiaanische Dollar', 'Loti', 'Litauische Litas', 'Litauische Talonas', 'Luxemburgische Franc (konvertibel)', 'Luxemburgische Franc', 'Luxemburgischer Finanz-Franc', 'Lettische Lats', 'Lettische Rubel', 'Lüübische Dinar', 'Marokkanische Dirham', 'Marokkanischer Franc', 160 => 'Moldau-Löi', 'Madagaschkar-Ariary', 'Madagaschkar-Franc',
+        'Denar', 165 => 'Malische Franc', 'Kyat', 'Tugrik', 'Pataca', 'Ouguiya (1973–2017)', 'Ouguiya', 'Malteesischi Lira', 'Malteesischs Pfund', 'Maurizius-Rupie', 175 => 'Malediven-Rufiyaa', 'Malawi-Kwacha', 'Mexikanische Peso', 'Mexikanische Silber-Peso (1861–1992)', 'Mexikanische Unidad de Inversion (UDI)', 'Malaysische Ringgit', 'Mosambikanische Escudo', 'Alte Metical',
+        'Metical', 'Namibia-Dollar', 'Naira', 'Cordoba', 'Nicaragua-Córdoba', 'Holländische Gulde', 'Norweegischi Chroone', 'Nepaleesischi Rupie', 'Neuseeland-Dollar', 'Rial Omani', 'Balboa', 'Peruanische Inti', 'Sol', 'Sol (1863–1965)', 'Kina', 'Philippiinische Peso', 'Pakischtanischi Rupie', 'Zloty', 'Zloty (1950–1995)', 'Portugiisische Escudo',
+        'Guarani', 'Katar-Riyal', 'Rhodesische Dollar', 'Löi', 'Rumäänische Löi', 'Serbische Dinar', 'Russische Rubel', 'Russische Rubel (alt)', 'Ruanda-Franc', 'Saudi-Riyal', 'Salomone-Dollar', 'Seyschelle-Rupie', 'Sudaneesische Dinar', 'Sudaneesischs Pfund', 'Sudaneesischs Pfund (alt)', 'Schweedischi Chroone', 'Singapur-Dollar', 'St.-Helena-Pfund', 'Tolar', 'Slowakischi Chroone',
+        'Leone', 'Leone (1964—2022)', 'Somalia-Schilling', 'Surinamische Dollar', 'Surinamische Gulde', 'Süüdsudaneesischs Pfund', 'Dobra (1977–2017)', 'Dobra', 'Sowjetische Rubel', 'El-Salvador-Colon', 'Süürischs Pfund', 'Lilangeni', 'Baht', 'Tadschikischtan-Rubel', 'Tadschikischtan-Somoni', 'Turkmeenischtan-Manat', 240 => 'Tuneesische Dinar', 'Paʻanga', 'Timor-Escudo',
+        'Türkischi Liire', 'Nöii Türkischi Liire', 'Trinidad-und-Tobago-Dollar', 'Nöii Taiwan-Dollar', 'Tansania-Schilling', 'Hryvnia', 'Ukraiinische Karbovanetz', 'Uganda-Schilling (1966–1987)', 'Uganda-Schilling', 'US-Dollar', 'US Dollar (Nöchschte Taag)', 'US Dollar (Gliiche Taag)', 256 => 'Uruguayische Nöie Peso (1975–1993)', 'Uruguayische Peso', 259 => 'Usbeekischtan-Sum', 'Bolivar (1871–2008)', 262 => 'Bolivar (2008–2018)',
+        'Bolivar', 'Dong', 266 => 'Vatu', 'Tala', 'CFA-Franc (Äquatoriaal)', 'Oschtkaribische Dollar', 271 => 'Europääischi Währigseinheit (XEU)', 'Französische Gold-Franc', 'Französische UIC-Franc', 'CFA-Franc (Wescht)', 'CFP-Franc', 'RINET-Funds', 'Jeme-Dinar', 'Jeme-Rial', 'Jugoslawische Dinar (1966–1990)', 'Nöii Dinar', 'Jugoslawische Dinar (konvertibel)',
+        284 => 'Rand', 'Kwacha (1968–2012)', 'Kwacha', 'Nöie Zaire', 'Zaire', 'Simbabwe-Dollar',
+    ],
+    'Symbols' => [
+        '', '', '', '', 5 => '', '', '', '', '', '', '', '', 15 => '', '', 'öS', 'A$', '', '',
+        '', '', '', 25 => '', '', '', '', '', '', 32 => '', 34 => '', '', '', '', '', 40 => '',
+        '', '', '', '', 'R$', '', '', 49 => '', '', '', '', '', '', '', '', 'CA$', '', '', '',
+        '', 63 => '', '', 66 => 'CN¥', '', '', '', '', '', 73 => '', '', '', '', '', '', '', '',
+        '', '', '', '', '', '', '', '', '', '', '', '€', '', '', '', '', '£', '', '', '',
+        '', '', '', '', '', '', '', '', '', '', '', 'HK$', '', '', '', '', '', '', '', '',
+        122 => '₪', '₹', '', '', 127 => '', '', '', '', '¥', '', '', '', '', '', 139 => '₩', '', '',
+        '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', 160 => '', '', '',
+        '', 165 => '', '', '', '', '', '', '', '', '', 175 => '', '', 'MX$', '', '', '', '', '',
+        '', '', '', '', '', '', '', '', 'NZ$', '', '', '', '', '', '', '₱', '', '', '', '',
+        '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+        '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', 240 => '', '', '',
+        '', '', '', 'NT$', '', '', '', '', '', '$', '', '', 256 => '', '', 259 => '', '', 262 => '',
+        '', '₫', 266 => '', '', 'FCFA', 'EC$', 271 => '', '', '', 'F CFA', 'CFPF', '', '', '', '', '', '',
+        284 => '', '', '', '', '', '',
+    ],
+];

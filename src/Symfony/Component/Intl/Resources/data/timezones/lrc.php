@@ -1,0 +1,16 @@
+<?php
+
+return [
+    'Names' => [
+        53 => 'ڤولاتیا یأکاگئرتە (Adak)', 'ڤولاتیا یأکاگئرتە (Anchorage)', 57 => 'بئرئزیل (Araguaína)', 73 => 'بئرئزیل (Bahia)', 'گاٛت مینجاٛیی (Bahía de Banderas)', 76 => 'بئرئزیل (Belém)', 'گاٛت مینجاٛیی (Belize)', 79 => 'بئرئزیل (Boa Vista)', 81 => 'ڤولاتیا یأکاگئرتە (Boise)', 84 => 'بئرئزیل (Campo Grande)', 90 => 'گاٛت مینجاٛیی (Chicago)', 'گاٛت مینجاٛیی (Chihuahua)',
+        95 => 'گاٛت مینجاٛیی (Costa Rica)', 98 => 'بئرئزیل (Cuiabá)', 103 => 'ڤولاتیا یأکاگئرتە (Denver)', 'ڤولاتیا یأکاگئرتە (Detroit)', 107 => 'بئرئزیل (Eirunepé)', 'گاٛت مینجاٛیی (El Salvador)', 110 => 'بئرئزیل (Fortaleza)', 117 => 'گاٛت مینجاٛیی (Guatemala)', 123 => 'ڤولاتیا یأکاگئرتە (Indianapolis)', 'گاٛت مینجاٛیی (Knox, Indiana)', 'ڤولاتیا یأکاگئرتە (Marengo, Indiana)', 'ڤولاتیا یأکاگئرتە (Petersburg, Indiana)', 'گاٛت مینجاٛیی (Tell City, Indiana)',
+        'ڤولاتیا یأکاگئرتە (Vevay, Indiana)', 'ڤولاتیا یأکاگئرتە (Vincennes, Indiana)', 'ڤولاتیا یأکاگئرتە (Winamac, Indiana)', 'ڤولاتیا یأکاگئرتە (Indianapolis)', 136 => 'ڤولاتیا یأکاگئرتە (Juneau)', 'ڤولاتیا یأکاگئرتە (Louisville)', 'ڤولاتیا یأکاگئرتە (Monticello, Kentucky)', 142 => 'ڤولاتیا یأکاگئرتە (Los Angeles)', 'ڤولاتیا یأکاگئرتە (Louisville)', 145 => 'بئرئزیل (Maceió)', 'گاٛت مینجاٛیی (Managua)', 'بئرئزیل (Manaus)', 150 => 'گاٛت مینجاٛیی (Matamoros)', 153 => 'گاٛت مینجاٛیی (Menominee)', 'گاٛت مینجاٛیی (Mérida)',
+        'ڤولاتیا یأکاگئرتە (Metlakatla)', 'گاٛت مینجاٛیی (Ciudad de México)', 159 => 'گاٛت مینجاٛیی (Monterrey)', 163 => 'ڤولاتیا یأکاگئرتە (New York)', 'ڤولاتیا یأکاگئرتە (Nome)', 'بئرئزیل (Fernando de Noronha)', 'گاٛت مینجاٛیی (Beulah, North Dakota)', 'گاٛت مینجاٛیی (Center, North Dakota)', 'گاٛت مینجاٛیی (New Salem, North Dakota)', 170 => 'گاٛت مینجاٛیی (Ojinaga)', 173 => 'ڤولاتیا یأکاگئرتە (Phoenix)', 176 => 'بئرئزیل (Porto Velho)', 179 => 'گاٛت مینجاٛیی (Rankin Inlet)', 'بئرئزیل (Recife)',
+        'گاٛت مینجاٛیی (Regina)', 'گاٛت مینجاٛیی (Resolute)', 'بئرئزیل (Rio Branco)', 'بئرئزیل (Santarém)', 187 => 'بئرئزیل (São Paulo)', 189 => 'ڤولاتیا یأکاگئرتە (Sitka)', 196 => 'گاٛت مینجاٛیی (Swift Current)', 'گاٛت مینجاٛیی (Tegucigalpa)', 204 => 'گاٛت مینجاٛیی (Winnipeg)', 'ڤولاتیا یأکاگئرتە (Yakutat)', 215 => 'Troll', 221 => 'روٙسیە (Anadyr)', 230 => 'روٙسیە (Barnaul)',
+        234 => 'ھئن (Kolkata)', 'روٙسیە (Chita)', 248 => 'روٙسیە (Irkutsk)', 253 => 'روٙسیە (Kamchatka)', 257 => 'روٙسیە (Khandyga)', 'ھئن (Kolkata)', 'روٙسیە (Krasnoyarsk)', 264 => 'روٙسیە (Magadan)', 269 => 'روٙسیە (Novokuznetsk)', 'روٙسیە (Novosibirsk)', 'روٙسیە (Omsk)', 282 => 'روٙسیە (Sakhalin)',
+        285 => 'چین (Shanghai)', 287 => 'روٙسیە (Srednekolymsk)', 293 => 'جاپوٙن (Tokyo)', 'روٙسیە (Tomsk)', 296 => 'چین (Ürümqi)', 'روٙسیە (Ust-Nera)', 299 => 'روٙسیە (Vladivostok)', 'روٙسیە (Yakutsk)', 302 => 'روٙسیە (Yekaterinburg)', 330 => 'روٙسیە (Astrakhan)', 333 => 'آلمان (Berlin)',
+        338 => 'آلمان (Büsingen)', 348 => 'روٙسیە (Kaliningrad)', 350 => 'روٙسیە (Kirov)', 354 => 'بیریتانیا گأپ (London)', 361 => 'روٙسیە (Moscow)', 363 => 'فأرانسە (Paris)', 367 => 'ئیتالیا (Rome)', 'روٙسیە (Samara)', 371 => 'روٙسیە (Saratov)', 378 => 'روٙسیە (Ulyanovsk)',
+        383 => 'روٙسیە (Volgograd)', 413 => 'ڤولاتیا یأکاگئرتە (Honolulu)',
+    ],
+    'Meta' => [],
+];

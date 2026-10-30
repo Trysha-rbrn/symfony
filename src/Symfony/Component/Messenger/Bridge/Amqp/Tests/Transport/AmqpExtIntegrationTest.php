@@ -14,18 +14,32 @@ namespace Symfony\Component\Messenger\Bridge\Amqp\Tests\Transport;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\RequiresPhpExtension;
 use PHPUnit\Framework\TestCase;
+use Psr\Container\ContainerInterface;
+use Symfony\Component\EventDispatcher\EventDispatcher;
 use Symfony\Component\Messenger\Bridge\Amqp\Tests\Fixtures\DummyMessage;
 use Symfony\Component\Messenger\Bridge\Amqp\Transport\AmqpReceivedStamp;
 use Symfony\Component\Messenger\Bridge\Amqp\Transport\AmqpReceiver;
 use Symfony\Component\Messenger\Bridge\Amqp\Transport\AmqpSender;
 use Symfony\Component\Messenger\Bridge\Amqp\Transport\AmqpStamp;
+use Symfony\Component\Messenger\Bridge\Amqp\Transport\AmqpTransport;
 use Symfony\Component\Messenger\Bridge\Amqp\Transport\Connection;
 use Symfony\Component\Messenger\Envelope;
+use Symfony\Component\Messenger\EventListener\SendFailedMessageForRetryListener;
+use Symfony\Component\Messenger\EventListener\SendFailedMessageToFailureTransportListener;
+use Symfony\Component\Messenger\EventListener\StopWorkerOnMessageLimitListener;
+use Symfony\Component\Messenger\Exception\BatchSendFailedException;
+use Symfony\Component\Messenger\Exception\TransportException;
+use Symfony\Component\Messenger\Handler\HandlersLocator;
+use Symfony\Component\Messenger\MessageBus;
+use Symfony\Component\Messenger\Middleware\HandleMessageMiddleware;
+use Symfony\Component\Messenger\Retry\MultiplierRetryStrategy;
 use Symfony\Component\Messenger\Stamp\DelayStamp;
 use Symfony\Component\Messenger\Stamp\RedeliveryStamp;
 use Symfony\Component\Messenger\Transport\Receiver\ReceiverInterface;
+use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
 use Symfony\Component\Messenger\Transport\Serialization\Serializer;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
+use Symfony\Component\Messenger\Worker;
 use Symfony\Component\Process\PhpProcess;
 use Symfony\Component\Process\Process;
 use Symfony\Component\Serializer as SerializerComponent;
@@ -113,6 +127,78 @@ class AmqpExtIntegrationTest extends TestCase
         // next tests send
         $connection->channel()->getConnection()->disconnect();
         $connection->clear();
+    }
+
+    public function testItSendsABatchOfMessagesAndWaitsForTheirConfirmsOnce()
+    {
+        $serializer = $this->createSerializer();
+
+        $connection = Connection::fromDsn(getenv('MESSENGER_AMQP_DSN'), ['confirm_timeout' => 2]);
+        $connection->setup();
+        $connection->purgeQueues();
+
+        $sender = new AmqpSender($connection, $serializer);
+        $receiver = new AmqpReceiver($connection, $serializer);
+
+        $sender->send(new Envelope(new DummyMessage('First')));
+
+        $envelopes = [
+            'a' => new Envelope(new DummyMessage('Second')),
+            'b' => new Envelope(new DummyMessage('Delayed'), [new DelayStamp(1000)]),
+            'c' => new Envelope(new DummyMessage('Third')),
+        ];
+
+        $this->assertSame(['a', 'b', 'c'], array_keys($sender->sendBatch($envelopes)));
+
+        foreach (['First', 'Second', 'Third', 'Delayed'] as $expected) {
+            $envelopes = $this->receiveEnvelopes($receiver, 5);
+            $this->assertCount(1, $envelopes);
+            $this->assertEquals(new DummyMessage($expected), $envelopes[0]->getMessage());
+            $receiver->ack($envelopes[0]);
+        }
+    }
+
+    public function testItTellsWhichMessagesOfABatchTheBrokerRejected()
+    {
+        $serializer = $this->createSerializer();
+
+        $connection = Connection::fromDsn(getenv('MESSENGER_AMQP_DSN'), [
+            'confirm_timeout' => 2,
+            'exchange' => ['name' => 'messages_batch'],
+            'queues' => ['messages_batch' => ['arguments' => ['x-max-length' => 3, 'x-overflow' => 'reject-publish']]],
+        ]);
+        $connection->setup();
+        $connection->purgeQueues();
+
+        $sender = new AmqpSender($connection, $serializer);
+        $receiver = new AmqpReceiver($connection, $serializer);
+
+        $sender->send(new Envelope(new DummyMessage('First')));
+
+        $envelopes = [
+            'a' => new Envelope(new DummyMessage('Second')),
+            'b' => new Envelope(new DummyMessage('Third')),
+            'c' => new Envelope(new DummyMessage('Fourth')),
+            'd' => new Envelope(new DummyMessage('Fifth')),
+        ];
+
+        try {
+            $sender->sendBatch($envelopes);
+            $this->fail('An exception should have been thrown.');
+        } catch (BatchSendFailedException $e) {
+            $this->assertSame(['a', 'b'], array_keys($e->getEnvelopes()));
+            $this->assertSame(['c', 'd'], array_keys($e->getExceptions()));
+            $this->assertInstanceOf(TransportException::class, $e->getExceptions()['c']);
+        }
+
+        foreach (['First', 'Second', 'Third'] as $expected) {
+            $envelopes = iterator_to_array($receiver->get());
+            $this->assertCount(1, $envelopes);
+            $this->assertEquals(new DummyMessage($expected), $envelopes[0]->getMessage());
+            $receiver->ack($envelopes[0]);
+        }
+
+        $this->assertSame([], iterator_to_array($receiver->get()));
     }
 
     public function testItSendsAndReceivesMessagesThroughDefaultExchange()
@@ -203,6 +289,34 @@ class AmqpExtIntegrationTest extends TestCase
         $receiver->ack($envelope);
     }
 
+    public function testAnExpirationShorterThanTheDelayDoesNotReleaseTheMessageEarly()
+    {
+        $connection = Connection::fromDsn(getenv('MESSENGER_AMQP_DSN'));
+        $connection->setup();
+        $connection->purgeQueues();
+
+        $sender = new AmqpSender($connection);
+        $receiver = new AmqpReceiver($connection);
+
+        $sender->send(new Envelope(new DummyMessage('Retried'), [new AmqpStamp(null, \AMQP_NOPARAM, ['expiration' => '1000'])]));
+        $envelopes = iterator_to_array($receiver->get());
+        $receiver->ack($envelopes[0]);
+
+        $startTime = microtime(true);
+        $sender->send($envelopes[0]->with(new DelayStamp(2000), new RedeliveryStamp(1)));
+        $sender->send(new Envelope(new DummyMessage('Delayed'), [new DelayStamp(2000), new AmqpStamp(null, \AMQP_NOPARAM, ['expiration' => '100'])]));
+
+        $envelopes = $this->receiveEnvelopes($receiver, 3);
+        $this->assertApproximateDuration($startTime, 2);
+        $this->assertCount(1, $envelopes);
+        $receiver->ack($envelopes[0]);
+
+        $envelopes = $this->receiveEnvelopes($receiver, 3);
+        $this->assertApproximateDuration($startTime, 2);
+        $this->assertCount(1, $envelopes);
+        $receiver->ack($envelopes[0]);
+    }
+
     public function testRetryAffectsOnlyOriginalQueue()
     {
         $connection = Connection::fromDsn(getenv('MESSENGER_AMQP_DSN'), [
@@ -239,6 +353,106 @@ class AmqpExtIntegrationTest extends TestCase
         $retriedEnvelopes = $this->receiveWithQueueName($receiver);
         $this->assertCount(1, $retriedEnvelopes);
         $this->assertArrayHasKey('A', $retriedEnvelopes);
+    }
+
+    public function testRetryWithoutDelayAffectsOnlyOriginalQueue()
+    {
+        $connection = Connection::fromDsn(getenv('MESSENGER_AMQP_DSN'), [
+            'exchange' => [
+                'name' => 'messages_fanout',
+                'type' => 'fanout',
+            ],
+            'queues' => [
+                'fanout_A' => [],
+                'fanout_B' => [],
+            ],
+        ]);
+        $connection->setup();
+        $connection->purgeQueues();
+
+        $sender = new AmqpSender($connection);
+        $receiver = new AmqpReceiver($connection);
+
+        $sender->send(new Envelope(new DummyMessage('Payload')));
+
+        $receivedEnvelopes = $this->receiveWithQueueName($receiver);
+        $this->assertCount(2, $receivedEnvelopes);
+
+        $retryEnvelope = $receivedEnvelopes['fanout_A']
+            ->with(new DelayStamp(0))
+            ->with(new RedeliveryStamp(1));
+        $sender->send($retryEnvelope);
+
+        $retriedEnvelopes = $this->receiveWithQueueName($receiver);
+        $this->assertCount(1, $retriedEnvelopes);
+        $this->assertArrayHasKey('fanout_A', $retriedEnvelopes);
+    }
+
+    public function testRetryWithoutDelayReachesOriginalQueueOfDirectExchange()
+    {
+        $connection = Connection::fromDsn(getenv('MESSENGER_AMQP_DSN'), [
+            'exchange' => [
+                'name' => 'messages_direct',
+                'type' => 'direct',
+                'default_publish_routing_key' => 'direct_routing_key',
+            ],
+            'queues' => [
+                'direct_queue' => ['binding_keys' => ['direct_routing_key']],
+            ],
+        ]);
+        $connection->setup();
+        $connection->purgeQueues();
+
+        $sender = new AmqpSender($connection);
+        $receiver = new AmqpReceiver($connection);
+
+        $sender->send(new Envelope(new DummyMessage('Payload')));
+
+        $receivedEnvelopes = $this->receiveWithQueueName($receiver);
+        $this->assertArrayHasKey('direct_queue', $receivedEnvelopes);
+
+        $retryEnvelope = $receivedEnvelopes['direct_queue']
+            ->with(new DelayStamp(0))
+            ->with(new RedeliveryStamp(1));
+        $sender->send($retryEnvelope);
+
+        $retriedEnvelopes = $this->receiveWithQueueName($receiver);
+        $this->assertCount(1, $retriedEnvelopes);
+        $this->assertArrayHasKey('direct_queue', $retriedEnvelopes);
+    }
+
+    public function testRetryWithoutDelayDoesNotReachTheQueuesOfTheCcHeader()
+    {
+        $connection = Connection::fromDsn(getenv('MESSENGER_AMQP_DSN'), [
+            'exchange' => [
+                'name' => 'messages_cc',
+                'type' => 'direct',
+                'default_publish_routing_key' => 'cc_main',
+            ],
+            'queues' => [
+                'cc_main' => ['binding_keys' => ['cc_main']],
+                'cc_other' => ['binding_keys' => ['cc_other']],
+            ],
+        ]);
+        $connection->setup();
+        $connection->purgeQueues();
+
+        $sender = new AmqpSender($connection);
+        $receiver = new AmqpReceiver($connection);
+
+        $sender->send(new Envelope(new DummyMessage('Payload'), [new AmqpStamp(null, \AMQP_NOPARAM, ['headers' => ['CC' => ['cc_other']]])]));
+
+        $receivedEnvelopes = $this->receiveWithQueueName($receiver);
+        $this->assertCount(2, $receivedEnvelopes);
+
+        $retryEnvelope = $receivedEnvelopes['cc_main']
+            ->with(new DelayStamp(0))
+            ->with(new RedeliveryStamp(1));
+        $sender->send($retryEnvelope);
+
+        $retriedEnvelopes = $this->receiveWithQueueName($receiver);
+        $this->assertCount(1, $retriedEnvelopes);
+        $this->assertArrayHasKey('cc_main', $retriedEnvelopes);
     }
 
     public function testItReceivesSignals()
@@ -311,6 +525,120 @@ class AmqpExtIntegrationTest extends TestCase
 
         sleep(1); // give amqp a moment to have the messages ready
         $this->assertSame(3, $connection->countMessagesInQueues());
+    }
+
+    public function testTheTransportConnectsAgainAfterBeingClosed()
+    {
+        $connection = Connection::fromDsn(getenv('MESSENGER_AMQP_DSN'));
+        $connection->setup();
+        $connection->purgeQueues();
+        $transport = new AmqpTransport($connection, $this->createSerializer());
+        $transport->send(new Envelope(new DummyMessage('First')));
+        $amqpConnection = \WeakReference::create($connection->channel()->getConnection());
+
+        $transport->close();
+        $this->assertNull($amqpConnection->get());
+
+        $transport->send(new Envelope(new DummyMessage('Second')));
+        $this->assertEquals(new DummyMessage('First'), iterator_to_array($transport->get())[0]->getMessage());
+        $this->assertEquals(new DummyMessage('Second'), iterator_to_array($transport->get())[0]->getMessage());
+    }
+
+    public function testAFailedMessageReachesAFailureTransportOnTheDefaultExchange()
+    {
+        $main = $this->createTransport(['auto_setup' => false, 'exchange' => ['name' => '', 'default_publish_routing_key' => 'messages_main'], 'queues' => ['messages_main' => []]]);
+        $failure = $this->createTransport(['auto_setup' => false, 'exchange' => ['name' => '', 'default_publish_routing_key' => 'messages_failed'], 'queues' => ['messages_failed' => []]]);
+
+        $this->assertFailedMessageReachesTheFailureTransport($main, $failure);
+    }
+
+    public function testAFailedMessageReachesAFailureTransportOnADirectExchange()
+    {
+        $main = $this->createTransport();
+        $failure = $this->createTransport(['exchange' => ['name' => 'messages_failed', 'type' => 'direct', 'default_publish_routing_key' => 'failed'], 'queues' => ['messages_failed' => ['binding_keys' => ['failed']]]]);
+
+        $this->assertFailedMessageReachesTheFailureTransport($main, $failure);
+    }
+
+    public function testAFailedMessageReachesAFailureTransportOnADirectExchangeAfterItsRetries()
+    {
+        $main = $this->createTransport();
+        $failure = $this->createTransport(['exchange' => ['name' => 'messages_failed', 'type' => 'direct', 'default_publish_routing_key' => 'failed'], 'queues' => ['messages_failed' => ['binding_keys' => ['failed']]]]);
+
+        $this->assertFailedMessageReachesTheFailureTransport($main, $failure, 2);
+    }
+
+    public function testAFailedMessageReachesAFailureTransportWithoutADefaultRoutingKeyAfterItsRetries()
+    {
+        $main = $this->createTransport();
+        $failure = $this->createTransport(['exchange' => ['name' => 'messages_failed', 'type' => 'direct'], 'queues' => ['messages_failed' => []]]);
+
+        $this->assertFailedMessageReachesTheFailureTransport($main, $failure, 2);
+    }
+
+    public function testAFailedMessageDoesNotInheritTheExpirationOfTheOriginalMessage()
+    {
+        $main = $this->createTransport();
+        $failure = $this->createTransport(['exchange' => ['name' => 'messages_failed', 'type' => 'direct', 'default_publish_routing_key' => 'failed'], 'queues' => ['messages_failed' => ['binding_keys' => ['failed']]]]);
+
+        $failed = $this->assertFailedMessageReachesTheFailureTransport($main, $failure, 0, [new AmqpStamp(null, \AMQP_NOPARAM, ['expiration' => '600000'])]);
+
+        $this->assertContains($failed->last(AmqpReceivedStamp::class)->getAmqpEnvelope()->getExpiration(), [null, '']);
+    }
+
+    private function assertFailedMessageReachesTheFailureTransport(AmqpTransport $main, AmqpTransport $failure, int $maxRetries = 0, array $stamps = []): Envelope
+    {
+        $main->send(new Envelope(new DummyMessage('Failing'), $stamps));
+
+        $bus = new MessageBus([new HandleMessageMiddleware(new HandlersLocator([
+            DummyMessage::class => [static function () { throw new \RuntimeException('Boom.'); }],
+        ]))]);
+        $locator = static fn (object $service) => new class($service) implements ContainerInterface {
+            public function __construct(private object $service)
+            {
+            }
+
+            public function get(string $id): object
+            {
+                return $this->service;
+            }
+
+            public function has(string $id): bool
+            {
+                return 'main' === $id;
+            }
+        };
+        $dispatcher = new EventDispatcher();
+        $dispatcher->addSubscriber(new StopWorkerOnMessageLimitListener(1 + $maxRetries));
+        $dispatcher->addSubscriber(new SendFailedMessageForRetryListener($locator($main), $locator(new MultiplierRetryStrategy($maxRetries, 100))));
+        $dispatcher->addSubscriber(new SendFailedMessageToFailureTransportListener($locator($failure)));
+
+        $worker = new Worker(['main' => $main], $bus, $dispatcher);
+        $worker->run(['sleep' => 10000, 'time_limit' => 10]);
+
+        $failed = iterator_to_array($failure->get(), false);
+
+        $this->assertCount(1, $failed, 'The failed message did not reach the failure transport.');
+        $this->assertEquals(new DummyMessage('Failing'), $failed[0]->getMessage());
+        $failure->ack($failed[0]);
+        $this->assertSame([], iterator_to_array($main->get(), false), 'The failed message went back to its original queue.');
+
+        return $failed[0];
+    }
+
+    private function createTransport(array $options = []): AmqpTransport
+    {
+        $connection = Connection::fromDsn(getenv('MESSENGER_AMQP_DSN'), $options);
+        if ('' === ($options['exchange']['name'] ?? null)) {
+            foreach ($connection->getQueueNames() as $queueName) {
+                $connection->queue($queueName)->declareQueue();
+            }
+        } else {
+            $connection->setup();
+        }
+        $connection->purgeQueues();
+
+        return new AmqpTransport($connection, new PhpSerializer());
     }
 
     private function waitForOutput(Process $process, string $output, $timeoutInSeconds = 10)

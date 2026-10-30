@@ -15,10 +15,15 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\RequiresPhpExtension;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\KeyManagement\Ciphertext;
+use Symfony\Component\KeyManagement\DataKey;
+use Symfony\Component\KeyManagement\DataKeyGeneratorInterface;
 use Symfony\Component\KeyManagement\Envelope;
 use Symfony\Component\KeyManagement\EnvelopeEncrypter;
 use Symfony\Component\KeyManagement\Exception\DecryptionFailedException;
 use Symfony\Component\KeyManagement\Exception\LogicException;
+use Symfony\Component\KeyManagement\KeyLoader\InMemoryKeyLoader;
+use Symfony\Component\KeyManagement\Local\OpenSslKms;
+use Symfony\Component\KeyManagement\Local\SealedBoxKms;
 use Symfony\Component\KeyManagement\SelfContainedFormat;
 use Symfony\Component\KeyManagement\Test\InMemoryKms;
 use Symfony\Component\KeyManagement\Tests\Fixtures\RedactedTraceAssertionsTrait;
@@ -88,6 +93,42 @@ class EnvelopeEncrypterTest extends TestCase
         $this->assertNull($envelope->reference);
     }
 
+    public function testTheEnvelopeRecordsTheKeyIdReportedByTheBackend()
+    {
+        $resolving = new class implements DataKeyGeneratorInterface {
+            public const string ARN = 'arn:aws:kms:eu-west-1:111122223333:key/1234abcd';
+
+            private InMemoryKms $inner;
+
+            public function __construct()
+            {
+                $this->inner = new InMemoryKms();
+            }
+
+            public function generateDataKey(string $keyId, int $length = 32, string $aad = ''): DataKey
+            {
+                $dataKey = $this->inner->generateDataKey($keyId, $length, $aad);
+
+                return new DataKey($dataKey->use(static fn (#[\SensitiveParameter] string $plaintext): string => $plaintext), new Ciphertext($dataKey->wrapped->blob, self::ARN));
+            }
+
+            public function wrapDataKey(string $keyId, #[\SensitiveParameter] string $dataKey, string $aad = ''): Ciphertext
+            {
+                return new Ciphertext($this->inner->wrapDataKey($keyId, $dataKey, $aad)->blob, self::ARN);
+            }
+
+            public function unwrapDataKey(Ciphertext $wrapped, string $aad = ''): DataKey
+            {
+                return $this->inner->unwrapDataKey(new Ciphertext($wrapped->blob, 'alias/app-key'), $aad);
+            }
+        };
+
+        $envelope = (new EnvelopeEncrypter($resolving))->encrypt('alias/app-key', 'hello');
+
+        $this->assertSame($resolving::ARN, $envelope->keyId);
+        $this->assertSame('hello', (new EnvelopeEncrypter($resolving))->decrypt($envelope));
+    }
+
     public function testAadRoundTrip()
     {
         $envelope = $this->encrypter->encrypt('app-key', 'hello', 'tenant=acme');
@@ -103,6 +144,58 @@ class EnvelopeEncrypterTest extends TestCase
         $this->encrypter->decrypt($envelope, 'tenant=globex');
     }
 
+    public function testTheAadDoesNotReachTheKms()
+    {
+        $spying = new class($this->kms) implements DataKeyGeneratorInterface {
+            /**
+             * @var list<string>
+             */
+            public array $seen = [];
+
+            public function __construct(
+                private readonly DataKeyGeneratorInterface $inner,
+            ) {
+            }
+
+            public function generateDataKey(string $keyId, int $length = 32, string $aad = ''): DataKey
+            {
+                $this->seen[] = $aad;
+
+                return $this->inner->generateDataKey($keyId, $length, $aad);
+            }
+
+            public function wrapDataKey(string $keyId, #[\SensitiveParameter] string $dataKey, string $aad = ''): Ciphertext
+            {
+                $this->seen[] = $aad;
+
+                return $this->inner->wrapDataKey($keyId, $dataKey, $aad);
+            }
+
+            public function unwrapDataKey(Ciphertext $wrapped, string $aad = ''): DataKey
+            {
+                $this->seen[] = $aad;
+
+                return $this->inner->unwrapDataKey($wrapped, $aad);
+            }
+        };
+        $encrypter = new EnvelopeEncrypter($spying);
+
+        $this->assertSame('hello', $encrypter->decrypt($encrypter->encrypt('app-key', 'hello', 'tenant=acme'), 'tenant=acme'));
+        $this->assertSame(['', ''], $spying->seen, 'the AAD binds the payload locally, so the wrapping of the data key carries none.');
+    }
+
+    #[RequiresPhpExtension('sodium')]
+    public function testAnAadIsBoundOnABackendThatRefusesAuthenticatedData()
+    {
+        $encrypter = new EnvelopeEncrypter(new SealedBoxKms(new InMemoryKeyLoader(['app-key' => sodium_crypto_box_keypair()])));
+        $envelope = $encrypter->encrypt('app-key', 'hello', 'tenant=acme');
+
+        $this->assertSame('hello', $encrypter->decrypt($envelope, 'tenant=acme'));
+
+        $this->expectException(DecryptionFailedException::class);
+        $encrypter->decrypt($envelope, 'tenant=globex');
+    }
+
     public function testEnvelopeIsPortableAcrossEncrypterInstances()
     {
         $envelope = $this->encrypter->encrypt('app-key', 'hello');
@@ -110,6 +203,48 @@ class EnvelopeEncrypterTest extends TestCase
         $other = new EnvelopeEncrypter($this->kms);
 
         $this->assertSame('hello', $other->decrypt($envelope));
+    }
+
+    public function testChangingTheKeyIdToAnAliasIsRejected()
+    {
+        $key = random_bytes(32);
+        $kms = new OpenSslKms(new InMemoryKeyLoader(['app' => $key, 'alias' => $key]));
+        $encrypter = new EnvelopeEncrypter($kms);
+        $envelope = $encrypter->encrypt('app', 'hello', 'context');
+        $aliased = Envelope::selfContained('alias', $envelope->wrappedDek, $envelope->iv, $envelope->tag, $envelope->ciphertext);
+
+        $this->assertSame('hello', $encrypter->decrypt($envelope, 'context'));
+        $this->expectException(DecryptionFailedException::class);
+        $encrypter->decrypt($aliased, 'context');
+    }
+
+    public function testChangingTheWrappingOfTheSameDataKeyIsRejected()
+    {
+        $kms = new OpenSslKms(new InMemoryKeyLoader(['app' => random_bytes(32)]));
+        $encrypter = new EnvelopeEncrypter($kms);
+        $envelope = $encrypter->encrypt('app', 'hello', 'context');
+        $wrapped = $kms->unwrapDataKey(new Ciphertext($envelope->wrappedDek, $envelope->keyId))
+            ->use(static fn (string $key): Ciphertext => $kms->encrypt('app', $key));
+        $rewrapped = Envelope::selfContained($wrapped->keyId, $wrapped->blob, $envelope->iv, $envelope->tag, $envelope->ciphertext);
+
+        $this->assertNotSame($envelope->wrappedDek, $wrapped->blob);
+        $this->assertSame('hello', $encrypter->decrypt($envelope, 'context'));
+        $this->expectException(DecryptionFailedException::class);
+        $encrypter->decrypt($rewrapped, 'context');
+    }
+
+    public function testTheKeyIdAndWrappingCannotBeShiftedIntoEachOther()
+    {
+        $kms = $this->createStub(DataKeyGeneratorInterface::class);
+        $kms->method('generateDataKey')->willReturn(new DataKey(str_repeat('K', 32), new Ciphertext('bc', 'a')));
+        $kms->method('unwrapDataKey')->willReturnCallback(static fn (Ciphertext $wrapped): DataKey => new DataKey(str_repeat('K', 32), $wrapped));
+        $encrypter = new EnvelopeEncrypter($kms);
+        $envelope = $encrypter->encrypt('a', 'hello', 'context');
+        $shifted = Envelope::selfContained('ab', 'c', $envelope->iv, $envelope->tag, $envelope->ciphertext);
+
+        $this->assertSame('hello', $encrypter->decrypt($envelope, 'context'));
+        $this->expectException(DecryptionFailedException::class);
+        $encrypter->decrypt($shifted, 'context');
     }
 
     public function testTamperedCiphertextFails()

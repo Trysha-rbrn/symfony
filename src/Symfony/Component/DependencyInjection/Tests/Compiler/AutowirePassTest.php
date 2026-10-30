@@ -12,6 +12,7 @@
 namespace Symfony\Component\DependencyInjection\Tests\Compiler;
 
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\IgnoreDeprecations;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\LoggerInterface;
@@ -40,6 +41,7 @@ use Symfony\Component\DependencyInjection\Tests\Fixtures\includes\FooVariadic;
 use Symfony\Component\DependencyInjection\Tests\Fixtures\OptionalParameter;
 use Symfony\Component\DependencyInjection\Tests\Fixtures\WithoutTarget;
 use Symfony\Component\DependencyInjection\Tests\Fixtures\WithTarget;
+use Symfony\Component\DependencyInjection\Tests\Fixtures\WithTargetAndServiceClosure;
 use Symfony\Component\DependencyInjection\Tests\Fixtures\WithTargetAnonymous;
 use Symfony\Component\DependencyInjection\TypedReference;
 use Symfony\Component\ExpressionLanguage\Expression;
@@ -356,6 +358,23 @@ class AutowirePassTest extends TestCase
         $pass->process($container);
 
         $this->assertSame('b', (string) $aDefinition->getArgument(0));
+    }
+
+    public function testGuessableIntersectionTypeWithTarget()
+    {
+        $container = new ContainerBuilder();
+
+        $container->register('b', \stdClass::class);
+        $container->registerAliasForArgument('b', CollisionInterface::class, 'foo.collision', 'foo');
+        $container->registerAliasForArgument('b', AnotherInterface::class, 'foo.another', 'foo');
+
+        $aDefinition = $container->register('a', IntersectionClassesWithTarget::class);
+        $aDefinition->setAutowired(true);
+
+        $pass = new AutowirePass();
+        $pass->process($container);
+
+        $this->assertSame($container->getDefinition('b'), $container->findDefinition((string) $aDefinition->getArgument(0)));
     }
 
     public function testTypeNotGuessableWithTypeSet()
@@ -1445,6 +1464,26 @@ class AutowirePassTest extends TestCase
         $this->assertSame('50%% off', $service->optional);
     }
 
+    public function testTargetWithAutowireServiceClosure()
+    {
+        $container = new ContainerBuilder();
+
+        $container->register(BarInterface::class, BarInterface::class);
+        $container->register('image.storage', BarInterface::class);
+        $container->registerAliasForArgument('image.storage', BarInterface::class);
+        $container->register('bar', BarInterface::class);
+        $container->register('with_target', WithTargetAndServiceClosure::class)
+            ->setAutowired(true);
+
+        (new AutowirePass())->process($container);
+
+        $definition = $container->getDefinition('with_target');
+
+        $this->assertSame($container->getDefinition('image.storage'), $container->findDefinition((string) $definition->getArgument(0)->getValues()[0]));
+        $this->assertEquals(new Reference(BarInterface::class), $definition->getArgument(1)->getValues()[0]);
+        $this->assertEquals(new Reference('bar'), $definition->getArgument(2)->getValues()[0]);
+    }
+
     public function testAsDecoratorAttribute()
     {
         $container = new ContainerBuilder();
@@ -1464,6 +1503,49 @@ class AutowirePassTest extends TestCase
         $this->assertSame(AsDecoratorBar20::class.'.inner', (string) $container->getDefinition(AsDecoratorBar20::class)->getArgument(1));
         $this->assertSame(AsDecoratorBaz::class.'.inner', (string) $container->getDefinition(AsDecoratorBaz::class)->getArgument(0));
         $this->assertSame(2, $container->getDefinition(AsDecoratorBaz::class)->getArgument(0)->getInvalidBehavior());
+    }
+
+    public function testAsDecoratorAttributeWithOrderConstraints()
+    {
+        $container = new ContainerBuilder();
+
+        $container->register(AsDecoratorFoo::class);
+        $container->register(AsDecoratorAroundBar20::class)->setAutowired(true);
+        $container->register(AsDecoratorBar10::class)->setAutowired(true)->setArgument(0, 'arg1');
+        $container->register(AsDecoratorBar20::class)->setAutowired(true)->setArgument(0, 'arg1');
+        $container->register(AsDecoratorWithinBar10::class)->setAutowired(true);
+
+        (new ResolveClassPass())->process($container);
+        (new AutowireAsDecoratorPass())->process($container);
+
+        $this->assertSame([AsDecoratorFoo::class, null, 0], $container->getDefinition(AsDecoratorWithinBar10::class)->getDecoratedService());
+        $this->assertSame([['within' => [AsDecoratorBar10::class], 'priority' => null]], $container->getDefinition(AsDecoratorWithinBar10::class)->getTag('container.decoration_order'));
+        $this->assertSame([['around' => [AsDecoratorBar20::class]]], $container->getDefinition(AsDecoratorAroundBar20::class)->getTag('container.decoration_order'));
+        $this->assertFalse($container->getDefinition(AsDecoratorBar10::class)->hasTag('container.decoration_order'));
+
+        (new DecoratorServicePass())->process($container);
+        (new AutowirePass())->process($container);
+
+        $this->assertSame(AsDecoratorBar10::class, (string) $container->getAlias(AsDecoratorFoo::class));
+        $this->assertSame(AsDecoratorWithinBar10::class, (string) $container->getAlias(AsDecoratorBar10::class.'.inner'));
+        $this->assertSame(AsDecoratorAroundBar20::class, (string) $container->getAlias(AsDecoratorWithinBar10::class.'.inner'));
+        $this->assertSame(AsDecoratorBar20::class, (string) $container->getAlias(AsDecoratorAroundBar20::class.'.inner'));
+        $this->assertSame(10, $container->getDefinition(AsDecoratorWithinBar10::class)->decorationPriority);
+    }
+
+    public function testAsDecoratorAttributeReplacesTheOrderConstraintsDeclaredElsewhereOnlyWithItsOwn()
+    {
+        $container = new ContainerBuilder();
+
+        $container->register(AsDecoratorFoo::class);
+        $container->register(AsDecoratorBar10::class)->setAutowired(true)->setArgument(0, 'arg1')->addTag('container.decoration_order', ['within' => ['foo']]);
+        $container->register(AsDecoratorWithinBar10::class)->setAutowired(true)->addTag('container.decoration_order', ['around' => ['foo']]);
+
+        (new ResolveClassPass())->process($container);
+        (new AutowireAsDecoratorPass())->process($container);
+
+        $this->assertSame([['within' => ['foo']]], $container->getDefinition(AsDecoratorBar10::class)->getTag('container.decoration_order'));
+        $this->assertSame([['within' => [AsDecoratorBar10::class], 'priority' => null]], $container->getDefinition(AsDecoratorWithinBar10::class)->getTag('container.decoration_order'));
     }
 
     public function testMultipleAsDecoratorAttribute()
@@ -1512,6 +1594,68 @@ class AutowirePassTest extends TestCase
 
         $this->assertSame($fooDecorator, (string) $container->getAlias(AsTagDecoratorFoo::class));
         $this->assertSame($barDecorator, (string) $container->getAlias(AsTagDecoratorBar::class));
+    }
+
+    public function testAsTagDecoratorAttributeWithOrderConstraints()
+    {
+        $container = new ContainerBuilder();
+
+        $container->register(AsTagDecoratorFoo::class)->addTag('test.tag');
+        $container->register(AsTagDecoratorAroundService::class, AsTagDecoratorAroundService::class)->setAutowired(true);
+        $container->register(AsTagDecoratorService::class, AsTagDecoratorService::class)->setAutowired(true);
+
+        (new AutowirePass())->process($container);
+        (new AutowireAsDecoratorPass())->process($container);
+
+        $aroundTemplate = '.tag_decorator.test.tag.'.AsTagDecoratorAroundService::class;
+        $this->assertSame([['decorates_tag' => 'test.tag', 'priority' => 0]], $container->getDefinition($aroundTemplate)->getTag('container.tag_decorator'));
+        $this->assertSame([['around' => [AsTagDecoratorService::class], 'priority' => null, 'alias' => AsTagDecoratorAroundService::class]], $container->getDefinition($aroundTemplate)->getTag('container.decoration_order'));
+
+        (new TagDecoratorPass())->process($container);
+        (new DecoratorServicePass())->process($container);
+
+        $aroundDecorator = '.decorator.'.AsTagDecoratorFoo::class.'.'.$aroundTemplate;
+        $serviceDecorator = '.decorator.'.AsTagDecoratorFoo::class.'..tag_decorator.test.tag.'.AsTagDecoratorService::class;
+
+        $this->assertSame($aroundDecorator, (string) $container->getAlias(AsTagDecoratorFoo::class));
+        $this->assertSame($serviceDecorator, (string) $container->getAlias($aroundDecorator.'.inner'));
+    }
+
+    public function testRepeatedAsDecoratorAttributeCanBeTargetedByServiceId()
+    {
+        $container = new ContainerBuilder();
+
+        $container->register(AsDecoratorMultipleFoo::class);
+        $container->register(AsDecoratorMultipleBar::class);
+        $container->register(AsDecoratorAroundMultiple::class)->setAutowired(true);
+        $container->register('app.multiple', AsDecoratorMultiple::class)->setAutowired(true)->setArgument(0, 'arg1');
+
+        (new ResolveClassPass())->process($container);
+        (new AutowireAsDecoratorPass())->process($container);
+        (new DecoratorServicePass())->process($container);
+
+        $this->assertSame(AsDecoratorAroundMultiple::class, (string) $container->getAlias(AsDecoratorMultipleFoo::class));
+        $this->assertSame('.decorator.'.AsDecoratorMultipleFoo::class.'.app.multiple', (string) $container->getAlias(AsDecoratorAroundMultiple::class.'.inner'));
+    }
+
+    public function testAsTagDecoratorAttributeCanBeTargetedByServiceId()
+    {
+        $container = new ContainerBuilder();
+
+        $container->register(AsTagDecoratorFoo::class)->addTag('test.tag');
+        $container->register(AsTagDecoratorAroundServiceId::class, AsTagDecoratorAroundServiceId::class)->setAutowired(true);
+        $container->register('app.tag_decorator', AsTagDecoratorService::class)->setAutowired(true);
+
+        (new AutowirePass())->process($container);
+        (new AutowireAsDecoratorPass())->process($container);
+        (new TagDecoratorPass())->process($container);
+        (new DecoratorServicePass())->process($container);
+
+        $aroundDecorator = '.decorator.'.AsTagDecoratorFoo::class.'..tag_decorator.test.tag.'.AsTagDecoratorAroundServiceId::class;
+        $serviceDecorator = '.decorator.'.AsTagDecoratorFoo::class.'..tag_decorator.test.tag.app.tag_decorator';
+
+        $this->assertSame($aroundDecorator, (string) $container->getAlias(AsTagDecoratorFoo::class));
+        $this->assertSame($serviceDecorator, (string) $container->getAlias($aroundDecorator.'.inner'));
     }
 
     public function testTypeSymbolExcluded()
@@ -1621,6 +1765,40 @@ class AutowirePassTest extends TestCase
 
         $this->assertTrue($definition->isLazy());
         $this->assertSame([['interface' => LazyProxyTestInterface::class]], $definition->getTag('proxy'));
+    }
+
+    public function testLazyServiceAttributeWithInterfaceProxiesUnionType()
+    {
+        $container = new ContainerBuilder();
+        $container->register('impl', FinalLazyProxyImplementation::class);
+        $container->setAlias(LazyProxyTestInterface::class, 'impl');
+        $container->setAlias(AInterface::class, 'impl');
+        $container->register('foo', LazyServiceAttributeWithInterfaceOnUnionTypeAutowiring::class)->setAutowired(true);
+
+        (new AutowirePass())->process($container);
+        (new ResolveLazyProxyPass())->process($container);
+
+        $definition = $container->getDefinition((string) $container->getDefinition('foo')->getArgument(0)->getValues()[2]);
+
+        $this->assertTrue($definition->isLazy());
+        $this->assertSame([['interface' => LazyProxyTestInterface::class]], $definition->getTag('proxy'));
+    }
+
+    public function testLazyServiceAttributeWithInterfaceProxiesWholeIntersectionType()
+    {
+        $container = new ContainerBuilder();
+        $container->register('impl', FinalLazyProxyImplementation::class);
+        $container->setAlias(LazyProxyTestInterface::class, 'impl');
+        $container->setAlias(AInterface::class, 'impl');
+        $container->register('foo', LazyServiceAttributeWithInterfaceOnIntersectionTypeAutowiring::class)->setAutowired(true);
+
+        (new AutowirePass())->process($container);
+        (new ResolveLazyProxyPass())->process($container);
+
+        $definition = $container->getDefinition((string) $container->getDefinition('foo')->getArgument(0)->getValues()[2]);
+
+        $this->assertTrue($definition->isLazy());
+        $this->assertSame([['interface' => AInterface::class], ['interface' => LazyProxyTestInterface::class]], $definition->getTag('proxy'));
     }
 
     public function testLazyNotCompatibleWithAutowire()

@@ -11,6 +11,8 @@
 
 namespace Symfony\Component\Tui\Input;
 
+use Symfony\Component\Tui\Exception\InvalidArgumentException;
+
 /**
  * Configurable keybindings manager.
  *
@@ -29,11 +31,19 @@ final class Keybindings
 
     /**
      * @param array<string, string[]> $bindings
+     *
+     * @throws InvalidArgumentException When a key id has no key, names an unknown modifier or an unknown key
      */
     public function __construct(array $bindings = [], ?KeyParser $parser = null)
     {
         $this->bindings = $bindings;
         $this->parser = $parser ?? new KeyParser();
+
+        foreach ($bindings as $keyIds) {
+            foreach ($keyIds as $keyId) {
+                $this->parser->validateKeyId($keyId);
+            }
+        }
     }
 
     public function matches(string $data, string $action): bool

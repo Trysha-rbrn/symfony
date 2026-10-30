@@ -51,12 +51,12 @@ class ExceptionCaster
 
     public static function castError(\Error $e, array $a, Stub $stub, bool $isNested, int $filter = 0): array
     {
-        return self::filterExceptionArray($stub->class, $a, "\0Error\0", $filter);
+        return self::filterExceptionArray($stub, $a, "\0Error\0", $filter);
     }
 
     public static function castException(\Exception $e, array $a, Stub $stub, bool $isNested, int $filter = 0): array
     {
-        return self::filterExceptionArray($stub->class, $a, "\0Exception\0", $filter);
+        return self::filterExceptionArray($stub, $a, "\0Exception\0", $filter);
     }
 
     public static function castErrorException(\ErrorException $e, array $a, Stub $stub, bool $isNested): array
@@ -74,9 +74,9 @@ class ExceptionCaster
         $prefix = Caster::PREFIX_PROTECTED;
         $xPrefix = "\0Exception\0";
 
-        if (isset($a[$xPrefix.'previous'], $a[$trace]) && $a[$xPrefix.'previous'] instanceof \Exception) {
-            $b = (array) $a[$xPrefix.'previous'];
-            $class = get_debug_type($a[$xPrefix.'previous']);
+        if (isset($a[$xPrefix.'previous'], $a[$trace]) && ($previous = $e->getPrevious()) instanceof \Exception) {
+            $b = (array) $previous;
+            $class = get_debug_type($previous);
             self::traceUnshift($b[$xPrefix.'trace'], $class, $b[$prefix.'file'], $b[$prefix.'line']);
             $a[$trace] = new TraceStub($b[$xPrefix.'trace'], false, 0, -\count($a[$trace]->value));
         }
@@ -120,6 +120,7 @@ class ExceptionCaster
         }
         $stub->class = '';
         $stub->handle = 0;
+        $stub->cut = $trace->cut;
         $frames = $trace->value;
         $prefix = Caster::PREFIX_VIRTUAL;
 
@@ -131,11 +132,15 @@ class ExceptionCaster
         if (!isset($trace->value[$i])) {
             return [];
         }
+        $length = $j - $i;
+        if (null !== $trace->sliceLength) {
+            $length = 0 > $trace->sliceLength ? $length + $trace->sliceLength : min($length, $trace->sliceLength);
+        }
         $lastCall = isset($frames[$i]['function']) ? (isset($frames[$i]['class']) ? $frames[0]['class'].$frames[$i]['type'] : '').$frames[$i]['function'].'()' : '';
         $frames[] = ['function' => ''];
         $collapse = false;
 
-        for ($j += $trace->numberingOffset - $i++; isset($frames[$i]); ++$i, --$j) {
+        for ($j += $trace->numberingOffset - $i++; 0 < $length-- && isset($frames[$i]); ++$i, --$j) {
             $f = $frames[$i];
             $call = isset($f['function']) ? (isset($f['class']) ? $f['class'].$f['type'] : '').$f['function'] : '???';
 
@@ -181,9 +186,6 @@ class ExceptionCaster
 
             $lastCall = $call;
         }
-        if (null !== $trace->sliceLength) {
-            $a = \array_slice($a, 0, $trace->sliceLength, true);
-        }
 
         return $a;
     }
@@ -198,10 +200,7 @@ class ExceptionCaster
         $srcContext = $frame->srcContext ?? self::$srcContext;
 
         if (isset($f['file'], $f['line'])) {
-            $cacheKey = $f;
-            unset($cacheKey['object'], $cacheKey['args']);
-            $cacheKey[] = $srcContext;
-            $cacheKey = implode('-', $cacheKey);
+            $cacheKey = "{$f['file']}-{$f['line']}-".($f['class'] ?? '').'-'.($f['type'] ?? '').'-'.($f['function'] ?? '').'-'.$srcContext;
 
             if (isset(self::$framesCache[$cacheKey])) {
                 $a[$prefix.'src'] = self::$framesCache[$cacheKey];
@@ -290,7 +289,7 @@ class ExceptionCaster
         return $a;
     }
 
-    private static function filterExceptionArray(string $xClass, array $a, string $xPrefix, int $filter): array
+    private static function filterExceptionArray(Stub $stub, array $a, string $xPrefix, int $filter): array
     {
         if (isset($a[$xPrefix.'trace'])) {
             $trace = $a[$xPrefix.'trace'];
@@ -300,10 +299,18 @@ class ExceptionCaster
         }
 
         if (!($filter & Caster::EXCLUDE_VERBOSE) && $trace) {
-            if (isset($a[Caster::PREFIX_PROTECTED.'file'], $a[Caster::PREFIX_PROTECTED.'line'])) {
-                self::traceUnshift($trace, $xClass, $a[Caster::PREFIX_PROTECTED.'file'], $a[Caster::PREFIX_PROTECTED.'line']);
+            if (($previous = $a[$xPrefix.'previous'] ?? null) instanceof \Throwable && $sharedFrames = self::countSharedFrames($previous->getTrace(), $trace)) {
+                $a[$xPrefix.'previous'] = new PreviousExceptionStub($previous, $sharedFrames);
             }
-            $a[Caster::PREFIX_VIRTUAL.'trace'] = new TraceStub($trace, self::$traceArgs);
+            if (isset($a[Caster::PREFIX_PROTECTED.'file'], $a[Caster::PREFIX_PROTECTED.'line'])) {
+                self::traceUnshift($trace, $stub->class, $a[Caster::PREFIX_PROTECTED.'file'], $a[Caster::PREFIX_PROTECTED.'line']);
+            }
+            $a[Caster::PREFIX_VIRTUAL.'trace'] = $trace = new TraceStub($trace, self::$traceArgs);
+
+            if ($stub->value instanceof PreviousExceptionStub) {
+                $trace->sliceLength = -$stub->value->sharedFrames;
+                $trace->cut = $stub->value->sharedFrames;
+            }
         }
         if (empty($a[$xPrefix.'previous'])) {
             unset($a[$xPrefix.'previous']);
@@ -321,6 +328,34 @@ class ExceptionCaster
         return $a;
     }
 
+    private static function countSharedFrames(array $trace, array $parentTrace): int
+    {
+        if (!array_is_list($trace) || !array_is_list($parentTrace)) {
+            return 0;
+        }
+
+        $sharedFrames = 0;
+        $i = \count($trace);
+        $j = \count($parentTrace);
+
+        while ($i && $j) {
+            $frame = $trace[--$i];
+            $parentFrame = $parentTrace[--$j];
+
+            if (($frame['file'] ?? null) !== ($parentFrame['file'] ?? null)
+                || ($frame['line'] ?? null) !== ($parentFrame['line'] ?? null)
+                || ($frame['class'] ?? null) !== ($parentFrame['class'] ?? null)
+                || ($frame['function'] ?? null) !== ($parentFrame['function'] ?? null)
+            ) {
+                break;
+            }
+
+            ++$sharedFrames;
+        }
+
+        return $sharedFrames;
+    }
+
     private static function traceUnshift(array &$trace, ?string $class, string $file, int $line): void
     {
         if (isset($trace[0]['file'], $trace[0]['line']) && $trace[0]['file'] === $file && $trace[0]['line'] === $line) {
@@ -335,7 +370,7 @@ class ExceptionCaster
 
     private static function extractSource(string $srcLines, int $line, int $srcContext, string $lang, ?string $file, array $frame): EnumStub
     {
-        $srcLines = explode("\n", $srcLines);
+        $srcLines = explode("\n", str_replace(["\r\n", "\r"], "\n", $srcLines));
         $src = [];
 
         for ($i = $line - 1 - $srcContext; $i <= $line - 1 + $srcContext; ++$i) {
@@ -372,7 +407,7 @@ class ExceptionCaster
         do {
             $pad = null;
             for ($i = $srcContext << 1; $i >= 0; --$i) {
-                if (isset($src[$i][$ltrim]) && "\r" !== ($c = $src[$i][$ltrim]) && "\n" !== $c) {
+                if (isset($src[$i][$ltrim]) && "\n" !== ($c = $src[$i][$ltrim])) {
                     $pad ??= $c;
                     if ((' ' !== $c && "\t" !== $c) || $pad !== $c) {
                         break;
@@ -386,7 +421,7 @@ class ExceptionCaster
 
         foreach ($src as $i => $c) {
             if ($ltrim) {
-                $c = isset($c[$ltrim]) && "\r" !== $c[$ltrim] ? substr($c, $ltrim) : ltrim($c, " \t");
+                $c = isset($c[$ltrim]) ? substr($c, $ltrim) : ltrim($c, " \t");
             }
             $c = substr($c, 0, -1);
             if ($i !== $srcContext) {

@@ -15,13 +15,21 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\TestWith;
 use PHPUnit\Framework\MockObject\Stub;
 use PHPUnit\Framework\TestCase;
+use Symfony\Component\EventDispatcher\EventDispatcher;
 use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\RequestStack;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Attribute\Cache;
+use Symfony\Component\HttpKernel\Controller\ArgumentResolver;
+use Symfony\Component\HttpKernel\Controller\ControllerResolver;
 use Symfony\Component\HttpKernel\Event\ControllerArgumentsEvent;
+use Symfony\Component\HttpKernel\Event\ControllerAttributeEvent;
 use Symfony\Component\HttpKernel\Event\ResponseEvent;
 use Symfony\Component\HttpKernel\EventListener\CacheAttributeListener;
+use Symfony\Component\HttpKernel\EventListener\ControllerAttributesListener;
+use Symfony\Component\HttpKernel\HttpKernel;
 use Symfony\Component\HttpKernel\HttpKernelInterface;
+use Symfony\Component\HttpKernel\KernelEvents;
 use Symfony\Component\HttpKernel\Tests\Fixtures\Controller\CacheAttributeController;
 
 class CacheAttributeListenerTest extends TestCase
@@ -50,6 +58,32 @@ class CacheAttributeListenerTest extends TestCase
         $this->listener->onKernelResponse($this->event);
 
         $this->assertSame($response, $this->event->getResponse());
+    }
+
+    #[TestWith([301])]
+    #[TestWith([308])]
+    public function testCacheAttributeIsAppliedToPermanentRedirect(int $statusCode)
+    {
+        $request = $this->createRequest(new Cache(public: true, maxage: 3600));
+        $response = new Response('', $statusCode);
+
+        $this->listener->onKernelResponse($this->createEventMock($request, $response));
+
+        $this->assertTrue($response->headers->hasCacheControlDirective('public'));
+        $this->assertSame('3600', $response->headers->getCacheControlDirective('max-age'));
+    }
+
+    #[TestWith([301])]
+    #[TestWith([308])]
+    public function testCacheAttributeEventIsAppliedToPermanentRedirect(int $statusCode)
+    {
+        $cache = new Cache(public: true, maxage: 3600);
+        $response = new Response('', $statusCode);
+
+        $this->listener->onKernelControllerAttribute(new ControllerAttributeEvent($cache, $this->createEventMock(new Request(), $response)));
+
+        $this->assertTrue($response->headers->hasCacheControlDirective('public'));
+        $this->assertSame('3600', $response->headers->getCacheControlDirective('max-age'));
     }
 
     public function testWontReassignResponseWhenNoConfigurationIsPresent()
@@ -531,6 +565,15 @@ class CacheAttributeListenerTest extends TestCase
             true,
         ];
 
+        yield 'expression using a constant' => [
+            'constant("PHP_INT_SIZE") <= 0',
+            'constant("PHP_INT_SIZE") > 0',
+            false,
+            false,
+            true,
+            true,
+        ];
+
         yield 'expression accessing controller' => [
             'this.cache',
             'not this.cache',
@@ -574,6 +617,116 @@ class CacheAttributeListenerTest extends TestCase
         $this->expectExceptionMessage(\sprintf('The value of the "$if" option of the "%s" attribute must evaluate to a boolean, "string" given.', Cache::class));
 
         $listener->onKernelControllerArguments($controllerArgumentsEvent);
+    }
+
+    public function testTargetedAttributeSetsTargetedCacheControl()
+    {
+        $request = $this->createRequest(
+            new Cache(maxage: 300, public: true),
+            new Cache(maxage: '1 hour', public: true, mustRevalidate: true, staleWhileRevalidate: 60, staleIfError: '1 day', target: 'CDN'),
+        );
+
+        $this->listener->onKernelResponse($this->createEventMock($request, $this->response));
+
+        $this->assertSame('max-age=300, public', $this->response->headers->get('Cache-Control'));
+        $this->assertSame('max-age=3600, must-revalidate, public, stale-if-error=86400, stale-while-revalidate=60', $this->response->headers->get('CDN-Cache-Control'));
+    }
+
+    public function testTargetedAttributeEventSetsTargetedCacheControl()
+    {
+        $response = new Response();
+
+        $this->listener->onKernelControllerAttribute(new ControllerAttributeEvent(new Cache(maxage: 3600, public: false, noStore: true, target: 'CDN'), $this->createEventMock(new Request(), $response)));
+
+        $this->assertSame('max-age=3600, no-store, private', $response->headers->get('CDN-Cache-Control'));
+        $this->assertFalse($response->headers->hasCacheControlDirective('max-age'));
+        $this->assertFalse($response->headers->hasCacheControlDirective('no-store'));
+    }
+
+    public function testTargetedAttributeDoesNotOverrideDirectivesAlreadySet()
+    {
+        $request = $this->createRequest(
+            new Cache(maxage: 3600, public: true, staleWhileRevalidate: 60, staleIfError: 60, target: 'CDN'),
+            new Cache(staleWhileRevalidate: 30, target: 'CDN'),
+        );
+        $this->response->cacheControl('CDN')->setMaxAge(600)->setPrivate();
+
+        $this->listener->onKernelResponse($this->createEventMock($request, $this->response));
+
+        $this->assertSame('max-age=600, private, stale-if-error=60, stale-while-revalidate=30', $this->response->headers->get('CDN-Cache-Control'));
+    }
+
+    public function testTargetedAttributeSetsEachTarget()
+    {
+        $request = $this->createRequest(new Cache(maxage: 3600, staleIfError: 60, target: ['CDN', 'Fastly']));
+
+        $this->listener->onKernelResponse($this->createEventMock($request, $this->response));
+
+        $this->assertFalse($this->response->headers->hasCacheControlDirective('max-age'));
+        $this->assertSame('max-age=3600, stale-if-error=60', $this->response->headers->get('CDN-Cache-Control'));
+        $this->assertSame('max-age=3600, stale-if-error=60', $this->response->headers->get('Fastly-Cache-Control'));
+    }
+
+    public function testTargetedAttributeDoesNotOverrideDirectivesAlreadySetPerTarget()
+    {
+        $request = $this->createRequest(
+            new Cache(maxage: 3600, staleIfError: 60, target: ['CDN', 'Fastly']),
+            new Cache(maxage: 60, target: 'Fastly'),
+        );
+        $this->response->cacheControl('CDN')->setMaxAge(600);
+
+        $this->listener->onKernelResponse($this->createEventMock($request, $this->response));
+
+        $this->assertSame('max-age=600, stale-if-error=60', $this->response->headers->get('CDN-Cache-Control'));
+        $this->assertSame('max-age=60, stale-if-error=60', $this->response->headers->get('Fastly-Cache-Control'));
+    }
+
+    public function testTargetedAttributeIsIgnoredWhenIfIsFalse()
+    {
+        $request = $this->createRequest(new Cache(maxage: 3600, if: false, target: 'CDN'));
+
+        $this->listener->onKernelResponse($this->createEventMock($request, $this->response));
+
+        $this->assertFalse($this->response->headers->has('CDN-Cache-Control'));
+    }
+
+    public function testKernelSetsTheCacheHeadersOnANotModifiedResponse()
+    {
+        $request = new Request();
+        $request->headers->set('If-None-Match', '"'.hash('sha256', '12345').'"');
+        $request->attributes->set('_controller', #[Cache(maxage: 60, public: true, etag: '"12345"')] static fn () => new Response());
+
+        $response = $this->createKernel()->handle($request);
+
+        $this->assertSame(304, $response->getStatusCode());
+        $this->assertSame('max-age=60, public', $response->headers->get('Cache-Control'));
+    }
+
+    public function testKernelEvaluatesTheAttributeForEachRequest()
+    {
+        $kernel = $this->createKernel();
+        $etags = [];
+
+        foreach (['1', '2'] as $id) {
+            $request = new Request();
+            $request->attributes->set('_controller', [new CacheAttributeController(), 'etag']);
+            $request->attributes->set('id', $id);
+            $etags[] = $kernel->handle($request)->getEtag();
+        }
+
+        $this->assertSame(['"'.hash('sha256', '1').'"', '"'.hash('sha256', '2').'"'], $etags);
+    }
+
+    private function createKernel(): HttpKernel
+    {
+        $dispatcher = new EventDispatcher();
+        $dispatcher->addSubscriber(new ControllerAttributesListener([
+            KernelEvents::CONTROLLER_ARGUMENTS => [Cache::class => true],
+            KernelEvents::RESPONSE => [Cache::class => true],
+        ]));
+        $dispatcher->addSubscriber($this->listener);
+
+        return new HttpKernel($dispatcher, new ControllerResolver(), new RequestStack(), new ArgumentResolver());
     }
 
     private function createRequest(Cache ...$cache): Request

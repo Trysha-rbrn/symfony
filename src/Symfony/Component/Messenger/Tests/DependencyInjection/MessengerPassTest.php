@@ -11,7 +11,12 @@
 
 namespace Symfony\Component\Messenger\Tests\DependencyInjection;
 
+use PHPUnit\Framework\Attributes\Group;
+use PHPUnit\Framework\Attributes\IgnoreDeprecations;
 use PHPUnit\Framework\TestCase;
+use Symfony\Component\Console\Tester\CommandTester;
+use Symfony\Component\DependencyInjection\Argument\IteratorArgument;
+use Symfony\Component\DependencyInjection\Argument\TaggedIteratorArgument;
 use Symfony\Component\DependencyInjection\ChildDefinition;
 use Symfony\Component\DependencyInjection\Compiler\AttributeAutoconfigurationPass;
 use Symfony\Component\DependencyInjection\Compiler\ResolveChildDefinitionsPass;
@@ -46,6 +51,7 @@ use Symfony\Component\Messenger\Tests\Fixtures\ChildDummyMessage;
 use Symfony\Component\Messenger\Tests\Fixtures\DummyCommand;
 use Symfony\Component\Messenger\Tests\Fixtures\DummyCommandHandler;
 use Symfony\Component\Messenger\Tests\Fixtures\DummyHandlerWithCustomMethods;
+use Symfony\Component\Messenger\Tests\Fixtures\DummyHandlerWithStampArgument;
 use Symfony\Component\Messenger\Tests\Fixtures\DummyMessage;
 use Symfony\Component\Messenger\Tests\Fixtures\DummyMessageInterface;
 use Symfony\Component\Messenger\Tests\Fixtures\DummyMessageWithAttribute;
@@ -63,6 +69,7 @@ use Symfony\Component\Messenger\Tests\Fixtures\UnionTypeOneMessage;
 use Symfony\Component\Messenger\Tests\Fixtures\UnionTypeTwoMessage;
 use Symfony\Component\Messenger\Transport\Receiver\ReceiverInterface;
 use Symfony\Component\Messenger\Transport\Serialization\Serializer;
+use Symfony\Component\Messenger\Transport\Serialization\SigningSerializer;
 
 class MessengerPassTest extends TestCase
 {
@@ -432,6 +439,24 @@ class MessengerPassTest extends TestCase
         );
     }
 
+    public function testTaggedMessageHandlerWithStampArgument()
+    {
+        $container = $this->getContainerBuilder($busId = 'message_bus');
+        $container
+            ->register(DummyHandlerWithStampArgument::class, DummyHandlerWithStampArgument::class)
+            ->setAutoconfigured(true)
+        ;
+
+        (new AttributeAutoconfigurationPass())->process($container);
+        (new ResolveInstanceofConditionalsPass())->process($container);
+        (new MessengerPass())->process($container);
+
+        $handlerDescriptionMapping = $container->getDefinition($busId.'.messenger.handlers_locator')->getArgument(0);
+
+        $this->assertCount(1, $handlerDescriptionMapping);
+        $this->assertHandlerDescriptor($container, $handlerDescriptionMapping, DummyMessage::class, [DummyHandlerWithStampArgument::class], [[]]);
+    }
+
     public function testTaggedBatchMessageHandlerIsRegisteredOnce()
     {
         $container = $this->getContainerBuilder($busId = 'message_bus');
@@ -518,6 +543,131 @@ class MessengerPassTest extends TestCase
         $handlerDescriptionMapping = $container->getDefinition($busId.'.messenger.handlers_locator')->getArgument(0);
 
         $this->assertHandlerDescriptor($container, $handlerDescriptionMapping, DummyMessage::class, ['handler_a', 'handler_b'], [['alias' => 'first'], ['alias' => 'handler_b']]);
+    }
+
+    public function testHandlersWithoutConstraintsKeepTheirOrderAndIds()
+    {
+        $container = $this->getContainerBuilder();
+        $container->register('a', DummyHandler::class)->addTag('messenger.message_handler', ['priority' => -5]);
+        $container->register('b', DummyHandlerWithTwoMethods::class)
+            ->addTag('messenger.message_handler', ['handles' => DummyMessage::class, 'method' => 'early'])
+            ->addTag('messenger.message_handler', ['handles' => DummyMessage::class, 'method' => 'late', 'priority' => 5, 'from_transport' => 'async']);
+        $container->register('c', DummyHandler::class)->addTag('messenger.message_handler', ['priority' => null]);
+
+        (new MessengerPass())->process($container);
+
+        $this->assertSame(['b::late', 'b::early', 'c', 'a'], $this->getHandlerIds($container, DummyMessage::class));
+        $this->assertTrue($container->hasDefinition('.messenger.method_on_object_wrapper.'.ContainerBuilder::hash(DummyMessage::class.':0:b:early:')));
+        $this->assertTrue($container->hasDefinition('.messenger.method_on_object_wrapper.'.ContainerBuilder::hash(DummyMessage::class.':5:b:late:async')));
+    }
+
+    public function testAHandlerWithoutPriorityCanRunBeforeAnother()
+    {
+        $container = $this->getContainerBuilder();
+        $container->register('a', DummyHandler::class)->addTag('messenger.message_handler', ['priority' => 10]);
+        $container->register('b', DummyHandler::class)->addTag('messenger.message_handler', ['before' => 'a']);
+        $container->register('c', DummyHandler::class)->addTag('messenger.message_handler', ['priority' => 5]);
+
+        (new MessengerPass())->process($container);
+
+        $this->assertSame(['b', 'a', 'c'], $this->getHandlerIds($container, DummyMessage::class));
+    }
+
+    public function testAHandlerWithoutPriorityCanRunAfterAnother()
+    {
+        $container = $this->getContainerBuilder();
+        $container->register('a', DummyHandler::class)->addTag('messenger.message_handler', ['after' => ['c']]);
+        $container->register('b', DummyHandler::class)->addTag('messenger.message_handler', ['priority' => 10]);
+        $container->register('c', DummyHandler::class)->addTag('messenger.message_handler', ['priority' => -5]);
+
+        (new MessengerPass())->process($container);
+
+        $this->assertSame(['b', 'c', 'a'], $this->getHandlerIds($container, DummyMessage::class));
+    }
+
+    public function testConstraintsReorderHandlersOfTheSamePriority()
+    {
+        $container = $this->getContainerBuilder();
+        $container->register('a', DummyHandler::class)->addTag('messenger.message_handler', ['priority' => 10]);
+        $container->register('b', DummyHandler::class)->addTag('messenger.message_handler', ['priority' => 10, 'before' => 'a']);
+
+        (new MessengerPass())->process($container);
+
+        $this->assertSame(['b', 'a'], $this->getHandlerIds($container, DummyMessage::class));
+    }
+
+    public function testAConstraintContradictingAnExplicitPriorityIsReported()
+    {
+        $container = $this->getContainerBuilder();
+        $container->register('a', DummyHandler::class)->addTag('messenger.message_handler', ['priority' => 10]);
+        $container->register('b', DummyHandler::class)->addTag('messenger.message_handler', ['priority' => 0, 'before' => 'a']);
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage(\sprintf('Cannot order the handlers of "%s" on bus "message_bus": the priority of "b" (0) contradicts its "before" constraint on "a" (10): raise it to 10 or more, remove it, or drop the constraint.', DummyMessage::class));
+
+        (new MessengerPass())->process($container);
+    }
+
+    public function testAConstraintCanTargetAClass()
+    {
+        $container = $this->getContainerBuilder();
+        $container->register('a', DummyHandlerWithTwoMethods::class)->addTag('messenger.message_handler', ['handles' => DummyMessage::class, 'method' => 'early']);
+        $container->register('b', DummyHandler::class)->addTag('messenger.message_handler', ['before' => DummyHandlerWithTwoMethods::class]);
+
+        (new MessengerPass())->process($container);
+
+        $handlerDescriptionMapping = $container->getDefinition('message_bus.messenger.handlers_locator')->getArgument(0);
+
+        $this->assertHandlerDescriptor($container, $handlerDescriptionMapping, DummyMessage::class, ['b', ['a', 'early']]);
+    }
+
+    public function testAConstraintCanTargetAMethodOfAHandler()
+    {
+        $container = $this->getContainerBuilder();
+        $container->register('multi', DummyHandlerWithTwoMethods::class)
+            ->addTag('messenger.message_handler', ['handles' => DummyMessage::class, 'method' => 'early', 'priority' => 10])
+            ->addTag('messenger.message_handler', ['handles' => DummyMessage::class, 'method' => 'late', 'priority' => -10]);
+        $container->register('a', DummyHandler::class)->addTag('messenger.message_handler', ['after' => 'multi::late']);
+
+        (new MessengerPass())->process($container);
+
+        $this->assertSame(['multi::early', 'multi::late', 'a'], $this->getHandlerIds($container, DummyMessage::class));
+    }
+
+    public function testAMethodTargetOnAKnownHandlerMustExist()
+    {
+        $container = $this->getContainerBuilder();
+        $container->register('multi', DummyHandlerWithTwoMethods::class)->addTag('messenger.message_handler', ['handles' => DummyMessage::class, 'method' => 'early']);
+        $container->register('a', DummyHandler::class)->addTag('messenger.message_handler', ['before' => 'multi::typo']);
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage(\sprintf('Invalid "before" constraint on handler "a": "multi" does not handle "%s" on bus "message_bus" with method "typo".', DummyMessage::class));
+
+        (new MessengerPass())->process($container);
+    }
+
+    public function testConstraintsTargetingAnAbsentHandlerAreIgnored()
+    {
+        $container = $this->getContainerBuilder();
+        $container->register('a', DummyHandler::class)->addTag('messenger.message_handler');
+        $container->register('b', DummyHandler::class)->addTag('messenger.message_handler', ['after' => 'not_installed', 'before' => 'absent::method']);
+
+        (new MessengerPass())->process($container);
+
+        $this->assertSame(['a', 'b'], $this->getHandlerIds($container, DummyMessage::class));
+    }
+
+    public function testBeforeAndAfterAreReadFromTheAttribute()
+    {
+        $container = $this->getContainerBuilder();
+        $container->register('a', DummyHandler::class)->addTag('messenger.message_handler');
+        $container->register('b', OrderedDummyHandler::class)->setAutoconfigured(true);
+
+        (new AttributeAutoconfigurationPass())->process($container);
+        (new ResolveInstanceofConditionalsPass())->process($container);
+        (new MessengerPass())->process($container);
+
+        $this->assertSame(['b', 'a'], $this->getHandlerIds($container, DummyMessage::class));
     }
 
     public function testProcessHandlersByBus()
@@ -1131,6 +1281,83 @@ class MessengerPassTest extends TestCase
         ], $container->getDefinition('console.command.messenger_debug')->getArgument(0));
     }
 
+    public function testItAddsMiddlewareToTheDebugCommand()
+    {
+        $container = $this->getContainerBuilder($fooBusId = 'messenger.bus.foo');
+        $container->register($barBusId = 'messenger.bus.bar', MessageBusInterface::class)->setArgument(0, [])->addTag('messenger.bus');
+        $container->register($bazBusId = 'messenger.bus.baz', MessageBusInterface::class)
+            ->setArgument(0, new IteratorArgument([new Reference(UselessMiddleware::class)]))
+            ->addTag('messenger.bus');
+        $container->register('middleware_with_factory', UselessMiddleware::class)->setAbstract(true);
+        $container->register(UselessMiddleware::class, UselessMiddleware::class);
+        $container->register('console.command.messenger_debug', DebugCommand::class)->addArgument([]);
+
+        $container->setParameter($fooBusId.'.middleware', [
+            ['id' => 'middleware_with_factory'],
+            ['id' => UselessMiddleware::class],
+        ]);
+
+        (new MessengerPass())->process($container);
+
+        $this->assertSame([
+            $fooBusId => [
+                [$fooBusId.'.middleware.middleware_with_factory', UselessMiddleware::class],
+                [UselessMiddleware::class, UselessMiddleware::class],
+            ],
+            $barBusId => [],
+            $bazBusId => [
+                [UselessMiddleware::class, UselessMiddleware::class],
+            ],
+        ], $container->getDefinition('console.command.messenger_debug')->getArgument('$middleware'));
+    }
+
+    public function testItAddsTaggedIteratorMiddlewareToTheDebugCommand()
+    {
+        $container = $this->getContainerBuilder($busId = 'messenger.bus.foo');
+        $container->getDefinition($busId)->setArgument(0, new TaggedIteratorArgument('app.middleware'));
+        $container->register('second_middleware', UselessMiddleware::class)->addTag('app.middleware', ['priority' => -1]);
+        $container->register('first_middleware', UselessMiddleware::class)->addTag('app.middleware', ['priority' => 1]);
+        $container->register('console.command.messenger_debug', DebugCommand::class)->addArgument([]);
+
+        (new MessengerPass())->process($container);
+
+        $this->assertSame([
+            $busId => [
+                ['first_middleware', UselessMiddleware::class],
+                ['second_middleware', UselessMiddleware::class],
+            ],
+        ], $container->getDefinition('console.command.messenger_debug')->getArgument('$middleware'));
+    }
+
+    public function testItAddsMiddlewareToTheDebugCommandWithoutSendersLocator()
+    {
+        $container = new ContainerBuilder();
+        $container->register('message_bus', MessageBusInterface::class)->addArgument([])->addTag('messenger.bus');
+        $container->register(UselessMiddleware::class, UselessMiddleware::class);
+        $container->setParameter('message_bus.middleware', [['id' => UselessMiddleware::class]]);
+        $container->register('console.command.messenger_debug', DebugCommand::class)->addArgument([])->setPublic(true);
+        $container->addCompilerPass(new MessengerPass());
+        $container->compile();
+
+        $tester = new CommandTester($container->get('console.command.messenger_debug'));
+        $tester->execute(['--middleware' => true], ['decorated' => false]);
+
+        $this->assertStringContainsString(UselessMiddleware::class, $tester->getDisplay(true));
+    }
+
+    public function testItStopsOnCircularMiddlewareParentsForTheDebugCommand()
+    {
+        $container = $this->getContainerBuilder($busId = 'messenger.bus.foo');
+        $container->getDefinition($busId)->setArgument(0, [new Reference('middleware_a')]);
+        $container->setDefinition('middleware_a', new ChildDefinition('middleware_b'));
+        $container->setDefinition('middleware_b', new ChildDefinition('middleware_a'));
+        $container->register('console.command.messenger_debug', DebugCommand::class)->addArgument([]);
+
+        (new MessengerPass())->process($container);
+
+        $this->assertSame([$busId => [['middleware_a', null]]], $container->getDefinition('console.command.messenger_debug')->getArgument('$middleware'));
+    }
+
     public function testItAddsRoutingToTheDebugCommand()
     {
         $container = $this->getContainerBuilder('message_bus');
@@ -1181,7 +1408,7 @@ class MessengerPassTest extends TestCase
         ], $commandDefinition->getArgument(4));
     }
 
-    public function testCreatesSigningSerializerChildrenFromMapping()
+    public function testKeepsTheSigningSerializersOfTransportsWhenAMessageTypeRequiresASignature()
     {
         $container = $this->getContainerBuilder('message_bus');
 
@@ -1194,18 +1421,16 @@ class MessengerPassTest extends TestCase
             ->addTag('messenger.message_handler', ['sign' => true])
         ;
 
-        $container->register('messenger.signing_serializer')
-            ->setArguments([null, null, [DummyMessage::class => ['messenger.default_serializer']]])
-        ;
+        $this->registerSigningSerializers($container);
 
         (new ResolveClassPass())->process($container);
         (new MessengerPass())->process($container);
 
-        $this->assertSame([DummyMessage::class], $container->getDefinition('messenger.signing_serializer')->getArgument(2));
-
-        $child = $container->getDefinition('.signing.messenger.default_serializer');
-        $this->assertInstanceOf(ChildDefinition::class, $child);
-        $this->assertSame(['messenger.default_serializer', null, 0], $child->getDecoratedService());
+        $this->assertSame([DummyMessage::class], $container->getDefinition('.messenger.signing_serializer.message_types')->getArgument(2));
+        $this->assertInstanceOf(ChildDefinition::class, $container->getDefinition('.messenger.transport.async.signing_serializer'));
+        $this->assertInstanceOf(ChildDefinition::class, $signed = $container->getDefinition('.messenger.transport.signed.signing_serializer'));
+        $this->assertSame('messenger.signing_serializer', $signed->getParent());
+        $this->assertSame([null, 'signing-key', 'sha256', false], array_values($container->getDefinition('messenger.signing_serializer')->getArguments()));
     }
 
     public function testAllSignedMessagesAreMapped()
@@ -1222,49 +1447,332 @@ class MessengerPassTest extends TestCase
             ->addTag('messenger.message_handler', ['sign' => true])
         ;
 
-        $container->register('messenger.signing_serializer')
-            ->setArguments([null, null, [DummyMessage::class => ['messenger.default_serializer']]])
-        ;
+        $this->registerSigningSerializers($container);
 
         (new ResolveClassPass())->process($container);
         (new MessengerPass())->process($container);
 
-        $this->assertSame([DummyMessage::class, DummyCommand::class], $container->getDefinition('messenger.signing_serializer')->getArgument(2));
+        $this->assertSame([DummyMessage::class, DummyCommand::class], $container->getDefinition('.messenger.signing_serializer.message_types')->getArgument(2));
     }
 
-    public function testDecoratesAllSerializersFromMappingRegardlessOfSignedTypes()
+    public function testAHandlerThatRequiresASignatureCannotBeBoundToATransportThatDoesNotSignEveryMessage()
     {
-        $container = $this->getContainerBuilder('message_bus');
+        $container = $this->getContainerBuilder();
+        $container->register('messenger.senders_locator')->addArgument([]);
+        $container->register('messenger.transport.async', DummyReceiver::class)->addTag('messenger.receiver', ['alias' => 'async']);
+        $container->register(DummyHandler::class, DummyHandler::class)->addTag('messenger.message_handler', ['transport' => 'async', 'sign' => true]);
 
-        $container
-            ->register(DummyHandler::class)
-            ->addTag('messenger.message_handler', ['sign' => true])
-        ;
-        // Do not sign SecondMessage on purpose; we only include it in the mapping below
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage(\sprintf('Invalid handler service "%s": it requires a signature, so the "async" transport that its "transport" option refers to must sign every message; set the "sign" option of that transport to true.', DummyHandler::class));
 
-        $container->register('messenger.signing_serializer')
-            ->setArguments([null, null, [
-                DummyMessage::class => ['messenger.serializer.one', 'messenger.serializer.two'],
-                SecondMessage::class => ['messenger.serializer.three'],
-            ]])
-        ;
+        (new MessengerPass())->process($container);
+    }
 
-        (new ResolveClassPass())->process($container);
+    public function testAHandlerThatRequiresASignatureCanBeBoundToATransportThatSignsEveryMessageOrHandlesThemInThisProcess()
+    {
+        $container = $this->getContainerBuilder();
+        $container->register('messenger.senders_locator')->addArgument([]);
+        $container->register('messenger.transport.async', DummyReceiver::class)->addTag('messenger.receiver', ['alias' => 'async', 'sign' => true]);
+        $container->register('messenger.transport.sync', DummyReceiver::class)->addTag('messenger.receiver', ['alias' => 'sync', 'is_consumable' => false]);
+        $container->register('app.async_handler', DummyHandler::class)->addTag('messenger.message_handler', ['transport' => 'async', 'sign' => true]);
+        $container->register('app.sync_handler', DummyHandler::class)->addTag('messenger.message_handler', ['transport' => 'sync', 'sign' => true]);
+
         (new MessengerPass())->process($container);
 
-        $this->assertSame([DummyMessage::class], $container->getDefinition('messenger.signing_serializer')->getArgument(2));
+        $this->assertSame([DummyMessage::class => ['async', 'sync']], $container->getDefinition('messenger.senders_locator')->getArgument(0));
+    }
 
-        $childOne = $container->getDefinition('.signing.messenger.serializer.one');
-        $this->assertInstanceOf(ChildDefinition::class, $childOne);
-        $this->assertSame(['messenger.serializer.one', null, 0], $childOne->getDecoratedService());
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
+    public function testRoutingAMessageWhoseHandlerRequiresASignatureToATransportThatDoesNotSignEveryMessageIsDeprecated()
+    {
+        $container = $this->getContainerBuilder();
+        $container->register('messenger.senders_locator')->addArgument([DummyMessage::class => ['async']]);
+        $container->register('messenger.transport.async', DummyReceiver::class)->addTag('messenger.receiver', ['alias' => 'async']);
+        $container->register(DummyHandler::class, DummyHandler::class)->addTag('messenger.message_handler', ['sign' => true]);
 
-        $childTwo = $container->getDefinition('.signing.messenger.serializer.two');
-        $this->assertInstanceOf(ChildDefinition::class, $childTwo);
-        $this->assertSame(['messenger.serializer.two', null, 0], $childTwo->getDecoratedService());
+        $this->expectUserDeprecationMessage(\sprintf('Since symfony/messenger 8.2: Routing message "%s" to the "async" transport is deprecated. A handler of this message requires a signature, but the transport does not sign every message. Set the "sign" option of the transport to true, or the handler will refuse these messages in 9.0.', DummyMessage::class));
 
-        $childThree = $container->getDefinition('.signing.messenger.serializer.three');
-        $this->assertInstanceOf(ChildDefinition::class, $childThree);
-        $this->assertSame(['messenger.serializer.three', null, 0], $childThree->getDecoratedService());
+        (new MessengerPass())->process($container);
+    }
+
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
+    public function testRoutingAChildOfAMessageWhoseHandlerRequiresASignatureToATransportThatDoesNotSignEveryMessageIsDeprecated()
+    {
+        $container = $this->getContainerBuilder();
+        $container->register('messenger.senders_locator')->addArgument([ChildDummyMessage::class => ['messenger.transport.async']]);
+        $container->register('messenger.transport.async', DummyReceiver::class)->addTag('messenger.receiver', ['alias' => 'async']);
+        $container->register(DummyHandler::class, DummyHandler::class)->addTag('messenger.message_handler', ['sign' => true]);
+
+        $this->expectUserDeprecationMessage(\sprintf('Since symfony/messenger 8.2: Routing message "%s" to the "messenger.transport.async" transport is deprecated. A handler of this message requires a signature, but the transport does not sign every message. Set the "sign" option of the transport to true, or the handler will refuse these messages in 9.0.', ChildDummyMessage::class));
+
+        (new MessengerPass())->process($container);
+    }
+
+    public function testRoutingAMessageWhoseHandlerRequiresASignatureToATransportThatSignsEveryMessageOrHandlesItInThisProcessOrThroughAWildcardIsNotDeprecated()
+    {
+        $container = $this->getContainerBuilder();
+        $container->register('messenger.senders_locator')->addArgument([
+            DummyMessage::class => ['signed', 'sync', 'app.sender'],
+            'Symfony\Component\Messenger\Tests\Fixtures\*' => ['async'],
+            '*' => ['async'],
+        ]);
+        $container->register('messenger.transport.async', DummyReceiver::class)->addTag('messenger.receiver', ['alias' => 'async']);
+        $container->register('messenger.transport.signed', DummyReceiver::class)->addTag('messenger.receiver', ['alias' => 'signed', 'sign' => true]);
+        $container->register('messenger.transport.sync', DummyReceiver::class)->addTag('messenger.receiver', ['alias' => 'sync', 'is_consumable' => false]);
+        $container->register(DummyHandler::class, DummyHandler::class)->addTag('messenger.message_handler', ['sign' => true]);
+        $container->register(DummyCommandHandler::class, DummyCommandHandler::class)->addTag('messenger.message_handler', ['sign' => true]);
+
+        (new MessengerPass())->process($container);
+
+        $this->assertSame(['signed', 'sync', 'app.sender'], $container->getDefinition('messenger.senders_locator')->getArgument(0)[DummyMessage::class]);
+    }
+
+    private function registerSigningSerializers(ContainerBuilder $container): void
+    {
+        $container->register('messenger.signing_serializer', SigningSerializer::class)
+            ->setAbstract(true)
+            ->setArguments([null, 'signing-key', 'sha256', false])
+        ;
+        $container->register('.messenger.signing_serializer.message_types', SigningSerializer::class)
+            ->setAbstract(true)
+            ->setFactory([SigningSerializer::class, 'forMessageTypes'])
+            ->setArguments([null, 'signing-key', [], 'sha256'])
+        ;
+        $container->setDefinition('.messenger.transport.async.signing_serializer', (new ChildDefinition('.messenger.signing_serializer.message_types'))
+            ->replaceArgument(0, new Reference('messenger.default_serializer')));
+        $container->setDefinition('.messenger.transport.signed.signing_serializer', (new ChildDefinition('messenger.signing_serializer'))
+            ->replaceArgument(0, new Reference('messenger.default_serializer')));
+    }
+
+    public function testTaggedMiddlewareIsAddedBeforeSendMessage()
+    {
+        $container = $this->getContainerBuilderWithMiddleware(['first', 'send_message', 'handle_message']);
+        $container->register('tagged', UselessMiddleware::class)->addTag('messenger.middleware', ['bus' => 'messenger.bus.foo']);
+
+        (new MessengerPass())->process($container);
+
+        $this->assertSame(['first', 'tagged', 'messenger.middleware.send_message', 'messenger.middleware.handle_message'], $this->getBusMiddlewareIds($container, 'messenger.bus.foo'));
+    }
+
+    public function testTaggedMiddlewareIsAddedLastWhenTheBusHasNoSendMessageMiddleware()
+    {
+        $container = $this->getContainerBuilderWithMiddleware(['first']);
+        $container->register('tagged', UselessMiddleware::class)->addTag('messenger.middleware', ['bus' => 'messenger.bus.foo']);
+
+        (new MessengerPass())->process($container);
+
+        $this->assertSame(['first', 'tagged'], $this->getBusMiddlewareIds($container, 'messenger.bus.foo'));
+    }
+
+    public function testTaggedMiddlewareIsAddedBeforeChainAndHandleMessageWhenTheBusDoesNotSendMessages()
+    {
+        $container = $this->getContainerBuilderWithMiddleware(['first', 'chain', 'handle_message']);
+        $container->register('tagged', UselessMiddleware::class)->addTag('messenger.middleware', ['bus' => 'messenger.bus.foo']);
+
+        (new MessengerPass())->process($container);
+
+        $this->assertSame(['first', 'tagged', 'messenger.middleware.chain', 'messenger.middleware.handle_message'], $this->getBusMiddlewareIds($container, 'messenger.bus.foo'));
+    }
+
+    public function testTaggedMiddlewareIsOrderedWithBeforeAndAfter()
+    {
+        $container = $this->getContainerBuilderWithMiddleware(['first', 'second', 'send_message', 'handle_message']);
+        $container->register('early', UselessMiddleware::class)->addTag('messenger.middleware', ['bus' => 'messenger.bus.foo', 'before' => 'second']);
+        $container->register('late', UselessMiddleware::class)->addTag('messenger.middleware', ['bus' => 'messenger.bus.foo', 'after' => ['messenger.middleware.send_message']]);
+        $container->register('by_class', UselessMiddleware::class)->addTag('messenger.middleware', ['bus' => 'messenger.bus.foo', 'before' => 'App\\FirstMiddleware']);
+
+        (new MessengerPass())->process($container);
+
+        $this->assertSame(['by_class', 'first', 'early', 'second', 'messenger.middleware.send_message', 'late', 'messenger.middleware.handle_message'], $this->getBusMiddlewareIds($container, 'messenger.bus.foo'));
+    }
+
+    public function testMiddlewareCanBeTaggedForSeveralBuses()
+    {
+        $container = $this->getContainerBuilderWithMiddleware(['first']);
+        $container->register('messenger.bus.bar', MessageBusInterface::class)->addTag('messenger.bus')->setArgument(0, []);
+        $container->setParameter('messenger.bus.bar.middleware', [['id' => 'second']]);
+        $container->register('tagged', UselessMiddleware::class)
+            ->addTag('messenger.middleware', ['bus' => 'messenger.bus.foo', 'before' => 'first'])
+            ->addTag('messenger.middleware', ['bus' => 'messenger.bus.bar']);
+
+        (new MessengerPass())->process($container);
+
+        $this->assertSame(['tagged', 'first'], $this->getBusMiddlewareIds($container, 'messenger.bus.foo'));
+        $this->assertSame(['second', 'tagged'], $this->getBusMiddlewareIds($container, 'messenger.bus.bar'));
+    }
+
+    public function testMiddlewareTaggedForAllBusesIsAddedToEachBus()
+    {
+        $container = $this->getContainerBuilderWithTwoBuses();
+        $container->register('tagged', UselessMiddleware::class)->addTag('messenger.middleware', ['bus' => '*']);
+
+        (new MessengerPass())->process($container);
+
+        $this->assertSame(['first', 'tagged'], $this->getBusMiddlewareIds($container, 'messenger.bus.foo'));
+        $this->assertSame(['second', 'tagged'], $this->getBusMiddlewareIds($container, 'messenger.bus.bar'));
+    }
+
+    public function testATagForASpecificBusOverridesTheOneForAllBuses()
+    {
+        $container = $this->getContainerBuilderWithTwoBuses();
+        $container->register('tagged', UselessMiddleware::class)
+            ->addTag('messenger.middleware', ['bus' => '*'])
+            ->addTag('messenger.middleware', ['bus' => 'messenger.bus.foo', 'before' => 'first']);
+
+        (new MessengerPass())->process($container);
+
+        $this->assertSame(['tagged', 'first'], $this->getBusMiddlewareIds($container, 'messenger.bus.foo'));
+        $this->assertSame(['second', 'tagged'], $this->getBusMiddlewareIds($container, 'messenger.bus.bar'));
+    }
+
+    public function testMiddlewareTaggedForAllBusesKeepsItsConfiguredPosition()
+    {
+        $container = $this->getContainerBuilderWithTwoBuses();
+        $container->setParameter('messenger.bus.foo.middleware', [['id' => 'tagged'], ['id' => 'first']]);
+        $container->register('tagged', UselessMiddleware::class)->addTag('messenger.middleware', ['bus' => '*']);
+
+        (new MessengerPass())->process($container);
+
+        $this->assertSame(['tagged', 'first'], $this->getBusMiddlewareIds($container, 'messenger.bus.foo'));
+        $this->assertSame(['second', 'tagged'], $this->getBusMiddlewareIds($container, 'messenger.bus.bar'));
+    }
+
+    public function testMiddlewareTaggedForAllBusesIsIgnoredWithoutBuses()
+    {
+        $container = $this->getContainerBuilder('messenger.bus.foo');
+        $container->register('tagged', UselessMiddleware::class)->addTag('messenger.middleware', ['bus' => '*']);
+
+        (new MessengerPass())->process($container);
+
+        $this->assertSame([], $container->getDefinition('messenger.bus.foo')->getArgument(0));
+    }
+
+    public function testTaggedMiddlewareRequiresABus()
+    {
+        $container = $this->getContainerBuilderWithMiddleware(['first']);
+        $container->register('tagged', UselessMiddleware::class)->addTag('messenger.middleware');
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Invalid middleware service "tagged": the "messenger.middleware" tag requires a "bus" attribute.');
+
+        (new MessengerPass())->process($container);
+    }
+
+    public function testTaggedMiddlewareTargetingAnUnknownBusFails()
+    {
+        $container = $this->getContainerBuilderWithMiddleware(['first']);
+        $container->register('tagged', UselessMiddleware::class)->addTag('messenger.middleware', ['bus' => 'messenger.bus.bar']);
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Invalid middleware service "tagged": bus "messenger.bus.bar" specified on the tag "messenger.middleware" does not exist (known ones are: "messenger.bus.foo").');
+
+        (new MessengerPass())->process($container);
+    }
+
+    public function testMiddlewareCannotBeBothConfiguredAndTaggedForTheSameBus()
+    {
+        $container = $this->getContainerBuilderWithMiddleware(['first']);
+        $container->getDefinition('first')->addTag('messenger.middleware', ['bus' => 'messenger.bus.foo']);
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Invalid middleware service "first": it is both listed in the configuration of bus "messenger.bus.foo" and tagged "messenger.middleware" for it.');
+
+        (new MessengerPass())->process($container);
+    }
+
+    public function testMiddlewareCannotBeTaggedForABusThatListsItThroughAnAlias()
+    {
+        $container = $this->getContainerBuilderWithMiddleware(['audit']);
+        $container->register('tagged', UselessMiddleware::class)->addTag('messenger.middleware', ['bus' => 'messenger.bus.foo']);
+        $container->setAlias('audit', 'tagged');
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Invalid middleware service "tagged": it is both listed in the configuration of bus "messenger.bus.foo" and tagged "messenger.middleware" for it.');
+
+        (new MessengerPass())->process($container);
+    }
+
+    public function testMiddlewareTaggedForAllBusesKeepsThePositionConfiguredThroughAnAlias()
+    {
+        $container = $this->getContainerBuilderWithMiddleware(['audit', 'first']);
+        $container->register('tagged', UselessMiddleware::class)->addTag('messenger.middleware', ['bus' => '*']);
+        $container->setAlias('audit', 'tagged');
+
+        (new MessengerPass())->process($container);
+
+        $this->assertSame(['audit', 'first'], $this->getBusMiddlewareIds($container, 'messenger.bus.foo'));
+    }
+
+    public function testMiddlewareCannotBeTaggedTwiceForTheSameBus()
+    {
+        $container = $this->getContainerBuilderWithMiddleware(['first']);
+        $container->register('tagged', UselessMiddleware::class)
+            ->addTag('messenger.middleware', ['bus' => 'messenger.bus.foo'])
+            ->addTag('messenger.middleware', ['bus' => 'messenger.bus.foo', 'before' => 'first']);
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Invalid middleware service "tagged": it is tagged "messenger.middleware" more than once for bus "messenger.bus.foo".');
+
+        (new MessengerPass())->process($container);
+    }
+
+    public function testTaggedMiddlewareCyclesAreReported()
+    {
+        $container = $this->getContainerBuilderWithMiddleware(['first']);
+        $container->register('a', UselessMiddleware::class)->addTag('messenger.middleware', ['bus' => 'messenger.bus.foo', 'before' => 'b']);
+        $container->register('b', UselessMiddleware::class)->addTag('messenger.middleware', ['bus' => 'messenger.bus.foo', 'before' => 'a']);
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Cannot order the middleware of bus "messenger.bus.foo": cycle detected in the "before"/"after" constraints: "a" -> "b" -> "a".');
+
+        (new MessengerPass())->process($container);
+    }
+
+    private function getContainerBuilderWithMiddleware(array $configuredIds): ContainerBuilder
+    {
+        $container = $this->getContainerBuilder('messenger.bus.foo');
+        $container->setParameter('messenger.bus.foo.middleware', array_map(static fn ($id) => ['id' => $id], $configuredIds));
+        $container->register('first', 'App\\FirstMiddleware');
+        $container->register('second', 'App\\SecondMiddleware');
+        $container->register('messenger.middleware.send_message', 'App\\SendMessageMiddleware');
+        $container->register('messenger.middleware.chain', 'App\\ChainMiddleware');
+        $container->register('messenger.middleware.handle_message', 'App\\HandleMessageMiddleware');
+
+        return $container;
+    }
+
+    private function getContainerBuilderWithTwoBuses(): ContainerBuilder
+    {
+        $container = $this->getContainerBuilderWithMiddleware(['first']);
+        $container->register('messenger.bus.bar', MessageBusInterface::class)->addTag('messenger.bus')->setArgument(0, []);
+        $container->setParameter('messenger.bus.bar.middleware', [['id' => 'second']]);
+
+        return $container;
+    }
+
+    private function getBusMiddlewareIds(ContainerBuilder $container, string $busId): array
+    {
+        return array_map('strval', $container->getDefinition($busId)->getArgument(0)->getValues());
+    }
+
+    /**
+     * @return list<string> The handlers of the message in the order they run, as "service" or "service::method"
+     */
+    private function getHandlerIds(ContainerBuilder $container, string $message): array
+    {
+        return array_map(static function (Reference $descriptor) use ($container): string {
+            $handler = (string) $container->getDefinition((string) $descriptor)->getArgument(0);
+
+            if (!str_starts_with($handler, '.messenger.method_on_object_wrapper.')) {
+                return $handler;
+            }
+
+            [$service, $method] = $container->getDefinition($handler)->getArgument(0);
+
+            return $service.'::'.$method;
+        }, $container->getDefinition('message_bus.messenger.handlers_locator')->getArgument(0)[$message]->getValues());
     }
 
     private function getContainerBuilder(string $busId = 'message_bus'): ContainerBuilder
@@ -1356,26 +1864,7 @@ class MessengerPassTest extends TestCase
         $this->assertNotNull($removeDefinition->getArgument(1));
     }
 
-    public function testCollectsSignedMessageTypesFromTaggedHandlers()
-    {
-        $container = $this->getContainerBuilder('message_bus');
-
-        $container
-            ->register(DummyHandler::class)
-            ->addTag('messenger.message_handler', ['sign' => true])
-        ;
-
-        $container->register('messenger.signing_serializer')
-            ->setArguments([null, null, [DummyMessage::class => ['messenger.default_serializer']]]);
-
-        (new ResolveClassPass())->process($container);
-        (new MessengerPass())->process($container);
-
-        $this->assertSame([DummyMessage::class], $container->getDefinition('messenger.signing_serializer')->getArgument(2));
-        $this->assertInstanceOf(ChildDefinition::class, $container->getDefinition('.signing.messenger.default_serializer'));
-    }
-
-    public function testRemovesSigningSerializerWhenNoSignedHandlers()
+    public function testReplacesTheSigningSerializersThatHaveNothingToSignWithTheirInnerSerializer()
     {
         $container = $this->getContainerBuilder('message_bus');
 
@@ -1384,13 +1873,34 @@ class MessengerPassTest extends TestCase
             ->addTag('messenger.message_handler')
         ;
 
-        $container->register('messenger.signing_serializer')
-            ->setArguments([null, null, [DummyMessage::class => ['messenger.default_serializer']]]);
+        $this->registerSigningSerializers($container);
 
         (new ResolveClassPass())->process($container);
         (new MessengerPass())->process($container);
 
-        $this->assertFalse($container->hasDefinition('messenger.signing_serializer'));
+        $this->assertFalse($container->hasDefinition('.messenger.transport.async.signing_serializer'));
+        $this->assertSame('messenger.default_serializer', (string) $container->getAlias('.messenger.transport.async.signing_serializer'));
+        $this->assertInstanceOf(ChildDefinition::class, $container->getDefinition('.messenger.transport.signed.signing_serializer'));
+        $this->assertSame([], $container->getDefinition('.messenger.signing_serializer.message_types')->getArgument(2));
+    }
+
+    public function testAHandlerOfEveryMessageThatAsksForASignatureDoesNotMakeTransportsSignEveryMessage()
+    {
+        $container = $this->getContainerBuilder('message_bus');
+
+        $container
+            ->register(MissingArgumentTypeHandler::class, MissingArgumentTypeHandler::class)
+            ->addTag('messenger.message_handler', ['handles' => '*', 'sign' => true])
+        ;
+
+        $this->registerSigningSerializers($container);
+
+        (new ResolveClassPass())->process($container);
+        (new MessengerPass())->process($container);
+
+        $this->assertSame([], $container->getDefinition('.messenger.signing_serializer.message_types')->getArgument(2));
+        $this->assertSame('messenger.default_serializer', (string) $container->getAlias('.messenger.transport.async.signing_serializer'));
+        $this->assertSame('messenger.signing_serializer', $container->getDefinition('.messenger.transport.signed.signing_serializer')->getParent());
     }
 
     public function testItRegistersTypeMappingFromMessageTag()
@@ -1704,6 +2214,25 @@ class MessengerPassTest extends TestCase
 }
 
 class DummyHandler
+{
+    public function __invoke(DummyMessage $message): void
+    {
+    }
+}
+
+class DummyHandlerWithTwoMethods
+{
+    public function early(DummyMessage $message): void
+    {
+    }
+
+    public function late(DummyMessage $message): void
+    {
+    }
+}
+
+#[AsMessageHandler(before: 'a')]
+class OrderedDummyHandler
 {
     public function __invoke(DummyMessage $message): void
     {

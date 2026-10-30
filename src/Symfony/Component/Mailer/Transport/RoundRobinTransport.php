@@ -13,10 +13,12 @@ namespace Symfony\Component\Mailer\Transport;
 
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
+use Symfony\Component\Clock\Clock;
 use Symfony\Component\Mailer\Envelope;
 use Symfony\Component\Mailer\Exception\TransportException;
 use Symfony\Component\Mailer\Exception\TransportExceptionInterface;
 use Symfony\Component\Mailer\SentMessage;
+use Symfony\Component\Mailer\Transport\Smtp\SmtpTransport;
 use Symfony\Component\Mime\RawMessage;
 
 /**
@@ -58,7 +60,7 @@ class RoundRobinTransport implements TransportInterface
                 $exception ??= new TransportException('All transports failed.');
                 $exception->appendDebug(\sprintf("Transport \"%s\": %s\n", $transport, $e->getDebug()));
                 $this->logger->error(\sprintf('Transport "%s" failed.', $transport), ['exception' => $e]);
-                $this->deadTransports[$transport] = microtime(true);
+                $this->deadTransports[$transport] = $this->now();
             }
         }
 
@@ -68,6 +70,15 @@ class RoundRobinTransport implements TransportInterface
     public function __toString(): string
     {
         return $this->getNameSymbol().'('.implode(' ', array_map('strval', $this->transports)).')';
+    }
+
+    public function stop(): void
+    {
+        foreach ($this->transports as $transport) {
+            if ($transport instanceof SmtpTransport || $transport instanceof SendmailTransport || $transport instanceof self) {
+                $transport->stop();
+            }
+        }
     }
 
     /**
@@ -87,7 +98,7 @@ class RoundRobinTransport implements TransportInterface
                 break;
             }
 
-            if ((microtime(true) - $this->deadTransports[$transport]) > $this->retryPeriod) {
+            if (($this->now() - $this->deadTransports[$transport]) > $this->retryPeriod) {
                 unset($this->deadTransports[$transport]);
 
                 break;
@@ -123,5 +134,16 @@ class RoundRobinTransport implements TransportInterface
     private function moveCursor(int $cursor): int
     {
         return ++$cursor >= \count($this->transports) ? 0 : $cursor;
+    }
+
+    private function now(): float
+    {
+        if (!class_exists(Clock::class)) {
+            return microtime(true);
+        }
+
+        $now = Clock::get()->now();
+
+        return \PHP_INT_SIZE >= 8 ? $now->getTimestamp() + $now->getMicrosecond() / 1e6 : (float) $now->format('U.u');
     }
 }

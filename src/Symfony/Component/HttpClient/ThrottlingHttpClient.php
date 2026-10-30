@@ -37,15 +37,22 @@ class ThrottlingHttpClient implements HttpClientInterface, ResetInterface
         $response = $this->client->request($method, $url, $options);
 
         if (0 < $waitDuration = $this->rateLimiter->reserve()->getWaitDuration()) {
-            $response->getInfo('pause_handler')($waitDuration);
+            if (\is_callable($pause = $response->getInfo('pause_handler'))) {
+                $pause($waitDuration);
+            } else {
+                usleep((int) (1E6 * $waitDuration));
+            }
         }
 
         return $response;
     }
 
-    public function reset(): void
+    /**
+     * @param bool $shutdown Whether the client is being shut down
+     */
+    public function reset(/* bool $shutdown = false */): void
     {
-        $this->traitReset();
+        $this->traitReset(...\func_get_args());
         $this->rateLimiter->reset();
     }
 }

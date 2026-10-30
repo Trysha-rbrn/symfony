@@ -209,7 +209,7 @@ class AnsiUtilsTest extends TestCase
         $styled = "\x1b[31mHello\x1b[0m";
         $result = AnsiUtils::sliceByColumn($styled, 0, 3);
 
-        // Should contain "Hel" with ANSI codes
+        // Should keep the first three columns with their ANSI codes
         $this->assertSame(3, AnsiUtils::visibleWidth($result));
     }
 
@@ -239,6 +239,8 @@ class AnsiUtilsTest extends TestCase
         yield 'space' => [' ', true];
         yield 'tab' => ["\t", true];
         yield 'newline' => ["\n", true];
+        yield 'ideographic space' => ["\u{3000}", true];
+        yield 'no-break space' => ["\u{00A0}", true];
         yield 'letter' => ['a', false];
     }
 
@@ -258,6 +260,14 @@ class AnsiUtilsTest extends TestCase
         yield 'exclamation' => ['!', true];
         yield 'letter' => ['a', false];
         yield 'space' => [' ', false];
+        yield 'ideographic comma' => ['，', true];
+        yield 'ideographic full stop' => ['。', true];
+        yield 'corner bracket' => ['「', true];
+        yield 'inverted question mark' => ['¿', true];
+        yield 'underscore' => ['_', false];
+        yield 'fullwidth low line' => ['＿', false];
+        yield 'CJK ideograph' => ['世', false];
+        yield 'emoji' => ['😀', false];
     }
 
     #[DataProvider('isPunctuationProvider')]
@@ -888,14 +898,114 @@ class AnsiUtilsTest extends TestCase
         $this->assertSame(['text' => "\u{1F44D}\u{1F3FD}\x1b[1m a", 'width' => 4], AnsiUtils::sliceWithWidth($line, 0, 4));
     }
 
+    /**
+     * @return iterable<string, array{int, string}>
+     */
+    public static function singleCodePointWidthProvider(): iterable
+    {
+        yield 'left-to-right isolate' => [0, "\u{2066}"];
+        yield 'right-to-left isolate' => [0, "\u{2067}"];
+        yield 'first strong isolate' => [0, "\u{2068}"];
+        yield 'pop directional isolate' => [0, "\u{2069}"];
+        yield 'byte order mark' => [0, "\u{FEFF}"];
+        yield 'zero width space' => [0, "\u{200B}"];
+        yield 'arabic letter mark' => [0, "\u{061C}"];
+        yield 'lone combining mark' => [0, "\u{0301}"];
+        yield 'lone combining mark in a wide block' => [0, "\u{302A}"];
+        yield 'soft hyphen' => [1, "\u{00AD}"];
+        yield 'accented letter' => [1, "\u{00E9}"];
+        yield 'wide character' => [2, "\u{6771}"];
+        yield 'emoji' => [2, "\u{1F600}"];
+        yield 'watch' => [2, "\u{231A}"];
+        yield 'newer wide character' => [2, "\u{1FA8B}"];
+        yield 'newer combining mark' => [0, "\u{1E4EC}"];
+        yield 'unassigned format character' => [0, "\u{2065}"];
+        yield 'unassigned interlinear annotation character' => [0, "\u{FFF0}"];
+        yield 'line separator' => [0, "\u{2028}"];
+        yield 'paragraph separator' => [0, "\u{2029}"];
+    }
+
+    #[DataProvider('singleCodePointWidthProvider')]
+    public function testGraphemeWidthOfASingleCodePoint(int $expected, string $grapheme)
+    {
+        $this->assertSame($expected, AnsiUtils::graphemeWidth($grapheme));
+    }
+
+    #[DataProvider('singleCodePointWidthProvider')]
+    public function testVisibleWidthOfASingleCodePoint(int $expected, string $grapheme)
+    {
+        $this->assertSame($expected, AnsiUtils::visibleWidth($grapheme));
+        $this->assertSame(4 + $expected, AnsiUtils::visibleWidth("a \x1b[1m".$grapheme."\x1b[0m b"));
+    }
+
+    public function testWidthOfANewerWideCharacterDoesNotChangeWithACombiningMark()
+    {
+        foreach (["\u{1FA8B}", "\u{1FA8B}\u{0301}"] as $grapheme) {
+            $this->assertSame(2, AnsiUtils::graphemeWidth($grapheme));
+            $this->assertSame(2, AnsiUtils::visibleWidth($grapheme));
+            $this->assertSame(['text' => $grapheme.'b', 'width' => 3], AnsiUtils::sliceWithWidth('a'.$grapheme.'bc', 1, 3, true));
+        }
+    }
+
+    public function testVisibleWidthGivesNoColumnToFormatCharacters()
+    {
+        $this->assertSame(3, AnsiUtils::visibleWidth("a\u{2067}b\u{2069}c"));
+        $this->assertSame(11, AnsiUtils::visibleWidth("\u{2068}Alice\u{2069} wrote"));
+        $this->assertSame(4, AnsiUtils::visibleWidth("\u{2068}\x1b[1m東京\x1b[0m\u{2069}"));
+        $this->assertSame(3, AnsiUtils::visibleWidth("\u{FEFF}abc"));
+        $this->assertSame(2, AnsiUtils::visibleWidth("a\u{200B}b"));
+        $this->assertSame(1, AnsiUtils::visibleWidth("\u{0301}a"));
+    }
+
+    public function testSlicingGivesNoColumnToFormatCharacters()
+    {
+        $line = "\u{2068}Alice\u{2069} wrote";
+
+        $this->assertSame("\u{2068}Alice\u{2069} ", AnsiUtils::sliceByColumn($line, 0, 6));
+        $this->assertSame(['text' => "\u{2069} wr", 'width' => 3], AnsiUtils::sliceWithWidth($line, 5, 3));
+        $this->assertSame("\u{2068}Alice\u{2069}\x1b[0m…", AnsiUtils::truncateToWidth($line, 6, '…'));
+    }
+
+    public function testSlicingGivesNoColumnToACombiningMarkSplitFromItsBase()
+    {
+        $line = "e\x1b[1m\u{0301}\x1b[0mx";
+
+        $this->assertSame($line, AnsiUtils::sliceByColumn($line, 0, AnsiUtils::visibleWidth($line)));
+        $this->assertSame(['text' => "\x1b[1m\u{0301}\x1b[0mx", 'width' => 1], AnsiUtils::sliceWithWidth($line, 1, 1));
+    }
+
+    public function testWrappingGivesNoColumnToFormatCharacters()
+    {
+        $this->assertSame(["\u{2068}Alice\u{2069} \u{2068}Bob\u{2069}"], TextWrapper::wrapTextWithAnsi("\u{2068}Alice\u{2069} \u{2068}Bob\u{2069}", 9));
+        $this->assertSame(["\u{2068}Alice\u{2069}", "\u{2068}Bob\u{2069}"], TextWrapper::wrapTextWithAnsi("\u{2068}Alice\u{2069} \u{2068}Bob\u{2069}", 5));
+        $this->assertSame(["ab\u{200B}c", "d\u{200B}ef"], TextWrapper::wrapTextWithAnsi("ab\u{200B}cd\u{200B}ef", 3));
+        $this->assertSame(["abcde\u{0301}", 'fgh'], array_map(AnsiUtils::stripAnsiCodes(...), TextWrapper::wrapTextWithAnsi("abcde\x1b[1m\u{0301}\x1b[0mfgh", 5)));
+    }
+
     public function testGraphemeWidthOfMalformedUtf8()
     {
         $this->assertSame(1, AnsiUtils::graphemeWidth("\xC3\u{0301}"));
     }
 
-    public function testGraphemeWidthOfBytesThatCarryNoCharacterIsZero()
+    public function testGraphemeWidthCountsAColumnPerInvalidSequence()
     {
-        $this->assertSame(0, AnsiUtils::graphemeWidth("\xC3\xC3"));
+        $this->assertSame(2, AnsiUtils::graphemeWidth("\xC3\xC3"));
+    }
+
+    #[DataProvider('visibleWidthOfMalformedUtf8Provider')]
+    public function testVisibleWidthCountsAColumnPerInvalidSequence(string $text, int $expected)
+    {
+        $this->assertSame($expected, AnsiUtils::visibleWidth($text));
+    }
+
+    public static function visibleWidthOfMalformedUtf8Provider(): iterable
+    {
+        // "crème café" in ISO-8859-1
+        yield 'ending with an invalid byte' => ["cr\xE8me caf\xE9", 10];
+        yield 'followed by spaces' => ["cr\xE8me caf\xE9   ", 13];
+        yield 'with ANSI codes' => ["\x1b[90mcr\xE8me caf\xE9\x1b[0m", 10];
+        yield 'truncated sequence' => ["a\xF0\x9F\x98", 2];
+        yield 'with a wide character' => ["\xE9\u{65E5}", 3];
     }
 
     public function testSliceByColumnKeepsSlicingMalformedUtf8()
@@ -914,5 +1024,63 @@ class AnsiUtilsTest extends TestCase
         $this->assertStringStartsWith("ab\xC3\u{0301}", $truncated);
         $this->assertStringEndsWith('...', $truncated);
         $this->assertLessThanOrEqual(6, AnsiUtils::visibleWidth($truncated));
+    }
+
+    #[DataProvider('truncatedHyperlinkProvider')]
+    public function testTruncateClosesTheHyperlinkItCuts(string $text, string $expected)
+    {
+        $this->assertSame($expected, AnsiUtils::truncateToWidth($text, 10));
+    }
+
+    public static function truncatedHyperlinkProvider(): iterable
+    {
+        yield 'BEL terminator' => ["\x1b]8;;https://example.com\x07click here please\x1b]8;;\x07", "\x1b]8;;https://example.com\x07click h\x1b]8;;\x07\x1b[0m..."];
+        yield 'ST terminator' => ["\x1b]8;;https://example.com\x1b\\click here please\x1b]8;;\x1b\\", "\x1b]8;;https://example.com\x1b\\click h\x1b]8;;\x1b\\\x1b[0m..."];
+        yield 'link already closed' => ["\x1b]8;;https://example.com\x07ab\x1b]8;;\x07 then more", "\x1b]8;;https://example.com\x07ab\x1b]8;;\x07 then\x1b[0m..."];
+    }
+
+    #[DataProvider('largeLineProvider')]
+    public function testMeasuringAndTruncatingALargeLineDoesNotSplitAllOfIt(string $text)
+    {
+        gc_collect_cycles();
+        memory_reset_peak_usage();
+        $before = memory_get_usage();
+
+        $truncated = AnsiUtils::truncateToWidth($text, 10);
+        $width = AnsiUtils::visibleWidth($text);
+
+        $this->assertLessThan(\strlen($text), memory_get_peak_usage() - $before);
+        $this->assertLessThanOrEqual(10, AnsiUtils::visibleWidth($truncated));
+        $this->assertGreaterThan(10, $width);
+    }
+
+    public static function largeLineProvider(): iterable
+    {
+        yield 'CJK' => [str_repeat('中文汉字', 200_000)];
+        yield 'combining marks' => [str_repeat("e\u{301}x", 400_000)];
+    }
+
+    public function testMeasuringAndTruncatingKeepGraphemesWholeAcrossChunks()
+    {
+        // 5 columns per unit: a with two combining marks, a family emoji, an ideograph
+        $unit = "a\u{301}\u{302}\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}中";
+        $text = str_repeat($unit, 2000);
+
+        $this->assertSame(10000, AnsiUtils::visibleWidth($text));
+        // The last ideograph does not fit in the last column
+        $this->assertSame(str_repeat($unit, 1999)."a\u{301}\u{302}\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}\x1b[0m", AnsiUtils::truncateToWidth($text, 9999, ''));
+    }
+
+    public function testMeasuringAndTruncatingKeepZwjSequencesWholeAcrossChunks()
+    {
+        $family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+
+        // Each iteration moves the end of the first 8192 bytes one byte further into the sequence
+        for ($i = 0; $i < \strlen($family); ++$i) {
+            $text = str_repeat('x', 8192 - $i).$family.'yz';
+
+            $this->assertSame(8196 - $i, AnsiUtils::visibleWidth($text));
+            $this->assertSame(str_repeat('x', 8192 - $i).$family."y\x1b[0m", AnsiUtils::truncateToWidth($text, 8195 - $i, ''));
+        }
     }
 }

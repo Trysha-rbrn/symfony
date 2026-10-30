@@ -31,7 +31,18 @@ trait BatchHandlerTrait
 
         if ($jobs = $this->jobs) {
             $this->jobs = [];
-            $this->process($jobs);
+
+            try {
+                $this->process($jobs);
+            } catch (\Throwable $e) {
+                foreach ($jobs as [, $ack]) {
+                    if (!$ack->isAcknowledged()) {
+                        $ack->nack($e);
+                    }
+                }
+
+                throw $e;
+            }
         }
     }
 
@@ -45,7 +56,8 @@ trait BatchHandlerTrait
     private function handle(object $message, ?Acknowledger $ack): mixed
     {
         $this->batchClock ??= $ack?->clock ?? Clock::get();
-        $this->lastMessageAt = (int) $this->batchClock->now()->format('U');
+        $now = $this->batchClock->now();
+        $this->lastMessageAt = \PHP_INT_SIZE >= 8 ? $now->getTimestamp() : (int) $now->format('U');
 
         if (null === $ack) {
             $ack = new Acknowledger(get_debug_type($this), null, $this->batchClock);
@@ -60,7 +72,7 @@ trait BatchHandlerTrait
         }
 
         $this->jobs[] = [$message, $ack];
-        if (!$this->shouldFlush()) {
+        if (!$this->shouldFlush() || $ack->deferFlush()) {
             return \count($this->jobs);
         }
 
@@ -77,7 +89,9 @@ trait BatchHandlerTrait
 
         $idleTimeout = $this->getIdleTimeout();
         if (null !== $idleTimeout && null !== $this->lastMessageAt) {
-            return ((int) ($this->batchClock ?? Clock::get())->now()->format('U') - $this->lastMessageAt) >= $idleTimeout;
+            $now = ($this->batchClock ?? Clock::get())->now();
+
+            return ((\PHP_INT_SIZE >= 8 ? $now->getTimestamp() : (int) $now->format('U')) - $this->lastMessageAt) >= $idleTimeout;
         }
 
         return false;

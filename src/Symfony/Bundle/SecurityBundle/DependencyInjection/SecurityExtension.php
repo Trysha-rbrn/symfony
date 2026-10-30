@@ -18,6 +18,7 @@ use Symfony\Bundle\SecurityBundle\DependencyInjection\Security\Factory\Authentic
 use Symfony\Bundle\SecurityBundle\DependencyInjection\Security\Factory\FirewallListenerFactoryInterface;
 use Symfony\Bundle\SecurityBundle\DependencyInjection\Security\Factory\StatelessAuthenticatorFactoryInterface;
 use Symfony\Bundle\SecurityBundle\DependencyInjection\Security\UserProvider\UserProviderFactoryInterface;
+use Symfony\Bundle\SecurityBundle\Security\TestBrowserAccessTokenAuthenticator;
 use Symfony\Component\Config\Definition\ConfigurationInterface;
 use Symfony\Component\Config\Definition\Exception\InvalidConfigurationException;
 use Symfony\Component\Config\FileLocator;
@@ -30,6 +31,7 @@ use Symfony\Component\DependencyInjection\ChildDefinition;
 use Symfony\Component\DependencyInjection\Compiler\ServiceLocatorTagPass;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Definition;
+use Symfony\Component\DependencyInjection\Exception\ExceptionInterface;
 use Symfony\Component\DependencyInjection\Extension\Extension;
 use Symfony\Component\DependencyInjection\Extension\PrependExtensionInterface;
 use Symfony\Component\DependencyInjection\Loader\PhpFileLoader;
@@ -61,6 +63,7 @@ use Symfony\Component\Security\Core\User\ChainUserChecker;
 use Symfony\Component\Security\Core\User\ChainUserProvider;
 use Symfony\Component\Security\Core\User\UserCheckerInterface;
 use Symfony\Component\Security\Core\User\UserProviderInterface;
+use Symfony\Component\Security\Http\Attribute\IsGranted;
 use Symfony\Component\Security\Http\Authenticator\Debug\TraceableAuthenticator;
 use Symfony\Component\Security\Http\Authenticator\Debug\TraceableAuthenticatorManagerListener;
 use Symfony\Component\Security\Http\Event\CheckPassportEvent;
@@ -82,6 +85,7 @@ class SecurityExtension extends Extension implements PrependExtensionInterface
     /** @var AuthenticatorFactoryInterface[] */
     private array $sortedFactories = [];
     private array $userProviderFactories = [];
+    private bool $frameworkTest = false;
 
     public function prepend(ContainerBuilder $container): void
     {
@@ -89,6 +93,24 @@ class SecurityExtension extends Extension implements PrependExtensionInterface
             if ($factory instanceof PrependExtensionInterface) {
                 $factory->prepend($container);
             }
+        }
+
+        $this->frameworkTest = false;
+        $test = false;
+
+        if ($container->hasExtension('framework')) {
+            foreach ($container->getExtensionConfig('framework') as $config) {
+                if (\array_key_exists('test', $config)) {
+                    // "test: ~" enables the option, like "test: true"
+                    $test = $config['test'] ?? true;
+                }
+            }
+        }
+
+        try {
+            $this->frameworkTest = true === $container->resolveEnvPlaceholders($test, true);
+        } catch (ExceptionInterface) {
+            // FrameworkBundle reports the error with the name of the option
         }
     }
 
@@ -183,9 +205,8 @@ class SecurityExtension extends Extension implements PrependExtensionInterface
         if ($container::willBeAvailable('symfony/routing', ContainerLoader::class, ['symfony/security-bundle'])) {
             $this->createLogoutUrisParameter($config['firewalls'] ?? [], $container);
         } else {
+            $container->removeDefinition('security.route_loader');
             $container->removeDefinition('security.route_loader.logout');
-            $container->removeDefinition('security.authenticator.oidc_login.route_loader');
-            $container->removeDefinition('security.authenticator.access_token.route_loader');
         }
 
         $this->createAuthorization($config, $container);
@@ -274,12 +295,15 @@ class SecurityExtension extends Extension implements PrependExtensionInterface
                       ->addMethodCall('add', [$matcher, $roles, $access['requires_channel']]);
         }
 
-        // allow cache warm-up for expressions
-        if ($this->expressions) {
-            $container->getDefinition('security.cache_warmer.expression')
-                ->replaceArgument(0, new IteratorArgument(array_values($this->expressions)));
-        } else {
-            $container->removeDefinition('security.cache_warmer.expression');
+        // compile the expressions of #[IsGranted] and of access_control rules when warming up the cache
+        if ($container->hasDefinition('security.expression_language')) {
+            $container->getDefinition('security.expression_language')
+                ->addTag('expression_language.compiled', [
+                    'attributes' => [IsGranted::class => ['attribute']],
+                    'expressions' => array_map(static fn ($id) => $container->getDefinition($id)->getArgument(0), array_keys($this->expressions)),
+                    'variables' => ['token', 'user', 'object', 'subject', 'role_names', 'auth_checker', 'trust_resolver', 'request'],
+                    'source' => 'security.access_control',
+                ]);
         }
     }
 
@@ -527,6 +551,14 @@ class SecurityExtension extends Extension implements PrependExtensionInterface
         // Determine default entry point
         $configuredEntryPoint = $firewall['entry_point'] ?? null;
 
+        if (isset($firewall['entry_point_path'])) {
+            $configuredEntryPoint = 'security.authentication.redirect_entry_point.'.$id;
+            $container
+                ->setDefinition($configuredEntryPoint, new ChildDefinition('security.authentication.redirect_entry_point'))
+                ->replaceArgument(1, $firewall['entry_point_path'])
+            ;
+        }
+
         // Authentication listeners
         $firewallAuthenticationProviders = [];
         [$authListeners, $defaultEntryPoint] = $this->createAuthenticationListeners($container, $id, $firewall, $firewallAuthenticationProviders, $defaultProvider, $providerIds, $configuredEntryPoint);
@@ -568,6 +600,14 @@ class SecurityExtension extends Extension implements PrependExtensionInterface
             ->setDefinition('security.listener.user_checker.'.$id, new ChildDefinition('security.listener.user_checker'))
             ->replaceArgument(0, new Reference('security.user_checker.'.$id))
             ->addTag('kernel.event_subscriber', ['dispatcher' => $firewallEventDispatcherId]);
+
+        if (($firewall['access_token']['dpop']['enabled'] ?? false) && !$firewall['stateless']) {
+            throw new InvalidConfigurationException(\sprintf('The "dpop" option of the "access_token" authenticator requires the "%s" firewall to be stateless, as a stateful one stores the authenticated token in the session: the session cookie alone would then be accepted for an access token bound to a key, which is what the binding is there to prevent.', $id));
+        }
+
+        if ($firewall['stateless'] && ($firewall['oidc_login']['backchannel_logout']['enabled'] ?? false)) {
+            throw new InvalidConfigurationException(\sprintf('The OIDC "backchannel_logout" option of the "%s" firewall requires a stateful firewall, as a stateless one restores no token from a session and would record the end of a provider session without ever refusing a login for it.', $id));
+        }
 
         if ($firewall['user_checker_on_refresh']) {
             if ($firewall['stateless']) {
@@ -671,6 +711,17 @@ class SecurityExtension extends Extension implements PrependExtensionInterface
                 }
 
                 $authenticators = $factory->createAuthenticator($container, $id, $firewall[$key], $userProvider);
+
+                // a stateless firewall doesn't read the session, so the test client sends its token with each request instead
+                // this decorator is removed when there is no test client, that is outside test mode
+                if ('access_token' === $key && $firewall['stateless']) {
+                    $container->register($testBrowserId = 'security.authenticator.access_token.test_browser.'.$id, TestBrowserAccessTokenAuthenticator::class)
+                        ->setDecoratedService($authenticators)
+                        ->setArguments([new Reference($testBrowserId.'.inner'), $id, $userProvider ? new Reference($userProvider) : null])
+                        ->addTag('container.remove_if_missing', ['service' => 'test.client'])
+                    ;
+                }
+
                 if (\is_array($authenticators)) {
                     foreach ($authenticators as $authenticator) {
                         $authenticationProviders[$authenticator] = $authenticator;
@@ -751,6 +802,13 @@ class SecurityExtension extends Extension implements PrependExtensionInterface
     {
         $hasherMap = [];
         foreach ($hashers as $class => $hasher) {
+            if ($this->frameworkTest) {
+                // the lowest values that bcrypt and argon2 accept
+                $hasher['cost'] ??= 4;
+                $hasher['time_cost'] ??= 3;
+                $hasher['memory_cost'] ??= 10;
+            }
+
             $hasherMap[$class] = $this->createHasher($hasher);
             // The key is not a class, so we register an alias for argument to
             // ease getting the hasher
@@ -954,7 +1012,9 @@ class SecurityExtension extends Extension implements PrependExtensionInterface
                 throw new InvalidConfigurationException(\sprintf('The "re_authentication_entry_point" option cannot be used on the stateless firewall "%s": it has no session to record when the user authenticated, so IS_AUTHENTICATED_RECENTLY is always denied and re-authentication would loop.', $id));
             }
 
-            $listener->replaceArgument(9, new Reference($config['re_authentication_entry_point']));
+            // allow it to be configured by authenticator key (e.g. "form_login"), as the entry point
+            $reAuthenticationEntryPoint = $config['re_authentication_entry_point'];
+            $listener->replaceArgument(9, new Reference($container->getParameter('security.'.$id.'._indexed_authenticators')[$reAuthenticationEntryPoint] ?? $reAuthenticationEntryPoint));
         }
 
         // access denied handler setup

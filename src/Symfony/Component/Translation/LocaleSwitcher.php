@@ -15,6 +15,8 @@ use Symfony\Component\Routing\RequestContext;
 use Symfony\Contracts\Translation\LocaleAwareInterface;
 
 /**
+ * Changes the locale of all locale-aware services, or only while a callback runs.
+ *
  * @author Kevin Bond <kevinbond@gmail.com>
  */
 class LocaleSwitcher implements LocaleAwareInterface
@@ -44,6 +46,11 @@ class LocaleSwitcher implements LocaleAwareInterface
 
         $this->locale = $locale;
         $this->requestContext?->setParameter('_locale', $locale);
+
+        if (!\is_array($this->localeAwareServices)) {
+            // a tagged iterator runs its generator again on every iteration, which costs much more than iterating an array
+            $this->localeAwareServices = iterator_to_array($this->localeAwareServices, false);
+        }
 
         foreach ($this->localeAwareServices as $service) {
             $service->setLocale($locale);

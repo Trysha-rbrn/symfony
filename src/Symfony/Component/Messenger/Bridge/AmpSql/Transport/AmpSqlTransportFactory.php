@@ -100,9 +100,9 @@ final class AmpSqlTransportFactory implements TransportFactoryInterface
         }
         $busyTimeout = self::nonNegativeInteger($configuration['busy_timeout'] ?? 5000, 'busy_timeout');
         $config = (new SqliteConfig($path))->withBusyTimeout($busyTimeout)->withTransactionMode(SqliteTransactionMode::Immediate);
-        $pool = new SqliteConnectionPool($config, $configuration['max_connections'], $configuration['idle_timeout'], transactionIsolation: SqliteTransactionMode::Immediate);
+        $poolFactory = static fn () => new SqliteConnectionPool($config, $configuration['max_connections'], $configuration['idle_timeout'], transactionIsolation: SqliteTransactionMode::Immediate);
 
-        return new AmpSqlTransport(new Connection($pool, new SqliteBackend(), $configuration), $serializer);
+        return new AmpSqlTransport(new Connection($poolFactory, new SqliteBackend(), $configuration), $serializer);
     }
 
     /** @param array<string, mixed> $options */
@@ -113,7 +113,7 @@ final class AmpSqlTransportFactory implements TransportFactoryInterface
         }
         $params = $this->parseDsn($dsn, 'amp-mysql', true);
         $configuration = $this->configure($params, $options, ['tls_ca', 'tls_cert', 'tls_key']);
-        $context = null;
+        $context = (new ConnectContext())->withTcpNoDelay();
         if (isset($configuration['tls_ca']) || isset($configuration['tls_cert']) || isset($configuration['tls_key'])) {
             $tls = new ClientTlsContext($params['host']);
             if (isset($configuration['tls_ca'])) {
@@ -124,12 +124,12 @@ final class AmpSqlTransportFactory implements TransportFactoryInterface
             } elseif (isset($configuration['tls_key'])) {
                 throw new InvalidArgumentException('The "tls_key" option requires "tls_cert".');
             }
-            $context = (new ConnectContext())->withTlsContext($tls);
+            $context = $context->withTlsContext($tls);
         }
         $config = new MysqlConfig($params['host'], $params['port'] ?? MysqlConfig::DEFAULT_PORT, $params['user'] ?? null, $params['pass'] ?? null, $params['database'], $context);
-        $pool = new MysqlConnectionPool($config, $configuration['max_connections'], $configuration['idle_timeout'], transactionIsolation: SqlTransactionIsolationLevel::Committed);
+        $poolFactory = static fn () => new MysqlConnectionPool($config, $configuration['max_connections'], $configuration['idle_timeout'], transactionIsolation: SqlTransactionIsolationLevel::Committed);
 
-        return new AmpSqlTransport(new Connection($pool, new MysqlBackend(), $configuration), $serializer);
+        return new AmpSqlTransport(new Connection($poolFactory, new MysqlBackend(), $configuration), $serializer);
     }
 
     /** @param array<string, mixed> $options */
@@ -143,9 +143,9 @@ final class AmpSqlTransportFactory implements TransportFactoryInterface
         $sslmode = isset($configuration['sslmode']) ? self::nonEmptyString($configuration['sslmode'], 'sslmode') : null;
         $host = trim($params['host'], '[]');
         $config = new PostgresConfig($host, $params['port'] ?? PostgresConfig::DEFAULT_PORT, $params['user'] ?? null, $params['pass'] ?? null, $params['database'], sslMode: $sslmode);
-        $pool = new PostgresConnectionPool($config, $configuration['max_connections'], $configuration['idle_timeout'], transactionIsolation: SqlTransactionIsolationLevel::Committed);
+        $poolFactory = static fn () => new PostgresConnectionPool($config, $configuration['max_connections'], $configuration['idle_timeout'], transactionIsolation: SqlTransactionIsolationLevel::Committed);
 
-        return new AmpSqlTransport(new Connection($pool, new PostgresBackend(), $configuration), $serializer);
+        return new AmpSqlTransport(new Connection($poolFactory, new PostgresBackend(), $configuration), $serializer);
     }
 
     /**

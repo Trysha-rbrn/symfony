@@ -109,6 +109,24 @@ class UrlMatcherTest extends TestCase
         $this->assertIsArray($matcher->match('/foo'));
     }
 
+    public function testHeadAllowedWhenRequirementContainsHead()
+    {
+        $coll = new RouteCollection();
+        $coll->add('foo', new Route('/foo', [], [], [], '', [], ['head']));
+
+        $matcher = $this->getUrlMatcher($coll, new RequestContext('', 'head'));
+        $this->assertSame(['_route' => 'foo'], $matcher->match('/foo'));
+
+        $matcher = $this->getUrlMatcher($coll);
+
+        try {
+            $matcher->match('/foo');
+            $this->fail();
+        } catch (MethodNotAllowedException $e) {
+            $this->assertSame(['HEAD'], $e->getAllowedMethods());
+        }
+    }
+
     public function testMethodNotAllowedAggregatesAllowedMethods()
     {
         $coll = new RouteCollection();
@@ -507,6 +525,46 @@ class UrlMatcherTest extends TestCase
 
         $this->expectException(ResourceNotFoundException::class);
 
+        $matcher->match('/foo');
+    }
+
+    public function testConstantCondition()
+    {
+        $coll = new RouteCollection();
+        $route = new Route('/foo');
+        $route->setCondition('context.getMethod() == constant("Symfony\\\\Component\\\\HttpFoundation\\\\Request::METHOD_GET")');
+        $coll->add('foo', $route);
+
+        $this->assertSame(['_route' => 'foo'], $this->getUrlMatcher($coll)->match('/foo'));
+    }
+
+    public function testZeroCondition()
+    {
+        $coll = new RouteCollection();
+        $coll->add('foo', new Route('/foo', [], [], [], '', [], [], '0'));
+        $coll->add('bar', new Route('/bar/{id}', [], [], [], '', [], [], '0'));
+        $matcher = $this->getUrlMatcher($coll);
+
+        try {
+            $matcher->match('/foo');
+            $this->fail('A static route whose condition is "0" must not match.');
+        } catch (ResourceNotFoundException $e) {
+        }
+
+        $this->expectException(ResourceNotFoundException::class);
+        $matcher->match('/bar/1');
+    }
+
+    public function testZeroConditionNextToOtherConditions()
+    {
+        $coll = new RouteCollection();
+        $coll->add('foo', new Route('/foo', [], [], [], '', [], [], '0'));
+        $coll->add('bar', new Route('/bar', [], [], [], '', [], [], '1'));
+        $matcher = $this->getUrlMatcher($coll);
+
+        $this->assertEquals(['_route' => 'bar'], $matcher->match('/bar'));
+
+        $this->expectException(ResourceNotFoundException::class);
         $matcher->match('/foo');
     }
 

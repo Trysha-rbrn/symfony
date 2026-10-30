@@ -22,6 +22,7 @@ use Symfony\Component\DependencyInjection\Loader\PhpFileLoader;
 use Symfony\Component\DependencyInjection\Reference;
 use Symfony\Component\Form\Form;
 use Symfony\Component\Mailer\Mailer;
+use Symfony\Component\Routing\RouteCollection;
 use Symfony\Component\Translation\LocaleSwitcher;
 use Symfony\Component\Translation\Translator;
 use Symfony\Component\Validator\Constraint;
@@ -30,6 +31,7 @@ use Twig\Attribute\AsTwigFunction;
 use Twig\Attribute\AsTwigTest;
 use Twig\Extension\ExtensionInterface;
 use Twig\Extension\RuntimeExtensionInterface;
+use Twig\Loader\FilesystemLoader;
 use Twig\Loader\LoaderInterface;
 
 /**
@@ -56,6 +58,10 @@ class TwigExtension extends Extension
 
         if ($container::willBeAvailable('symfony/console', Application::class, ['symfony/twig-bundle'])) {
             $loader->load('console.php');
+        }
+
+        if ($container::willBeAvailable('symfony/routing', RouteCollection::class, ['symfony/twig-bundle'])) {
+            $loader->load('routing.php');
         }
 
         if (!$container::willBeAvailable('symfony/translation', Translator::class, ['symfony/twig-bundle'])) {
@@ -135,20 +141,21 @@ class TwigExtension extends Extension
             $container->getDefinition('twig.command.lint')->replaceArgument(1, $config['file_name_pattern'] ?: ['*.twig']);
         }
 
+        // the directories below are known to exist, false tells the loader not to check them again on each request
         foreach ($this->getBundleTemplatePaths($container, $config) as $name => $paths) {
             $namespace = $this->normalizeBundleName($name);
             foreach ($paths as $path) {
-                $twigFilesystemLoaderDefinition->addMethodCall('addPath', [$path, $namespace]);
+                $twigFilesystemLoaderDefinition->addMethodCall('addPath', [$path, $namespace, false]);
             }
 
             if ($paths) {
                 // the last path must be the bundle views directory
-                $twigFilesystemLoaderDefinition->addMethodCall('addPath', [$path, '!'.$namespace]);
+                $twigFilesystemLoaderDefinition->addMethodCall('addPath', [$path, '!'.$namespace, false]);
             }
         }
 
         if (file_exists($defaultTwigPath)) {
-            $twigFilesystemLoaderDefinition->addMethodCall('addPath', [$parameterBag->escapeValue($defaultTwigPath)]);
+            $twigFilesystemLoaderDefinition->addMethodCall('addPath', [$parameterBag->escapeValue($defaultTwigPath), FilesystemLoader::MAIN_NAMESPACE, false]);
         }
         $container->addResource(new FileExistenceResource($defaultTwigPath));
 

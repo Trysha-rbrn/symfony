@@ -12,12 +12,14 @@
 namespace Symfony\Component\DependencyInjection\Loader\Configurator;
 
 use Jose\Component\Core\JWK;
+use Symfony\Bundle\SecurityBundle\Controller\OidcLoginBackChannelLogoutController;
 use Symfony\Bundle\SecurityBundle\Controller\OidcLoginStartController;
 use Symfony\Component\Security\Http\Authenticator\Oidc\OidcClient;
 use Symfony\Component\Security\Http\Authenticator\Oidc\OidcIdToken;
 use Symfony\Component\Security\Http\Authenticator\Oidc\OidcSignatureVerifier;
 use Symfony\Component\Security\Http\Authenticator\Oidc\OidcTokenRefresher;
 use Symfony\Component\Security\Http\Authenticator\OidcLoginAuthenticator;
+use Symfony\Component\Security\Http\EventListener\OidcBackChannelLogoutListener;
 use Symfony\Component\Security\Http\EventListener\OidcEndSessionListener;
 use Symfony\Component\Security\Http\Firewall\OidcTokenRefreshListener;
 use Symfony\Component\Security\Http\OAuth2\ClientAuthentication\ClientSecretBasic;
@@ -25,7 +27,13 @@ use Symfony\Component\Security\Http\OAuth2\ClientAuthentication\ClientSecretJwt;
 use Symfony\Component\Security\Http\OAuth2\ClientAuthentication\ClientSecretPost;
 use Symfony\Component\Security\Http\OAuth2\ClientAuthentication\NoClientAuthentication;
 use Symfony\Component\Security\Http\OAuth2\ClientAuthentication\PrivateKeyJwt;
+use Symfony\Component\Security\Http\OAuth2\ClientAuthentication\SelfSignedTlsClientAuth;
+use Symfony\Component\Security\Http\OAuth2\ClientAuthentication\TlsClientAuth;
+use Symfony\Component\Security\Http\OAuth2\Dpop\DpopProofFactory;
+use Symfony\Component\Security\Http\Oidc\OidcBackChannelLogout;
 use Symfony\Component\Security\Http\Oidc\OidcDiscovery;
+use Symfony\Component\Security\Http\Oidc\OidcEndedSessions;
+use Symfony\Component\Security\Http\Oidc\OidcLogoutToken;
 
 return static function (ContainerConfigurator $container) {
     $container->services()
@@ -46,13 +54,15 @@ return static function (ContainerConfigurator $container) {
                 null,
                 service('clock'),
                 abstract_arg('firewall event dispatcher'),
+                // replaced by the firewall proof factory, unless the firewall binds nothing to a key
+                null,
             ])
 
         ->set('security.authenticator.oidc_login.signature_verifier', OidcSignatureVerifier::class)
             ->abstract()
             ->args([
                 abstract_arg('OIDC discovery'),
-                service('cache.app'),
+                service('cache.security.discovery'),
                 service('http_client'),
                 abstract_arg('signature algorithms'),
                 abstract_arg('default JWKS cache TTL'),
@@ -71,7 +81,7 @@ return static function (ContainerConfigurator $container) {
             ->abstract()
             ->args([
                 service('http_client'),
-                service('cache.app'),
+                service('cache.security.discovery'),
                 // relative to the issuer below, which OidcDiscovery normalizes at runtime
                 '.well-known/openid-configuration',
                 abstract_arg('issuer'),
@@ -79,6 +89,7 @@ return static function (ContainerConfigurator $container) {
                 // the cache key is derived from the configuration URL
                 null,
                 abstract_arg('endpoints that must be announced and must not downgrade to plain HTTP the transport of the discovery document'),
+                abstract_arg('endpoints whose mutual-TLS alias is checked the same way'),
             ])
 
         ->set('security.authenticator.oidc_login.client', OidcClient::class)
@@ -88,9 +99,12 @@ return static function (ContainerConfigurator $container) {
                 abstract_arg('OIDC discovery'),
                 abstract_arg('client ID'),
                 abstract_arg('client authentication'),
+                abstract_arg('HTTP client options presenting the client certificate, or none'),
+                // replaced by the firewall proof factory, unless the firewall binds nothing to a key
+                null,
             ])
 
-        // the only client authentication method that has nothing to configure, so that
+        // a client authentication method that has nothing to configure, so that
         // declaring a public client takes no service of its own
         ->set('security.oauth2.client_authentication.none', NoClientAuthentication::class)
 
@@ -113,6 +127,7 @@ return static function (ContainerConfigurator $container) {
                 abstract_arg('signature algorithm'),
                 abstract_arg('assertion lifetime'),
                 service('clock'),
+                abstract_arg('the discovery naming the audience, or null for the token endpoint'),
             ])
 
         ->set('security.oauth2.client_authentication.private_key_jwt', PrivateKeyJwt::class)
@@ -122,6 +137,27 @@ return static function (ContainerConfigurator $container) {
                 abstract_arg('signature algorithm'),
                 abstract_arg('assertion lifetime'),
                 service('clock'),
+                abstract_arg('the discovery naming the audience, or null for the token endpoint'),
+            ])
+
+        // nothing to configure either, the certificate being an option of the firewall
+        ->set('security.oauth2.client_authentication.tls_client_auth', TlsClientAuth::class)
+
+        ->set('security.oauth2.client_authentication.self_signed_tls_client_auth', SelfSignedTlsClientAuth::class)
+
+        ->set('security.oauth2.dpop.proof_factory', DpopProofFactory::class)
+            ->abstract()
+            ->args([
+                abstract_arg('proof signing key'),
+                abstract_arg('signature algorithm'),
+                service('clock'),
+            ])
+
+        ->set('security.oauth2.dpop.signing_key', JWK::class)
+            ->abstract()
+            ->factory([JWK::class, 'createFromJson'])
+            ->args([
+                abstract_arg('JSON-encoded JWK'),
             ])
 
         // the private key of the "private_key_jwt" method, parsed from the JSON-encoded JWK
@@ -139,6 +175,48 @@ return static function (ContainerConfigurator $container) {
             ->public()
             ->args([
                 service_locator([]),
+            ])
+
+        // the target of the routes declared for the "backchannel_logout.path" of each
+        // oidc_login firewall; public, as the routes reference it by id as their controller
+        ->set('security.authenticator.oidc_login.backchannel_logout_controller', OidcLoginBackChannelLogoutController::class)
+            ->public()
+            ->args([
+                service_locator([]),
+            ])
+
+        ->set('security.authenticator.oidc_login.backchannel_logout', OidcBackChannelLogout::class)
+            ->abstract()
+            ->args([
+                abstract_arg('signature verifier'),
+                abstract_arg('logout token'),
+                abstract_arg('OIDC discovery'),
+                abstract_arg('client ID'),
+                abstract_arg('ended sessions'),
+                service('logger')->nullOnInvalid(),
+            ])
+            ->tag('monolog.logger', ['channel' => 'security'])
+
+        ->set('security.authenticator.oidc_login.logout_token', OidcLogoutToken::class)
+            ->abstract()
+            ->args([
+                service('clock'),
+                abstract_arg('allowed time drift'),
+            ])
+
+        ->set('security.authenticator.oidc_login.ended_sessions', OidcEndedSessions::class)
+            ->abstract()
+            ->args([
+                abstract_arg('cache pool'),
+                abstract_arg('firewall name'),
+                abstract_arg('lifetime'),
+            ])
+
+        ->set('security.authenticator.oidc_login.backchannel_logout_listener', OidcBackChannelLogoutListener::class)
+            ->abstract()
+            ->args([
+                abstract_arg('ended sessions'),
+                abstract_arg('firewall name'),
             ])
 
         ->set('security.authenticator.oidc_login.token_refresher', OidcTokenRefresher::class)

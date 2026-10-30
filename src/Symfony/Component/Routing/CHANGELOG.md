@@ -4,15 +4,17 @@ CHANGELOG
 8.2
 ---
 
+ * Add the `template`, `redirect_to_route` and `redirect_to` keys to route definitions; `template` is exposed as the `_template` route default
+ * Add `RouteTrait::template()`, `RouteTrait::redirectToRoute()` and `RouteTrait::redirectTo()` to configure template and redirect routes in fluent PHP
  * Add `RouterBundle`, which provides the `router` configuration and the services previously provided by `FrameworkBundle` under `framework.router`
  * Add the `#[AsRouteLoader]` attribute, which replaces `FrameworkBundle`'s `RouteLoaderInterface`
- * Add `Command\RouterMatchCommand`, which `FrameworkBundle` used to provide
- * Add `DependencyInjection\Router` and `Attribute\AsRoutingConditionService`, which `FrameworkBundle` used to provide; the attribute no longer extends `AutoconfigureTag`, so it tags only the classes that carry it, not their subclasses
- * Add `CacheWarmer\RouterCacheWarmer`, `Controller\RedirectController`, `Loader\AttributeRouteControllerLoader`, `Loader\DelegatingLoader` and `Matcher\RedirectableCompiledUrlMatcher`, which `FrameworkBundle` used to provide
+ * Add `Attribute\AsRoutingConditionService`, `CacheWarmer\RouterCacheWarmer`, `Command\RouterMatchCommand`, `Controller\RedirectController`, `DependencyInjection\Router`, `Loader\AttributeRouteControllerLoader`, `Loader\DelegatingLoader` and `Matcher\RedirectableCompiledUrlMatcher`, which `FrameworkBundle` used to provide
+ * Make `#[AsRoutingConditionService]` tag only the classes that carry it, not their subclasses
  * Add a `firewall` option to route definitions, exposed as the `_firewall` route default
  * Allow defining default query parameters with the `_query` route default
  * Add `RequestContext::runWith()` to generate and match URLs for another host, scheme or base URL without leaking the change
  * Add `Route::addCondition()`, `RouteCollection::addCondition()` and the `add_condition` import key to combine a condition with the existing ones
+ * Make the `router.strict_requirements` option default to `true` in debug mode and to `null` otherwise
 
 8.1
 ---

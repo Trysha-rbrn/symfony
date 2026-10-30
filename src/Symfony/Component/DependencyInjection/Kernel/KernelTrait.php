@@ -99,7 +99,7 @@ trait KernelTrait
         $cachePath = $this->getEffectiveBuildDir().'/'.$this->getContainerClass().'.bundles.php';
         if (
             is_file($cachePath)
-            && (!$this->debug || is_file($bundlesPath = $this->getBundlesPath()) && filemtime($cachePath) > filemtime($bundlesPath))
+            && (!$this->debug || is_file($bundlesPath = $this->getBundlesPath()) && filemtime($cachePath) > filemtime($bundlesPath) && $this->isContainerFresh())
         ) {
             $cached = require $cachePath;
 
@@ -124,9 +124,7 @@ trait KernelTrait
     {
         $class = $this->getContainerClass();
         $buildDir = $this->getEffectiveBuildDir();
-        $skip = $_SERVER['SYMFONY_DISABLE_RESOURCE_TRACKING'] ?? '';
-        $skip = filter_var($skip, \FILTER_VALIDATE_BOOLEAN, \FILTER_NULL_ON_FAILURE) ?? explode(',', $skip);
-        $cache = new ConfigCache($buildDir.'/'.$class.'.php', $this->debug, null, \is_array($skip) && ['*'] !== $skip ? $skip : ($skip ? [] : null));
+        $cache = $this->getContainerConfigCache();
 
         $cachePath = $cache->getPath();
 
@@ -173,81 +171,85 @@ trait KernelTrait
             error_reporting($errorLevel);
         }
 
-        if ($collectDeprecations = $this->debug && !\defined('PHPUNIT_COMPOSER_INSTALL')) {
-            $collectedLogs = [];
-            $previousHandler = set_error_handler(static function ($type, $message, $file, $line) use (&$collectedLogs, &$previousHandler) {
-                if (\E_USER_DEPRECATED !== $type && \E_DEPRECATED !== $type) {
-                    return $previousHandler ? $previousHandler($type, $message, $file, $line) : false;
-                }
-
-                if (isset($collectedLogs[$message])) {
-                    ++$collectedLogs[$message]['count'];
-
-                    return null;
-                }
-
-                $backtrace = debug_backtrace(\DEBUG_BACKTRACE_IGNORE_ARGS, 5);
-                // Clean the trace by removing first frames added by the error handler itself.
-                for ($i = 0; isset($backtrace[$i]); ++$i) {
-                    if (isset($backtrace[$i]['file'], $backtrace[$i]['line']) && $backtrace[$i]['line'] === $line && $backtrace[$i]['file'] === $file) {
-                        $backtrace = \array_slice($backtrace, 1 + $i);
-                        break;
-                    }
-                }
-                for ($i = 0; isset($backtrace[$i]); ++$i) {
-                    if (!isset($backtrace[$i]['file'], $backtrace[$i]['line'], $backtrace[$i]['function'])) {
-                        continue;
-                    }
-                    if (!isset($backtrace[$i]['class']) && 'trigger_deprecation' === $backtrace[$i]['function']) {
-                        $file = $backtrace[$i]['file'];
-                        $line = $backtrace[$i]['line'];
-                        $backtrace = \array_slice($backtrace, 1 + $i);
-                        break;
-                    }
-                }
-
-                // Remove frames added by DebugClassLoader.
-                for ($i = \count($backtrace) - 2; 0 < $i; --$i) {
-                    if (DebugClassLoader::class === ($backtrace[$i]['class'] ?? null)) {
-                        $backtrace = [$backtrace[$i + 1]];
-                        break;
-                    }
-                }
-
-                $collectedLogs[$message] = [
-                    'type' => $type,
-                    'message' => $message,
-                    'file' => $file,
-                    'line' => $line,
-                    'trace' => [$backtrace[0]],
-                    'count' => 1,
-                ];
-
-                return null;
-            });
-        }
+        $this->container = null;
 
         try {
-            $container = null;
-            $container = $this->buildContainer();
-            $container->compile();
+            if ($collectDeprecations = $this->debug && !\defined('PHPUNIT_COMPOSER_INSTALL')) {
+                $collectedLogs = [];
+                $previousHandler = set_error_handler(static function ($type, $message, $file, $line) use (&$collectedLogs, &$previousHandler) {
+                    if (\E_USER_DEPRECATED !== $type && \E_DEPRECATED !== $type) {
+                        return $previousHandler ? $previousHandler($type, $message, $file, $line) : false;
+                    }
+
+                    if (isset($collectedLogs[$message])) {
+                        ++$collectedLogs[$message]['count'];
+
+                        return null;
+                    }
+
+                    $backtrace = debug_backtrace(\DEBUG_BACKTRACE_IGNORE_ARGS, 5);
+                    // Clean the trace by removing first frames added by the error handler itself.
+                    for ($i = 0; isset($backtrace[$i]); ++$i) {
+                        if (isset($backtrace[$i]['file'], $backtrace[$i]['line']) && $backtrace[$i]['line'] === $line && $backtrace[$i]['file'] === $file) {
+                            $backtrace = \array_slice($backtrace, 1 + $i);
+                            break;
+                        }
+                    }
+                    for ($i = 0; isset($backtrace[$i]); ++$i) {
+                        if (!isset($backtrace[$i]['file'], $backtrace[$i]['line'], $backtrace[$i]['function'])) {
+                            continue;
+                        }
+                        if (!isset($backtrace[$i]['class']) && 'trigger_deprecation' === $backtrace[$i]['function']) {
+                            $file = $backtrace[$i]['file'];
+                            $line = $backtrace[$i]['line'];
+                            $backtrace = \array_slice($backtrace, 1 + $i);
+                            break;
+                        }
+                    }
+
+                    // Remove frames added by DebugClassLoader.
+                    for ($i = \count($backtrace) - 2; 0 < $i; --$i) {
+                        if (DebugClassLoader::class === ($backtrace[$i]['class'] ?? null)) {
+                            $backtrace = [$backtrace[$i + 1]];
+                            break;
+                        }
+                    }
+
+                    $collectedLogs[$message] = [
+                        'type' => $type,
+                        'message' => $message,
+                        'file' => $file,
+                        'line' => $line,
+                        'trace' => [$backtrace[0]],
+                        'count' => 1,
+                    ];
+
+                    return null;
+                });
+            }
+
+            try {
+                $container = null;
+                $container = $this->buildContainer();
+                $container->compile();
+            } finally {
+                if ($collectDeprecations) {
+                    restore_error_handler();
+
+                    @file_put_contents($buildDir.'/'.$class.'Deprecations.log', serialize(array_values($collectedLogs)));
+                }
+
+                if (null !== $container) {
+                    @file_put_contents($buildDir.'/'.$class.'Compiler.log', implode("\n", $container->getCompiler()->getLog()));
+                }
+            }
+
+            $this->dumpContainer($cache, $container, $class, $this->getContainerBaseClass());
         } finally {
-            if ($collectDeprecations) {
-                restore_error_handler();
-
-                @file_put_contents($buildDir.'/'.$class.'Deprecations.log', serialize(array_values($collectedLogs)));
+            if ($lock) {
+                flock($lock, \LOCK_UN);
+                fclose($lock);
             }
-
-            if (null !== $container) {
-                @file_put_contents($buildDir.'/'.$class.'Compiler.log', implode("\n", $container->getCompiler()->getLog()));
-            }
-        }
-
-        $this->dumpContainer($cache, $container, $class, $this->getContainerBaseClass());
-
-        if ($lock) {
-            flock($lock, \LOCK_UN);
-            fclose($lock);
         }
 
         $this->container = require $cachePath;
@@ -486,6 +488,30 @@ trait KernelTrait
     private function getBundlesPath(): string
     {
         return $this->getConfigDir().'/bundles.php';
+    }
+
+    /**
+     * Tells whether the container is fresh, as the list of bundles cached with it cannot be trusted otherwise.
+     *
+     * The bundles required with "ignoreOnInvalid" depend on classes that can appear or disappear after the list was cached.
+     */
+    private function isContainerFresh(): bool
+    {
+        $cache = $this->getContainerConfigCache();
+
+        if (!(self::$freshCache[$cache->getPath()] ?? $cache->isFresh())) {
+            return false;
+        }
+
+        return self::$freshCache[$cache->getPath()] = true;
+    }
+
+    private function getContainerConfigCache(): ConfigCache
+    {
+        $skip = $_SERVER['SYMFONY_DISABLE_RESOURCE_TRACKING'] ?? '';
+        $skip = filter_var($skip, \FILTER_VALIDATE_BOOLEAN, \FILTER_NULL_ON_FAILURE) ?? explode(',', $skip);
+
+        return new ConfigCache($this->getEffectiveBuildDir().'/'.$this->getContainerClass().'.php', $this->debug, null, \is_array($skip) && ['*'] !== $skip ? $skip : ($skip ? [] : null));
     }
 
     /**

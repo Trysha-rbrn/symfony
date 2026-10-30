@@ -20,8 +20,11 @@ use Symfony\Component\DependencyInjection\Definition;
 use Symfony\Component\DependencyInjection\Exception\InvalidArgumentException;
 use Symfony\Component\DependencyInjection\Exception\LogicException;
 use Symfony\Component\DependencyInjection\Reference;
+use Symfony\Component\Lock\LockInterface;
+use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Message\RedispatchMessage;
 use Symfony\Component\Messenger\MessageBusInterface;
+use Symfony\Component\Messenger\Stamp\StampInterface;
 use Symfony\Component\Messenger\Transport\TransportInterface;
 use Symfony\Component\Scheduler\Messenger\ServiceCallMessage;
 use Symfony\Component\Scheduler\RecurringMessage;
@@ -130,7 +133,21 @@ class AddScheduleMessengerPass implements CompilerPassInterface
                     }
                     $message = new Definition(RunCommandMessage::class, [$input]);
                 } else {
-                    $message = new Definition(ServiceCallMessage::class, [$serviceId, $tagAttributes['method'] ?? '__invoke', (array) ($tagAttributes['arguments'] ?? [])]);
+                    $r = $container->getReflectionClass($serviceDefinition->getClass(), false);
+
+                    if ($r && !$r->hasMethod($method) && !$r->hasMethod('__call')) {
+                        if (isset($tagAttributes['method'])) {
+                            throw new InvalidArgumentException(\sprintf('Invalid task service "%s": method "%s::%s()" does not exist.', $serviceId, $r->getName(), $method));
+                        }
+
+                        throw new InvalidArgumentException(\sprintf('Invalid task service "%s": class "%s" has no "__invoke()" method, and the task sets no "method" option. To dispatch a message on a schedule, return a "RecurringMessage" from a schedule provider instead.', $serviceId, $r->getName()));
+                    }
+
+                    $message = new Definition(ServiceCallMessage::class, [$serviceId, $method, (array) ($tagAttributes['arguments'] ?? [])]);
+                }
+
+                if ($stamps = (array) ($tagAttributes['stamps'] ?? [])) {
+                    $message = new Definition(Envelope::class, [$message, $this->createStampDefinitions($container, $stamps, $serviceId)]);
                 }
 
                 if ($tagAttributes['transports'] ?? null) {
@@ -161,12 +178,46 @@ class AddScheduleMessengerPass implements CompilerPassInterface
             }
         }
 
+        $schedulesConfig = [];
+
+        foreach ($container->hasParameter('.scheduler.schedules') ? $container->getParameter('.scheduler.schedules') : [] as $scheduleName => $scheduleConfig) {
+            if (!isset($tasksPerSchedule[$scheduleName]) && !isset($scheduleProviderIds[$scheduleName])) {
+                $knownSchedules = array_keys($tasksPerSchedule + $scheduleProviderIds);
+                sort($knownSchedules);
+
+                $container->log($this, \sprintf('Schedule "%s" is configured but no task or schedule provider uses it; check for a typo (known schedules: "%s").', $scheduleName, implode('", "', $knownSchedules)));
+
+                continue;
+            }
+
+            $tasksPerSchedule[$scheduleName] ??= [];
+
+            if ($scheduleConfig['stateful'] ?? false) {
+                $scheduleConfig['cache_pool'] ??= 'cache.scheduler';
+                $scheduleConfig['lock_factory'] ??= $container->has('lock.factory') ? 'lock.factory' : null;
+            }
+
+            $schedulesConfig[$scheduleName] = $scheduleConfig;
+        }
+
         foreach ($tasksPerSchedule as $scheduleName => $tasks) {
             $id = "scheduler.provider.$scheduleName";
             $schedule = new Definition(Schedule::class);
 
             if ($tasks) {
                 $schedule->addMethodCall('add', $tasks);
+            }
+
+            if (null !== $cachePool = $schedulesConfig[$scheduleName]['cache_pool'] ?? null) {
+                $schedule->addMethodCall('stateful', [new Reference($cachePool)]);
+            }
+
+            if (null !== $lockFactory = $schedulesConfig[$scheduleName]['lock_factory'] ?? null) {
+                $schedule->addMethodCall('lock', [(new Definition(LockInterface::class, ['scheduler_'.$scheduleName]))->setFactory([new Reference($lockFactory), 'createLock'])]);
+            }
+
+            if ($schedulesConfig[$scheduleName]['process_only_last_missed_run'] ?? false) {
+                $schedule->addMethodCall('processOnlyLastMissedRun', [true]);
             }
 
             if (isset($scheduleProviderIds[$scheduleName])) {
@@ -197,5 +248,41 @@ class AddScheduleMessengerPass implements CompilerPassInterface
             ;
             $container->setDefinition('messenger.transport.'.$transportName, $transportDefinition);
         }
+    }
+
+    /**
+     * The container holds classes, not objects, so a stamp is declared as a class name, on its own or mapped to the arguments its constructor takes.
+     *
+     * @param array<mixed> $stamps
+     *
+     * @return Definition[]
+     */
+    private function createStampDefinitions(ContainerBuilder $container, array $stamps, string $serviceId): array
+    {
+        $definitions = [];
+
+        foreach ($stamps as $class => $arguments) {
+            if (\is_int($class)) {
+                [$class, $arguments] = [$arguments, []];
+            }
+
+            if (\is_object($class)) {
+                throw new InvalidArgumentException(\sprintf('Option "stamps" of task "%s" must list stamp classes, not instances: pass "%s::class" instead, or "%s::class => [...$arguments]" when the stamp takes constructor arguments.', $serviceId, $class::class, $class::class));
+            }
+
+            $reflector = \is_string($class) ? $container->getReflectionClass($class) : null;
+
+            if (!$reflector?->implementsInterface(StampInterface::class) || !$reflector->isInstantiable()) {
+                throw new InvalidArgumentException(\sprintf('Option "stamps" of task "%s" must list instantiable classes implementing "%s", got "%s".', $serviceId, StampInterface::class, \is_string($class) ? $class : get_debug_type($class)));
+            }
+
+            $definition = new Definition($class);
+            foreach ((array) $arguments as $key => $value) {
+                $definition->setArgument(\is_string($key) && !str_starts_with($key, '$') ? '$'.$key : $key, $value);
+            }
+            $definitions[] = $definition;
+        }
+
+        return $definitions;
     }
 }

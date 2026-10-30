@@ -11,8 +11,10 @@
 
 namespace Symfony\Component\Messenger\Tests\Command;
 
+use PHPUnit\Framework\Attributes\BackupGlobals;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\TestCase;
+use Symfony\Bridge\PhpUnit\ClockMock;
 use Symfony\Component\Console\Exception\RuntimeException;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Tester\CommandCompletionTester;
@@ -21,10 +23,15 @@ use Symfony\Component\DependencyInjection\ServiceLocator;
 use Symfony\Component\Messenger\Command\FailedMessagesShowCommand;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Exception\InvalidArgumentException;
+use Symfony\Component\Messenger\Stamp\BusNameStamp;
 use Symfony\Component\Messenger\Stamp\ErrorDetailsStamp;
+use Symfony\Component\Messenger\Stamp\HandledStamp;
+use Symfony\Component\Messenger\Stamp\ReceivedStamp;
 use Symfony\Component\Messenger\Stamp\RedeliveryStamp;
 use Symfony\Component\Messenger\Stamp\SentToFailureTransportStamp;
+use Symfony\Component\Messenger\Stamp\SerializedMessageStamp;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
+use Symfony\Component\Messenger\Transport\InMemory\InMemoryTransport;
 use Symfony\Component\Messenger\Transport\Receiver\ListableReceiverInterface;
 use Symfony\Component\Messenger\Transport\Receiver\MessageCountAwareInterface;
 use Symfony\Component\Messenger\Transport\Receiver\ReceiverInterface;
@@ -45,8 +52,13 @@ class FailedMessagesShowCommandTest extends TestCase
         putenv($this->colSize ? 'COLUMNS='.$this->colSize : 'COLUMNS');
     }
 
+    #[BackupGlobals(true)]
     public function testBasicRunWithServiceLocator()
     {
+        $_SERVER['SCRIPT_FILENAME'] = __FILE__;
+        $_SERVER['SYMFONY_CLI_CONSOLE_COMMAND'] = '["symfony","console"]';
+        $_SERVER['SYMFONY_CLI_CONSOLE_SCRIPT'] = __FILE__;
+
         $sentToFailureStamp = new SentToFailureTransportStamp('async');
         $redeliveryStamp = new RedeliveryStamp(0);
         $errorStamp = ErrorDetailsStamp::create(new \Exception('Things are bad!', 123));
@@ -81,6 +93,8 @@ class FailedMessagesShowCommandTest extends TestCase
             EOF,
             $redeliveryStamp->getRedeliveredAt()->format('Y-m-d H:i:s')),
             $tester->getDisplay(true));
+        $this->assertStringContainsString('symfony console messenger:failed:retry 15 --transport=failure_receiver', $tester->getDisplay());
+        $this->assertStringContainsString('symfony console messenger:failed:remove 15 --transport=failure_receiver', $tester->getDisplay());
     }
 
     public function testMultipleRedeliveryFailsWithServiceLocator()
@@ -137,8 +151,13 @@ class FailedMessagesShowCommandTest extends TestCase
         $tester->execute(['id' => 15]);
     }
 
+    #[BackupGlobals(true)]
     public function testListMessagesWithServiceLocator()
     {
+        $_SERVER['SCRIPT_FILENAME'] = __FILE__;
+        $_SERVER['SYMFONY_CLI_CONSOLE_COMMAND'] = '["symfony","console"]';
+        $_SERVER['SYMFONY_CLI_CONSOLE_SCRIPT'] = __FILE__;
+
         $sentToFailureStamp = new SentToFailureTransportStamp('async');
         $redeliveryStamp = new RedeliveryStamp(0);
         $errorStamp = ErrorDetailsStamp::create(new \RuntimeException('Things are bad!'));
@@ -175,7 +194,7 @@ class FailedMessagesShowCommandTest extends TestCase
             EOF;
 
         $this->assertStringContainsString($expectedLoadingMessage, $tester->getDisplay());
-        $this->assertStringContainsString('Run messenger:failed:show {id} --transport=failure_receiver -vv to see message details.', $tester->getDisplay());
+        $this->assertStringContainsString('Run symfony console messenger:failed:show {id} --transport=failure_receiver -vv to see message details.', $tester->getDisplay());
     }
 
     public function testListMessagesReturnsNoMessagesFoundWithServiceLocator()
@@ -245,6 +264,25 @@ class FailedMessagesShowCommandTest extends TestCase
         $tester->execute(['--class-filter' => 'namespace\otherClass']);
         $this->assertStringContainsString('[OK] No failed messages were found.', $tester->getDisplay(true));
         $this->assertStringContainsString('Displaying only \'namespace\otherClass\' messages', $tester->getDisplay(true));
+    }
+
+    public function testListMessagesAppliesMaxAfterClassFilter()
+    {
+        $transport = new InMemoryTransport();
+        foreach ([\stdClass::class, \ArrayObject::class, \stdClass::class, \stdClass::class] as $i => $class) {
+            $transport->send(new Envelope(new $class(), [ErrorDetailsStamp::create(new \RuntimeException('Error '.($i + 1)))]));
+        }
+
+        $command = new FailedMessagesShowCommand('failure_receiver', new ServiceLocator(['failure_receiver' => static fn () => $transport]));
+
+        $tester = new CommandTester($command);
+        $tester->execute(['--class-filter' => 'stdClass', '--max' => 2]);
+
+        $display = $tester->getDisplay(true);
+        $this->assertStringContainsString('Error 1', $display);
+        $this->assertStringContainsString('Error 3', $display);
+        $this->assertStringNotContainsString('Error 4', $display);
+        $this->assertStringContainsString('Showing first 2 messages.', $display);
     }
 
     public function testListMessagesReturnsCountByClassName()
@@ -357,6 +395,86 @@ class FailedMessagesShowCommandTest extends TestCase
             %%A
             EOF,
             __FILE__, $exceptionLine),
+            $tester->getDisplay(true));
+    }
+
+    public function testVeryVerboseOutputForSingleMessageContainsStamps()
+    {
+        $envelope = new Envelope(new \stdClass(), [
+            new TransportMessageIdStamp(15),
+            new SentToFailureTransportStamp('async'),
+            new RedeliveryStamp(2, new \DateTimeImmutable('2026-01-02 03:04:05 UTC')),
+            new BusNameStamp('messenger.bus.default'),
+            new HandledStamp('result', 'App\Handler\OrderHandler::__invoke'),
+            new ReceivedStamp('failure_receiver'),
+            new SerializedMessageStamp('{"serialized": "body"}'),
+            ErrorDetailsStamp::create(new \RuntimeException('Things are bad!')),
+        ]);
+        $receiver = $this->createMock(ListableReceiverInterface::class);
+        $receiver->expects($this->once())->method('find')->with(42)->willReturn($envelope);
+
+        $failureTransportName = 'failure_receiver';
+
+        $command = new FailedMessagesShowCommand($failureTransportName, new ServiceLocator([$failureTransportName => static fn () => $receiver]));
+        $tester = new CommandTester($command);
+        $tester->execute(['id' => 42], ['verbosity' => OutputInterface::VERBOSITY_VERY_VERBOSE]);
+        $this->assertStringMatchesFormat(<<<'EOF'
+            %A
+            Stamps:
+            =======
+
+            [
+              Symfony\Component\Messenger\Stamp\TransportMessageIdStamp {
+                -id: 15
+              },
+              Symfony\Component\Messenger\Stamp\SentToFailureTransportStamp {
+                -originalReceiverName: "async"
+              },
+              Symfony\Component\Messenger\Stamp\RedeliveryStamp {
+                -redeliveredAt: DateTimeImmutable @1767323045 {%A}
+                -retryCount: 2
+              },
+              Symfony\Component\Messenger\Stamp\BusNameStamp {
+                -busName: "messenger.bus.default"
+              },
+              Symfony\Component\Messenger\Stamp\HandledStamp {
+                -result: "result"
+                -handlerName: "App\Handler\OrderHandler::__invoke"
+              }
+            ]
+
+            Exception:
+            ==========
+            %A
+            EOF,
+            $tester->getDisplay(true));
+    }
+
+    public function testVeryVerboseOutputForSingleMessageWithoutStampsToDisplay()
+    {
+        $envelope = new Envelope(new \stdClass(), [
+            new ReceivedStamp('failure_receiver'),
+            ErrorDetailsStamp::create(new \RuntimeException('Things are bad!')),
+        ]);
+        $receiver = $this->createMock(ListableReceiverInterface::class);
+        $receiver->expects($this->once())->method('find')->with(42)->willReturn($envelope);
+
+        $failureTransportName = 'failure_receiver';
+
+        $command = new FailedMessagesShowCommand($failureTransportName, new ServiceLocator([$failureTransportName => static fn () => $receiver]));
+        $tester = new CommandTester($command);
+        $tester->execute(['id' => 42], ['verbosity' => OutputInterface::VERBOSITY_VERY_VERBOSE]);
+        $this->assertStringMatchesFormat(<<<'EOF'
+            %A
+            Stamps:
+            =======
+
+            (no data)
+
+            Exception:
+            ==========
+            %A
+            EOF,
             $tester->getDisplay(true));
     }
 
@@ -541,6 +659,32 @@ class FailedMessagesShowCommandTest extends TestCase
         $this->assertStringContainsString('Displaying only messages that failed after 2024-05-02 00:00:00', $display);
         $this->assertStringContainsString('Displaying only messages that failed before 2024-05-02 23:59:59', $display);
         $this->assertStringContainsString('Showing 1 message(s).', $display);
+    }
+
+    public function testListMessagesFilteredByRelativeFailureTimeWithoutAClock()
+    {
+        ClockMock::withClockMock((new \DateTimeImmutable('2024-05-02 12:00:00 UTC'))->getTimestamp());
+
+        $receiver = $this->createStub(ListableReceiverInterface::class);
+        $receiver->method('all')->willReturn([
+            $this->createFailedEnvelope(10, '2024-05-02 10:00:00 UTC', 'Older failure'),
+            $this->createFailedEnvelope(20, '2024-05-02 11:30:00 UTC', 'Recent failure'),
+        ]);
+
+        $tester = new CommandTester(new FailedMessagesShowCommand('failure_receiver', new ServiceLocator(['failure_receiver' => static fn () => $receiver])));
+        $timezone = date_default_timezone_get();
+        date_default_timezone_set('Europe/Paris');
+
+        try {
+            $tester->execute(['--failed-after' => '-1 hour']);
+        } finally {
+            date_default_timezone_set($timezone);
+        }
+
+        $display = $tester->getDisplay(true);
+        $this->assertStringContainsString('Displaying only messages that failed after 2024-05-02 13:00:00', $display);
+        $this->assertStringContainsString('Recent failure', $display);
+        $this->assertStringNotContainsString('Older failure', $display);
     }
 
     public function testListMessagesFilteredByClassAndFailureTime()

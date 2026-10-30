@@ -134,6 +134,19 @@ abstract class NodeDefinition implements NodeParentInterface
     }
 
     /**
+     * Declares that the value of this node is needed while the container is compiled, so that its env vars are resolved instead of passed as placeholders.
+     *
+     * Use it when the extension reads the value itself, for example to decide which services to register.
+     * The env vars are read once, so the container must be rebuilt when their value changes.
+     *
+     * @return $this
+     */
+    public function resolvesAtCompileTime(bool $resolvesAtCompileTime = true): static
+    {
+        return $this->attribute('resolves_at_compile_time', $resolvesAtCompileTime);
+    }
+
+    /**
      * Sets an attribute on the node.
      *
      * @return $this

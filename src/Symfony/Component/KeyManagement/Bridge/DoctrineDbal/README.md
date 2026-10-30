@@ -21,6 +21,7 @@ $type = new EncryptedType(
     Type::getTypeRegistry()->get('string'),
     $envelopeEncrypter,
     'alias/app-key',
+    'string',
 );
 
 Type::getTypeRegistry()->register('app_user_email', $type);
@@ -54,6 +55,26 @@ class User
 }
 ```
 
+A type authenticates its configured key and parent type name with every value.
+Both strings have a length prefix, so a decorator can append its own context without changing their boundaries.
+Values written under a different key or parent type name are refused.
+The encrypted declaration's name and the parent instance's configuration aren't authenticated.
+Two columns using the same key and parent type name can read each other's values.
+Give those columns different keys or scopes to keep them apart.
+
+`EncryptedTypes` uses the configured `type` as the parent type name, `string` in the example below.
+Changing the PHP implementation behind that name leaves existing values readable if the new converter can read the old plaintext.
+Changing the parent type name requires rewriting existing values, even when both names resolve to the same PHP class.
+Renaming the encrypted declaration doesn't require rewriting values.
+
+For direct construction, pass the same stable parent name as the optional fourth argument, `$typeName`.
+Use the configured parent alias when direct and configured types must read each other's values.
+Only `null` falls back to the parent PHP class; empty strings and `'0'` are valid names.
+The class fallback changes when the parent class is renamed or subclassed, so these changes require rewriting existing values.
+Use a stable explicit name to avoid that migration.
+Values written before context binding need to be read with the previous implementation, then rewritten with the current type.
+The envelope binds this context locally, so the KMS needn't support authenticated data.
+
 Where to register the types
 ---------------------------
 
@@ -61,17 +82,41 @@ One instance is registered per `(envelope encrypter, master key id, parent
 type)` combination, and the registration must happen before the first query,
 on every request.
 
-In particular, do not defer it to Doctrine ORM's `loadClassMetadata` event: the
+In a Symfony application, `KeyManagementBundle` does it from its configuration:
+
+```yaml
+key_management:
+    clients:
+        default: '%env(KMS_DSN)%'
+    store:
+        key_id: 'alias/app-key'
+    doctrine_dbal:
+        types:
+            app_user_email: { type: string, key: 'user.email' }
+            app_user_notes: { type: text, key: 'user.notes' }
+```
+
+The types encrypt with the envelope encrypter that `EnvelopeEncrypterInterface` resolves to.
+When `key_management.store` is configured, this is the store-backed encrypter, and `key` names a scope.
+Otherwise, this is the encrypter of the default client, and `key` names a master key.
+The bundle declares the types when DoctrineBundle creates a connection.
+DoctrineBundle registers the types of its own configuration at that time, so `type` can name one of them.
+
+With the Doctrine ORM, you don't need to declare these types.
+Mark the property with the `#[Encrypted]` attribute of `symfony/doctrine-orm-key-management` instead, and the bundle registers the type of the column for you.
+
+Every entry point creates a connection before its first query: the front controller, the console with its schema tool and its migrations, and the test kernel.
+A request that doesn't use the database doesn't declare the types.
+
+Do not defer the registration to Doctrine ORM's `loadClassMetadata` event: the
 event does not fire when metadata comes from the cache, which DoctrineBundle
 enables in production, so a cached field mapping would reference a type name
 that is missing from the registry and every read of the column would fail with
-`UnknownColumnType`. Declare the types where the application declares the rest
-of its Doctrine configuration instead.
+`UnknownColumnType`.
 
-`doctrine.dbal.types` is not that place, and cannot be: it names a class that
-DoctrineBundle instantiates with no argument, while an `EncryptedType` takes an
-encrypter, which is a service. `EncryptedTypes` is what an application declares
-instead, one service per encrypter:
+Without the bundle, the application declares the types itself.
+`doctrine.dbal.types` is not the place for them, and cannot be: it names a class that DoctrineBundle instantiates with no argument, while an `EncryptedType` takes an encrypter, which is a service.
+`EncryptedTypes` is what the application declares instead, one service per encrypter:
 
 ```yaml
 services:
@@ -79,7 +124,7 @@ services:
         class: Symfony\Component\KeyManagement\Bridge\DoctrineDbal\EncryptedTypes
         public: true
         arguments:
-            $envelopes: '@key_management.stored_envelope_encrypter'
+            $envelopes: '@app.envelope_encrypter'
             $types:
                 app_user_email: { type: string, key: 'user.email' }
                 app_user_notes: { type: text, key: 'user.notes' }
@@ -97,21 +142,18 @@ public function boot(): void
 }
 ```
 
-Booting is early enough for every entry point at once, the front controller,
-the console with its schema tool and its migrations, and the test kernel, and
-it costs nothing: a DBAL connection only reaches the database on its first
-query. Registering later is what does not work. A connection cannot do it
-either, however tempting `doctrine.dbal.connection_factory` looks: a store-backed
-encrypter needs a connection, so asking a connection for the types closes a
-circle the container refuses to compile.
+When the kernel boots, DoctrineBundle has not registered the types of its configuration yet.
+The types declared this way can only wrap the types that are registered before, such as the built-in ones.
 
-Which encrypter a type is given is what decides the regime of the column, so an
-entity holding both is two services, one per encrypter, each registering its own
-names. Swapping one for another environment is then one argument.
+Which encrypter a type is given is what decides the regime of the column.
+The configured types all share one encrypter, so an entity holding both regimes declares the types of the other one with such a service.
+For instance, its `$envelopes` is `@key_management.envelope_encrypter.<client>` for the self-contained envelopes of a client, while the configured types use the store.
 
 Calling `register()` twice is safe and is what a rebooted kernel does: the type
 registry is global and outlives the container, so a name already taken is
 replaced rather than refused.
+Pass the connection to `register($connection)` when the connection uses its own type registry.
+That registry must be a writable `TypeRegistry`.
 
 Keeping the data keys in a table
 --------------------------------
@@ -126,7 +168,7 @@ rows instead of rewriting the payloads:
 use Symfony\Component\KeyManagement\Bridge\DoctrineDbal\DataKeyStore;
 use Symfony\Component\KeyManagement\StoredEnvelopeEncrypter;
 
-$store = new DataKeyStore($connection, $clients, 'aws', 'alias/app-key');
+$store = new DataKeyStore($connection, $clients, 'aws', 'alias/app-key', $secret);
 $store->createTable();
 
 $encrypter = new StoredEnvelopeEncrypter($store);
@@ -142,18 +184,59 @@ Type::getTypeRegistry()->register('app_user_email', new EncryptedType(
     Type::getTypeRegistry()->get('string'),
     $encrypter,
     'user.email',
+    'string',
 ));
 ```
 
-Rows of that column then share one data key and carry a 16-byte reference to
-it. To migrate a column that already holds self-contained envelopes, give the
-store-backed encrypter a fallback and keep the same registered name: rows
-written before are still read through the KMS, and rows written afterwards refer
-to the stored key.
+Rows of that column use the same data key and contain a 16-byte reference to that key.
+To read existing self-contained envelopes during migration, give the store-backed encrypter a fallback, `read_self_contained: true` in the bundle.
+Keep the old configured key string as the new scope and retain the same parent type name.
+The encrypted declaration's name can change.
+Use the configured key from the earlier `alias/app-key` example.
 
 ```php
 $encrypter = new StoredEnvelopeEncrypter($store, new EnvelopeEncrypter($kms));
+$type = new EncryptedType(Type::getTypeRegistry()->get('string'), $encrypter, 'alias/app-key', 'string');
 ```
+
+Rows written before are still read through the KMS, and new rows refer to the stored data key.
+Changing the scope to `user.email` at the same time would prevent the fallback from reading existing values.
+
+Turn the fallback off once the migration is over.
+A self-contained payload contains its own wrapped data key and bypasses the store's scope and binding checks.
+The envelope still authenticates the type's configured key and parent type name.
+
+The bundle trusts only `store.client` by default.
+List additional clients in `key_management.store.allowed_clients` before reading or rewrapping keys with them.
+The rewrap command uses the same list.
+Registering a client elsewhere in the application doesn't authorize that client for stored keys.
+For standalone usage, pass only trusted clients to the store and rewrap command.
+
+```yaml
+key_management:
+    store:
+        client: new
+        key_id: app-key
+        allowed_clients: [old]
+```
+
+Only list the clients that wrapped stored keys.
+The store never uses a client that isn't in this list, whatever a row of the table says.
+
+The store also authenticates each row with a secret: `$secret` above, `key_management.store.secret` in the bundle.
+In a Symfony application, it defaults to the `kernel.secret` parameter.
+Without this secret, a database writer could insert a data key that they know, and your application would encrypt new values with that key.
+They can wrap such a key under a public key, for example the one of a `SealedBoxKms`.
+They can also use a master key of their own that your KMS credentials are allowed to use.
+Keep the secret out of the database, like your other application secrets.
+
+To change the secret, add the new secret at the top of the list and keep the old one.
+The store signs new keys with the first secret and accepts keys signed with any of them.
+Then run `key-management:rewrap-data-keys` to bind every key under the new secret.
+Without options, it re-wraps the keys under the client and the master key of the store.
+Remove the old secret after that run.
+Removing it earlier makes the keys bound under it unreadable.
+This includes changing `kernel.secret` when the store uses it.
 
 The table holds exactly what the store needs and nothing else:
 
@@ -164,6 +247,7 @@ The table holds exactly what the store needs and nothing else:
 | `key_material` | `BLOB` | The wrapped data key |
 | `master_key_id` | `VARCHAR(255)` | The master key that wrapped it |
 | `client` | `VARCHAR(64)` | The configured KMS client able to unwrap it |
+| `binding` | `BINARY(32)` | Proof that the key was minted for this reference and scope by a store that knows the secret, checked once the key is unwrapped |
 
 There is no timestamp column on purpose: a UUIDv7 carries its creation instant
 and sorts chronologically, so the newest row of a scope is its current key and
@@ -173,13 +257,25 @@ A scope longer than its column is refused rather than truncated, and the column
 follows the collation of the connection: under a case-insensitive one,
 `user.email` and `User.Email` are one scope.
 
-A key is retired thirty days after it was minted, `DEFAULT_MAX_AGE_SECONDS`, and
-`max_age` moves that. Rotating is not hygiene here, it is what the format
-requires: every payload is sealed under a random 96-bit IV, which NIST SP 800-38D
-bounds at 2^32 payloads per key, and thirty days covers some 1650 payloads per
-second in one scope. Passing `null` turns rotation off and hands that bound to
-the application. Retiring a key never deletes its row, so what it sealed stays
-readable.
+A key is retired thirty days after it was minted, `DEFAULT_MAX_AGE_SECONDS`, and `max_age` controls that age.
+Stored envelopes use AES-256-GCM with random 96-bit IVs.
+NIST SP 800-38D limits this mode to 2^32 encryptions per key across all processes.
+Age-based rotation doesn't count encryptions.
+Choose `max_age` so the total writes under one key stay below that limit.
+The default thirty days covers about 1650 writes per second across all writers of one scope.
+Passing `null` disables age-based rotation.
+Rewrapping keeps the same data key and doesn't reset its usage count.
+Retiring a key never deletes its row, so existing values stay readable.
+
+`bindWrappingContext: true`, `bind_wrapping_context` in the bundle, has the backend
+authenticate the reference and the scope of each data key as it wraps it, which is
+what a Vault Transit key created with `derived=true` requires and what a backend
+refusing authenticated data cannot do. Rows written before it was turned on are
+moved over by `key-management:rewrap-data-keys --accept-unbound`.
+
+Turning it on takes effect at once: until that command has moved them, the rows written before are refused, and so is encrypting under a scope whose current key is one of them.
+The command can be run again after an interruption.
+There is no way back: once the option is turned off again, the rows written or moved while it was on cannot be read, and the command cannot move them back.
 
 The table name is configurable, but a name that needs quoting, a reserved word
 such as `order` or a hyphenated name, is not supported, as for the Lock and
@@ -191,33 +287,30 @@ table with `createTable()` or with your own migration.
 
 In a Symfony application, `key_management.store` wires all of this: the
 store is what `DataKeyStoreInterface` resolves to, and the store-backed encrypter
-becomes what `EnvelopeEncrypterInterface` injects, with the default client's
-encrypter behind it so the payloads written before the store keep being read. The
-per-client encrypters stay available through `#[Target('<name>')]`.
+becomes what `EnvelopeEncrypterInterface` injects. With `read_self_contained: true`,
+the default client's encrypter is put behind it so the payloads written before the
+store keep being read. The per-client encrypters stay available through
+`#[Target('<name>')]`.
 
-A scope is resolved once and then held, unwrapped, for as long as the store
-lives, which is what spares the round trips. A key created inside a transaction
-is the one exception: its row is looked up again on every use until the
-transaction is seen committed, so that a rollback taking the row away is noticed
-rather than encrypted with. Holding the keys also means the store holds
-plaintext key material in memory: `forget()` drops it, and the Symfony wiring
-calls it between two units of work through the `kernel.reset` tag, so a
-long-running worker starts each request with nothing retained.
+A scope, or a reference read back from a payload, is resolved once and then held, unwrapped, for as long as the store lives, which is what spares the round trips.
+A key created inside a transaction is the one exception: its row is looked up again on every use until the transaction is seen committed, so that a rollback taking the row away is noticed rather than encrypted with.
+A row deleted, edited or copied elsewhere is likewise seen only after the next `forget()`.
+Holding the keys also means the store holds plaintext key material in memory: `forget()` drops it, and the Symfony wiring calls it between two units of work through the `kernel.reset` tag, so a long-running worker starts each request with nothing retained.
 
 Adding your own columns
 -----------------------
 
-Every query names those five columns explicitly, so extra columns are invisible
+Every query names those six columns explicitly, so extra columns are invisible
 to the store, provided they are nullable or have a default: nothing fills them
 on insert. How you declare them depends on who owns the table.
 
 **You own the table.** Skip `createTable()`, leave `configureSchema()` unwired,
-and declare the five columns plus yours in your own migration. Simplest route,
+and declare the six columns plus yours in your own migration. Simplest route,
 and the one to prefer as soon as the table carries anything the store does not
 know about.
 
 **Doctrine owns the schema.** If the schema listener calls `configureSchema()`,
-the assembled schema declares five columns while the database holds more, so
+the assembled schema declares six columns while the database holds more, so
 `doctrine:schema:update` will offer to drop the extra ones. Add them to the same
 table from your own `postGenerateSchema` listener, so both sides agree.
 
@@ -260,25 +353,37 @@ name: `EncryptedType` knows an envelope encrypter and a `$key`, and that is all.
 Changing provider is a change of the encrypter handed to the type, and what it
 costs depends on what the column already holds. Both clients are configured at
 once meanwhile, which in a Symfony application makes their encrypters available
-through `#[Target('aws')]` and `#[Target('azure')]`.
+through `#[Target('old')]` and `#[Target('new')]`.
 
 **Rows referring to a stored data key.** Nothing to do on the Doctrine side.
-Declare the new client next to the old one, move the data keys over with
-`key-management:rewrap-data-keys --from=aws --to=azure --key-id=...`, then point
-the store at the new client so the keys it creates afterwards are wrapped there.
+Declare the new client and add it to `key_management.store.allowed_clients`.
+Run `key-management:rewrap-data-keys --from=old --to=new --key-id=...`.
+Then change `store.client` to the new client.
+Keep the old client in `store.allowed_clients` until all its stored keys have been moved.
 No payload is read or rewritten, the references stay what they were, and the old
-client goes away once a `--from=aws --dry-run` run lists nothing.
+client goes away once a `--from=old --dry-run` run lists nothing.
 
 A store wrapping with a `CompositeKms` records that client, so its rows are
-wrapped by every member at once and read through whichever answers. Losing a
-member for good is then a change of members, followed by the same command from
-the composite client to itself, which wraps every key under the new list.
+wrapped by every member at once and read through whichever answers. When a
+member is lost for good, rows with a wrapping from a surviving member stay
+readable after the member list changes. New writes use the new list. Stored
+keys need rewrapping under a replacement member to regain redundancy;
+`key-management:rewrap-data-keys --from=main` writes them under the current
+active members when `main` is the client of the store.
+
+A member's name is stored in each wrapping. When replacing a member, list its
+old name under the composite client's `retired` option to read old values
+without asking it to wrap new ones. Rewrap stored keys before removing the old
+name from `retired`; direct ciphertexts and self-contained envelopes are not
+visited by the command and need separate migration. A retired member remains
+a full decryption path and needs the same protection as an active member.
 
 **Rows carrying their own wrapped data key.** Each one is wrapped by the master
 key of the provider that wrote it, so moving to another provider means rewriting
-every row, and a row not yet rewritten still needs the old client to be read. A
-decrypter routing on the key id keeps both readable while the column is being
-rewritten, and writes everything through the new provider:
+every row, and a row not yet rewritten still needs the old client to be read.
+When the configured key changes, read through the old type and write through a new type.
+To keep serving queries, add another column mapped to the new type and backfill that column.
+Both types can use an encrypter that routes to the appropriate provider by key id:
 
 ```php
 final class MigratingEnvelopes implements EnvelopeEncrypterInterface, EnvelopeDecrypterInterface
@@ -303,37 +408,37 @@ final class MigratingEnvelopes implements EnvelopeEncrypterInterface, EnvelopeDe
 }
 ```
 
-Register the type with that encrypter, deploy, then rewrite the column. Do that
-through DBAL rather than through the ORM: the decrypted value is the same before
-and after, so the unit of work computes an empty change set and no `UPDATE` is
-ever issued.
+Keep the existing column mapped to the old type.
+Register a separate type with the new key for a second column, `email_next` here.
+Keep writes consistent across both columns during the backfill, or pause writes.
+The following DBAL pass reads with the old type and writes with the new type.
 
 ```php
 $platform = $connection->getDatabasePlatform();
-$legacy = new EncryptedType($parent, new EnvelopeEncrypter($awsKms), 'alias/app-key');
-$target = new EncryptedType($parent, $encrypter, 'user.email');
+$legacy = new EncryptedType($parent, new EnvelopeEncrypter($awsKms), 'alias/app-key', 'string');
+$target = new EncryptedType($parent, $encrypter, 'user.email', 'string');
 
 foreach ($connection->iterateAssociative('SELECT id, email FROM user ORDER BY id') as $row) {
     $connection->update(
         'user',
-        ['email' => $target->convertToDatabaseValue($legacy->convertToPHPValue($row['email'], $platform), $platform)],
+        ['email_next' => $target->convertToDatabaseValue($legacy->convertToPHPValue($row['email'], $platform), $platform)],
         ['id' => $row['id']],
-        ['email' => ParameterType::BINARY],
+        ['email_next' => ParameterType::BINARY],
     );
 }
 ```
 
-Register the type with the target encrypter alone once every row is rewritten,
-and drop the old client. That pass is the one occasion to change how the column
-is protected without paying for it twice, so it is worth writing through a
-store-backed encrypter, as `$target` does above: the cost is the same today, and
-the next provider change becomes the case above, one command and not a single
-row read.
+Once every row has a new value, switch readers to the new column and type.
+Remove the old column and client when they are no longer used.
+For an offline migration, stop reads and writes, update `email` in that loop, then change the mapping to the new type.
+Writing through a store-backed encrypter also lets later provider changes rewrap the stored keys without rewriting the payloads.
 
-Rotating the master key within one provider is another matter entirely. The key
-id travels inside the envelope and is handed back to the KMS on every read, so
-rows written under a retired key keep resolving and nothing has to be rewritten,
-for as long as that key stays usable.
+Re-encrypting existing values doesn't establish their original ownership.
+Use a trusted copy or re-enroll affected secrets before migration if database values may have been replaced.
+
+Physical key rotation within a provider doesn't require rewriting values while the type's configured key string stays unchanged.
+For example, the same logical alias can point to a new master key while old keys remain available for decryption.
+Changing the configured alias, key name or ARN changes the authenticated context and requires migration, even if the KMS still reads the old key.
 
 Requirements
 ------------
@@ -374,12 +479,12 @@ Either way:
     and the ciphertext outgrows it by the envelope's framing, so a column sized
     after it would truncate the ciphertext and destroy the authentication tag
     with it.
-  * **A ciphertext is not bound to its row.** The type passes no AAD, because
-    `convertToDatabaseValue()` never sees the table, the column or the row it
-    converts for. Within one scope, or one master key, an encrypted value copied
-    into another row of the same type decrypts there. When moving a value
-    between rows must be detectable, bind the row yourself: put its identity in
-    the payload and check it after decryption.
+  * **A ciphertext is not bound to its row.** The type authenticates its configured key and parent type name.
+    `convertToDatabaseValue()` never sees the table, column or row it converts for.
+    Rows using the same configured key and parent type name can read each other's encrypted values.
+    To detect moving a value between rows, include the row identity in the payload.
+    Check the row identity against the expected row after decryption.
+  * **SQL `NULL` isn't authenticated.** Deny protected operations when a required encrypted value is missing.
 
 Resources
 ---------

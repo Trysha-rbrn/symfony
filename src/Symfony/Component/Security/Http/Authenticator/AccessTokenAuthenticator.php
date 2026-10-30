@@ -19,6 +19,7 @@ use Symfony\Component\Security\Core\Exception\BadCredentialsException;
 use Symfony\Component\Security\Core\User\UserProviderInterface;
 use Symfony\Component\Security\Http\AccessToken\AccessTokenExtractorInterface;
 use Symfony\Component\Security\Http\AccessToken\AccessTokenHandlerInterface;
+use Symfony\Component\Security\Http\AccessToken\SenderConstraintInterface;
 use Symfony\Component\Security\Http\Authentication\AuthenticationFailureHandlerInterface;
 use Symfony\Component\Security\Http\Authentication\AuthenticationSuccessHandlerInterface;
 use Symfony\Component\Security\Http\Authenticator\Passport\Badge\UserBadge;
@@ -53,8 +54,12 @@ class AccessTokenAuthenticator implements AuthenticatorInterface, FallbackAuthen
     private ?TranslatorInterface $translator = null;
 
     /**
-     * @param string|null $resourceMetadataUri The URL of the RFC 9728 protected resource metadata document to advertise
-     *                                         in the "WWW-Authenticate" header; a path is resolved against the request
+     * @param string|null                    $resourceMetadataUri The URL of the RFC 9728 protected resource metadata document to advertise
+     *                                                            in the "WWW-Authenticate" header; a path is resolved against the request
+     * @param SenderConstraintInterface|null $senderConstraint    What the request has to prove possession of, beyond holding the access
+     *                                                            token, for the token to be accepted (RFC 9449 for DPoP). Null accepts a
+     *                                                            token from whoever presents it, which is what a bearer token is
+     *                                                            (RFC 6750, Section 1)
      */
     public function __construct(
         private readonly AccessTokenHandlerInterface $accessTokenHandler,
@@ -64,6 +69,7 @@ class AccessTokenAuthenticator implements AuthenticatorInterface, FallbackAuthen
         private readonly ?AuthenticationFailureHandlerInterface $failureHandler = null,
         private readonly ?string $realm = null,
         private readonly ?string $resourceMetadataUri = null,
+        private readonly ?SenderConstraintInterface $senderConstraint = null,
     ) {
     }
 
@@ -86,6 +92,11 @@ class AccessTokenAuthenticator implements AuthenticatorInterface, FallbackAuthen
         }
 
         $userBadge = $this->accessTokenHandler->getUserBadgeFrom($accessToken);
+
+        // the token says what it is bound to, the request has to prove possession of it before anything
+        // is loaded on its behalf
+        $this->senderConstraint?->check($request, $accessToken, $userBadge->getAttributes() ?? []);
+
         if ($this->userProvider && (null === $userBadge->getUserLoader() || $userBadge->getUserLoader() instanceof FallbackUserLoader)) {
             $userBadge->setUserLoader($this->userProvider->loadUserByIdentifier(...));
         }
@@ -112,16 +123,15 @@ class AccessTokenAuthenticator implements AuthenticatorInterface, FallbackAuthen
             return $this->failureHandler->onAuthenticationFailure($request, $exception);
         }
 
-        if (null !== $this->translator) {
-            $errorMessage = $this->translator->trans($exception->getMessageKey(), $exception->getMessageData(), 'security');
-        } else {
-            $errorMessage = strtr($exception->getMessageKey(), $exception->getMessageData());
-        }
+        $errorMessage = $this->getErrorMessage($exception);
 
         return new Response(
-            null,
+            $errorMessage,
             Response::HTTP_UNAUTHORIZED,
-            ['WWW-Authenticate' => $this->getAuthenticateHeader($request, 'invalid_token', $errorMessage)]
+            [
+                'Content-Type' => 'text/plain',
+                'WWW-Authenticate' => $this->getAuthenticateHeader($request, 'invalid_token', $errorMessage, $exception),
+            ]
         );
     }
 
@@ -131,9 +141,12 @@ class AccessTokenAuthenticator implements AuthenticatorInterface, FallbackAuthen
         // holds no error code, as an error code describes a token the client did send. This is
         // the request an RFC 9728 client makes to discover where to get a token from.
         return new Response(
-            null,
+            null !== $authException ? $this->getErrorMessage($authException) : null,
             Response::HTTP_UNAUTHORIZED,
-            ['WWW-Authenticate' => $this->getAuthenticateHeader($request)]
+            [
+                'Content-Type' => 'text/plain',
+                'WWW-Authenticate' => $this->getAuthenticateHeader($request, null, null, $authException),
+            ]
         );
     }
 
@@ -168,8 +181,13 @@ class AccessTokenAuthenticator implements AuthenticatorInterface, FallbackAuthen
      * @see https://datatracker.ietf.org/doc/html/rfc6750#section-3
      * @see https://datatracker.ietf.org/doc/html/rfc9728#section-5.1
      */
-    private function getAuthenticateHeader(Request $request, ?string $error = null, ?string $errorDescription = null): string
+    private function getAuthenticateHeader(Request $request, ?string $error = null, ?string $errorDescription = null, ?AuthenticationException $exception = null): string
     {
+        // the challenge of a firewall accepting sender-constrained tokens names the scheme they are
+        // presented under, and the constraint adds what a client needs to come back with one (RFC 9449,
+        // Section 7.1); a bearer firewall keeps the scheme and the parameters of RFC 6750, Section 3
+        [$scheme, $parameters] = $this->senderConstraint?->getChallenge($exception) ?? ['Bearer', []];
+
         $data = [
             'realm' => $this->realm,
             'error' => $error,
@@ -181,13 +199,22 @@ class AccessTokenAuthenticator implements AuthenticatorInterface, FallbackAuthen
             },
         ];
         $values = [];
-        foreach ($data as $k => $v) {
+        foreach (array_replace($data, $parameters) as $k => $v) {
             if (null === $v || '' === $v) {
                 continue;
             }
             $values[] = \sprintf('%s="%s"', $k, $v);
         }
 
-        return $values ? 'Bearer '.implode(',', $values) : 'Bearer';
+        return $values ? $scheme.' '.implode(',', $values) : $scheme;
+    }
+
+    private function getErrorMessage(AuthenticationException $exception): string
+    {
+        if (null !== $this->translator) {
+            return $this->translator->trans($exception->getMessageKey(), $exception->getMessageData(), 'security');
+        }
+
+        return strtr($exception->getMessageKey(), $exception->getMessageData());
     }
 }

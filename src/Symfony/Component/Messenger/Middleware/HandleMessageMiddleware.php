@@ -19,6 +19,7 @@ use Symfony\Component\Messenger\Event\HandlerFailureEvent;
 use Symfony\Component\Messenger\Event\HandlerStartingEvent;
 use Symfony\Component\Messenger\Event\HandlerSuccessEvent;
 use Symfony\Component\Messenger\Exception\HandlerFailedException;
+use Symfony\Component\Messenger\Exception\InvalidMessageSignatureException;
 use Symfony\Component\Messenger\Exception\LogicException;
 use Symfony\Component\Messenger\Exception\NoHandlerForMessageException;
 use Symfony\Component\Messenger\Handler\Acknowledger;
@@ -29,6 +30,7 @@ use Symfony\Component\Messenger\Stamp\FlushBatchHandlersStamp;
 use Symfony\Component\Messenger\Stamp\HandledStamp;
 use Symfony\Component\Messenger\Stamp\HandlerArgumentsStamp;
 use Symfony\Component\Messenger\Stamp\NoAutoAckStamp;
+use Symfony\Component\Messenger\Stamp\TrustStamp;
 
 /**
  * @author Samuel Roze <samuel.roze@gmail.com>
@@ -59,8 +61,10 @@ class HandleMessageMiddleware implements MiddlewareInterface
 
         $exceptions = [];
         $alreadyHandled = false;
+        $handledStamps = [];
         foreach ($this->handlersLocator->getHandlers($envelope) as $handlerDescriptor) {
-            if ($this->messageHasAlreadyBeenHandled($envelope, $handlerDescriptor)) {
+            // a flush dispatch never runs handlers, since the envelope of a failed message can miss the stamps of the handlers that succeeded
+            if ($envelope->last(FlushBatchHandlersStamp::class) || $this->messageHasAlreadyBeenHandled($envelope, $handlerDescriptor)) {
                 $alreadyHandled = true;
                 continue;
             }
@@ -75,11 +79,24 @@ class HandleMessageMiddleware implements MiddlewareInterface
                 $handler = $handlerDescriptor->getHandler();
                 $batchHandler = $handlerDescriptor->getBatchHandler();
 
+                if ($handlerDescriptor->getOption('sign') && !TrustStamp::isEnvelopeTrusted($envelope)) {
+                    if ($envelope->last(TrustStamp::class)) {
+                        throw new InvalidMessageSignatureException(\sprintf('Handler "%s" requires a verified signature, but message "%s" comes from data that was not verified.', $handlerDescriptor->getName(), $context['class']));
+                    }
+
+                    // transports that bypass the signing serializer add no TrustStamp
+                    trigger_deprecation('symfony/messenger', '8.2', 'Handler "%s" requires a signature, but message "%s" comes from a transport that did not verify it. Handling such a message is deprecated, and the handler will refuse it in 9.0. Set the "sign" option of the transport to sign every message, or make the transport add "%s::trusted()" to the messages it creates in this process.', $handlerDescriptor->getName(), $context['class'], TrustStamp::class);
+                }
+
                 if ($batchHandler && $ackStamp = $envelope->last(AckStamp::class)) {
                     $dispatcher = $this->dispatcher;
-                    $ack = new Acknowledger(get_debug_type($batchHandler), static function (?\Throwable $e = null, $result = null) use ($envelope, $ackStamp, $handlerDescriptor, $dispatcher) {
+                    $handledBefore = \count($handledStamps);
+                    $ack = new Acknowledger(get_debug_type($batchHandler), static function (?\Throwable $e = null, $result = null) use ($envelope, $ackStamp, $handlerDescriptor, $dispatcher, &$handledStamps, $handledBefore) {
                         if (null !== $e) {
                             $dispatcher?->dispatch(new HandlerFailureEvent($envelope, $handlerDescriptor, $e));
+                            // a retry must skip the handlers that succeeded after this batch handler
+                            // a nack sent during the dispatch must not wait for them, since outer middlewares may undo their work
+                            $envelope = $envelope->with(...\array_slice($handledStamps, $handledBefore));
                             $e = new HandlerFailedException($envelope, [$handlerDescriptor->getName() => $e]);
                         } else {
                             $envelope = $envelope->with(HandledStamp::fromDescriptor($handlerDescriptor, $result));
@@ -87,9 +104,9 @@ class HandleMessageMiddleware implements MiddlewareInterface
                         }
 
                         $ackStamp->ack($envelope, $e);
-                    }, $this->clock);
+                    }, $this->clock, static fn () => $ackStamp->deferFlush($handlerDescriptor));
 
-                    $result = $this->callHandler($handler, $message, $ack, $envelope->last(HandlerArgumentsStamp::class));
+                    $result = $this->callHandler($handlerDescriptor, $envelope, $ack);
 
                     if (!\is_int($result) || 0 > $result) {
                         throw new LogicException(\sprintf('A handler implementing BatchHandlerInterface must return the size of the current batch as a positive integer, "%s" returned from "%s".', \is_int($result) ? $result : get_debug_type($result), get_debug_type($batchHandler)));
@@ -104,11 +121,14 @@ class HandleMessageMiddleware implements MiddlewareInterface
                         $result = $ack->getResult();
                     }
                 } else {
-                    $result = $this->callHandler($handler, $message, null, $envelope->last(HandlerArgumentsStamp::class));
+                    $result = $this->callHandler($handlerDescriptor, $envelope, null);
                 }
 
                 $handledStamp = HandledStamp::fromDescriptor($handlerDescriptor, $result);
                 $envelope = $envelope->with($handledStamp);
+                if (!$ackPending) {
+                    $handledStamps[] = $handledStamp;
+                }
                 $this->logger?->info('Message {class} handled by {handler}', $context + ['handler' => $handledStamp->getHandlerName()]);
             } catch (\Throwable $e) {
                 $exceptions[$handlerDescriptor->getName()] = $e;
@@ -162,18 +182,31 @@ class HandleMessageMiddleware implements MiddlewareInterface
         return false;
     }
 
-    /**
-     * @param-immediately-invoked-callable $handler
-     */
-    private function callHandler(\Closure $handler, object $message, ?Acknowledger $ack, ?HandlerArgumentsStamp $handlerArgumentsStamp): mixed
+    private function callHandler(HandlerDescriptor $handlerDescriptor, Envelope $envelope, ?Acknowledger $ack): mixed
     {
-        $arguments = [$message];
+        $arguments = [$envelope->getMessage()];
         if (null !== $ack) {
             $arguments[] = $ack;
         }
-        if (null !== $handlerArgumentsStamp) {
+        if (null !== $handlerArgumentsStamp = $envelope->last(HandlerArgumentsStamp::class)) {
             $arguments = [...$arguments, ...$handlerArgumentsStamp->getAdditionalArguments()];
         }
+        foreach ($handlerDescriptor->getStampParameters() as $name => [$class, $allowsNull, $hasDefault, $position]) {
+            if (\array_key_exists($position, $arguments) || \array_key_exists($name, $arguments)) {
+                continue;
+            }
+            if (Envelope::class === $class) {
+                $arguments[$name] = $envelope;
+            } elseif (null !== $stamp = $envelope->last($class)) {
+                $arguments[$name] = $stamp;
+            } elseif (!$hasDefault) {
+                if (!$allowsNull) {
+                    throw new LogicException(\sprintf('Handler "%s" requires a "%s" stamp for argument "$%s", but the envelope carries none.', $handlerDescriptor->getName(), $class, $name));
+                }
+                $arguments[$name] = null;
+            }
+        }
+        $handler = $handlerDescriptor->getHandler();
 
         return $handler(...$arguments);
     }

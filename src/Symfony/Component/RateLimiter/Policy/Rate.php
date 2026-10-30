@@ -11,6 +11,7 @@
 
 namespace Symfony\Component\RateLimiter\Policy;
 
+use Symfony\Component\RateLimiter\Exception\InvalidIntervalException;
 use Symfony\Component\RateLimiter\Util\TimeUtil;
 
 /**
@@ -29,6 +30,9 @@ final class Rate
         private \DateInterval $refillTime,
         private int $refillAmount = 1,
     ) {
+        if (TimeUtil::dateIntervalToSeconds($refillTime) < 1) {
+            throw new InvalidIntervalException('The refill interval must be at least one second.');
+        }
     }
 
     public static function perSecond(int $rate = 1): self
@@ -89,7 +93,7 @@ final class Rate
      */
     public function calculateNextTokenAvailability(): \DateTimeImmutable
     {
-        return (new \DateTimeImmutable())->add($this->refillTime);
+        return \DateTimeImmutable::createFromTimestamp(microtime(true))->setTimezone(new \DateTimeZone(date_default_timezone_get()))->add($this->refillTime);
     }
 
     /**

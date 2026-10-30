@@ -123,6 +123,18 @@ class MarshallingSessionHandlerTest extends TestCase
         $this->assertSame('', $marshallingSessionHandler->read('session_id'));
     }
 
+    public function testReadFailure()
+    {
+        $marshaller = $this->createMock(MarshallerInterface::class);
+        $marshallingSessionHandler = new MarshallingSessionHandler($this->handler, $marshaller);
+
+        $this->handler->expects($this->once())->method('read')->with('session_id')
+            ->willReturn(false);
+        $marshaller->expects($this->never())->method('unmarshall');
+
+        $this->assertFalse($marshallingSessionHandler->read('session_id'));
+    }
+
     public function testWrite()
     {
         $marshaller = $this->createMock(MarshallerInterface::class);
@@ -137,6 +149,38 @@ class MarshallingSessionHandlerTest extends TestCase
         ;
 
         $marshallingSessionHandler->write('session_id', 'data');
+    }
+
+    public function testWriteDoesNotMarshallEmptyData()
+    {
+        $marshaller = $this->createMock(MarshallerInterface::class);
+        $marshallingSessionHandler = new MarshallingSessionHandler($this->handler, $marshaller);
+
+        $marshaller->expects($this->never())->method('marshall');
+
+        $this->handler->expects($this->once())->method('write')
+            ->with('session_id', '')
+            ->willReturn(true);
+
+        $this->assertTrue($marshallingSessionHandler->write('session_id', ''));
+    }
+
+    public function testWriteDoesNotMarshallIgbinaryEmptyData()
+    {
+        if (!\function_exists('igbinary_serialize')) {
+            $this->markTestSkipped('The "igbinary" extension is required.');
+        }
+
+        $marshaller = $this->createMock(MarshallerInterface::class);
+        $marshallingSessionHandler = new MarshallingSessionHandler($this->handler, $marshaller);
+
+        $marshaller->expects($this->never())->method('marshall');
+
+        $this->handler->expects($this->once())->method('write')
+            ->with('session_id', igbinary_serialize([]))
+            ->willReturn(true);
+
+        $this->assertTrue($marshallingSessionHandler->write('session_id', igbinary_serialize([])));
     }
 
     public function testValidateId()

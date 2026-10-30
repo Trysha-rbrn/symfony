@@ -11,19 +11,69 @@
 
 namespace Symfony\Component\Messenger\Tests;
 
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\RunInSeparateProcess;
 use PHPUnit\Framework\TestCase;
+use Symfony\Bridge\PhpUnit\ClassExistsMock;
+use Symfony\Component\DependencyInjection\Compiler\CompilerPassInterface;
+use Symfony\Component\DependencyInjection\Compiler\PassConfig;
+use Symfony\Component\DependencyInjection\ContainerBuilder;
+use Symfony\Component\DependencyInjection\Exception\ServiceNotFoundException;
 use Symfony\Component\DependencyInjection\Kernel\AbstractKernel;
 use Symfony\Component\DependencyInjection\Kernel\KernelTrait;
 use Symfony\Component\DependencyInjection\Loader\Configurator\ContainerConfigurator;
+use Symfony\Component\EventDispatcher\EventDispatcher;
 use Symfony\Component\Filesystem\Filesystem;
+use Symfony\Component\Lock\LockFactory;
+use Symfony\Component\Lock\Store\InMemoryStore;
+use Symfony\Component\Messenger\Attribute\AsMessageHandler;
+use Symfony\Component\Messenger\Attribute\AsMessageMiddleware;
+use Symfony\Component\Messenger\Envelope;
+use Symfony\Component\Messenger\Event\WorkerMessageFailedEvent;
+use Symfony\Component\Messenger\EventListener\StopWorkerOnMessageLimitListener;
+use Symfony\Component\Messenger\Exception\HandlerFailedException;
+use Symfony\Component\Messenger\Exception\InvalidArgumentException;
+use Symfony\Component\Messenger\Exception\InvalidMessageSignatureException;
+use Symfony\Component\Messenger\Exception\MessageDecodingFailedException;
+use Symfony\Component\Messenger\Message\RedispatchMessage;
 use Symfony\Component\Messenger\MessageBusInterface;
 use Symfony\Component\Messenger\MessengerBundle;
+use Symfony\Component\Messenger\Middleware\MiddlewareInterface;
+use Symfony\Component\Messenger\Middleware\StackInterface;
+use Symfony\Component\Messenger\Stamp\BusNameStamp;
+use Symfony\Component\Messenger\Stamp\CausationStamp;
+use Symfony\Component\Messenger\Stamp\CorrelationStamp;
+use Symfony\Component\Messenger\Stamp\DeduplicateStamp;
+use Symfony\Component\Messenger\Stamp\DispatchAfterCurrentBusStamp;
 use Symfony\Component\Messenger\Stamp\ErrorDetailsStamp;
+use Symfony\Component\Messenger\Stamp\HandledStamp;
+use Symfony\Component\Messenger\Stamp\MessageIdStamp;
+use Symfony\Component\Messenger\Stamp\PropagatedStampInterface;
+use Symfony\Component\Messenger\Stamp\ReceivedStamp;
 use Symfony\Component\Messenger\Stamp\RedeliveryStamp;
 use Symfony\Component\Messenger\Stamp\SentToFailureTransportStamp;
+use Symfony\Component\Messenger\Stamp\TrustStamp;
+use Symfony\Component\Messenger\Stamp\UnverifiedDecodingFailureStamp;
+use Symfony\Component\Messenger\Tests\Fixtures\DummyCommand;
 use Symfony\Component\Messenger\Tests\Fixtures\DummyMessage;
+use Symfony\Component\Messenger\Tests\Fixtures\DummyMessageInterface;
 use Symfony\Component\Messenger\Tests\Fixtures\FailingDummyMessageHandler;
+use Symfony\Component\Messenger\Tests\Fixtures\SecondMessage;
+use Symfony\Component\Messenger\Tests\Fixtures\ThirdMessage;
+use Symfony\Component\Messenger\Transport\CloseableTransportInterface;
 use Symfony\Component\Messenger\Transport\InMemory\InMemoryTransport;
+use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
+use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
+use Symfony\Component\Messenger\Transport\Serialization\StampHeaderMapperInterface;
+use Symfony\Component\Messenger\Transport\TransportFactoryInterface;
+use Symfony\Component\Messenger\Transport\TransportInterface;
+use Symfony\Component\Messenger\Worker;
+use Symfony\Component\Serializer\Encoder\JsonEncoder;
+use Symfony\Component\Serializer\Normalizer\ObjectNormalizer;
+use Symfony\Component\Serializer\Serializer;
+use Symfony\Component\Uid\Uuid;
+
+use function Symfony\Component\DependencyInjection\Loader\Configurator\inline_service;
 
 class MessengerBundleTest extends TestCase
 {
@@ -53,6 +103,52 @@ class MessengerBundleTest extends TestCase
 
         $bus->dispatch(new DummyMessage('hello'));
         $this->assertCount(1, $transport->getSent());
+    }
+
+    public function testMiddlewareDeclaredWithTheAttributeRunsInTheOrderOfItsConstraints()
+    {
+        $kernel = new TestAttributeMiddlewareKernel('test', true, $this->varDir);
+        $kernel->boot();
+        AttributeRecordingMiddleware::$calls = [];
+
+        $kernel->getContainer()->get('test.messenger.default_bus')->dispatch(new DummyMessage('hello'));
+
+        $this->assertSame([SecondAttributeMiddleware::class, FirstAttributeMiddleware::class], AttributeRecordingMiddleware::$calls);
+    }
+
+    public function testABusDispatchesOnlyTheMessagesOfItsTypes()
+    {
+        $kernel = new TestTypedBusesKernel('test', true, $this->varDir);
+        $kernel->boot();
+        $container = $kernel->getContainer();
+
+        $this->assertSame('Handled "Hey"', $container->get('test.query.bus')->dispatch(new DummyMessage('Hey'))->last(HandledStamp::class)?->getResult());
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage(\sprintf('This bus only dispatches messages of type "%s", "%s" given.', DummyCommand::class, DummyMessage::class));
+
+        $container->get('test.command.bus')->dispatch(new DummyMessage('Hey'));
+    }
+
+    public function testAllTheHandlersOfAMessageRunOnABusThatDispatchesIt()
+    {
+        $kernel = new TestTypedBusesKernel('test', true, $this->varDir);
+        $kernel->boot();
+
+        $envelope = $kernel->getContainer()->get('test.query.bus')->dispatch(new AuditedDummyMessage('Hey'));
+
+        $this->assertCount(2, $envelope->all(HandledStamp::class));
+    }
+
+    public function testABusCanThrowTheExceptionOfTheFailingHandler()
+    {
+        $kernel = new TestTypedBusesKernel('test', true, $this->varDir);
+        $kernel->boot();
+
+        $this->expectException(\DomainException::class);
+        $this->expectExceptionMessage('The command failed.');
+
+        $kernel->getContainer()->get('test.command.bus')->dispatch(new DummyCommand());
     }
 
     public function testTheServicesNeedingAnotherBundleAreDropped()
@@ -91,6 +187,306 @@ class MessengerBundleTest extends TestCase
         $this->assertSame('Handling "Hey" failed 3 time(s).', $failed->last(ErrorDetailsStamp::class)?->getExceptionMessage());
         $this->assertCount(3, $failed->all(RedeliveryStamp::class));
     }
+
+    #[DataProvider('provideDefaultLockFactories')]
+    public function testDeduplicationUsesTheConfiguredLockFactory(bool $withDefaultLockFactory)
+    {
+        $kernel = new TestDeduplicationKernel('test', true, $this->varDir, 'lock.dedup.factory', $withDefaultLockFactory);
+        $kernel->boot();
+        $container = $kernel->getContainer();
+        $bus = $container->get('test.messenger.default_bus');
+        $transport = $container->get('test.messenger.transport.async');
+
+        $envelope = $bus->dispatch(new DummyMessage('hello'), [new DeduplicateStamp('message')]);
+        $bus->dispatch(new DummyMessage('hello again'), [new DeduplicateStamp('message')]);
+
+        $this->assertCount(1, $transport->getSent());
+        $lock = $container->get('test.lock.dedup.factory')->createLock('message');
+        $this->assertFalse($lock->acquire());
+
+        $container->get('test.event_dispatcher')->dispatch(new WorkerMessageFailedEvent($envelope, 'async', new \RuntimeException('Handling failed.')));
+
+        $this->assertTrue($lock->acquire());
+        $lock->release();
+
+        $bus->dispatch(new DummyMessage('hello after failure'), [new DeduplicateStamp('message')]);
+
+        $this->assertCount(2, $transport->getSent());
+    }
+
+    public static function provideDefaultLockFactories(): iterable
+    {
+        yield 'without a default factory' => [false];
+        yield 'with a default factory' => [true];
+    }
+
+    public function testAMissingDeduplicationLockFactoryIsReported()
+    {
+        $kernel = new TestDeduplicationKernel('test', true, $this->varDir, 'lock.missing.factory');
+
+        $this->expectException(ServiceNotFoundException::class);
+        $this->expectExceptionMessage('The service "messenger.middleware.deduplicate_middleware" has a dependency on a non-existent service "lock.missing.factory".');
+
+        $kernel->boot();
+    }
+
+    public function testAReplayedDecodingFailureKeepsTheIdentityAndThePropagatedStampsOfItsMessage()
+    {
+        $kernel = new TestFlowContextKernel('test', true, $this->varDir);
+        $kernel->boot();
+        FlowContextHandler::$handled = [];
+
+        $encoded = new PhpSerializer()->encode(new Envelope(new DummyMessage('Hey'), [
+            new BusNameStamp('messenger.bus.default'),
+            new FlowTenantStamp('t1'),
+            new MessageIdStamp('original-id'),
+            new CorrelationStamp('original-correlation'),
+        ]));
+        // what PhpSerializer::decode() returns for a body it cannot decode: the bus name only
+        $failure = MessageDecodingFailedException::wrap($encoded, 'Could not decode Envelope.')->with(new BusNameStamp('messenger.bus.default'), new ReceivedStamp('async'));
+
+        $kernel->getContainer()->get('test.messenger.default_bus')->dispatch($failure);
+
+        $this->assertCount(2, FlowContextHandler::$handled);
+        [$decoded, $child] = FlowContextHandler::$handled;
+
+        $this->assertInstanceOf(DummyMessage::class, $decoded->getMessage());
+        $this->assertSame(['original-id'], array_map(static fn (MessageIdStamp $stamp) => $stamp->getId(), $decoded->all(MessageIdStamp::class)));
+        $this->assertSame(['original-correlation'], array_map(static fn (CorrelationStamp $stamp) => $stamp->getId(), $decoded->all(CorrelationStamp::class)));
+
+        $this->assertInstanceOf(SecondMessage::class, $child->getMessage());
+        $this->assertSame(['t1'], array_map(static fn (FlowTenantStamp $stamp) => $stamp->tenant, $child->all(FlowTenantStamp::class)));
+        $this->assertSame('original-correlation', $child->last(CorrelationStamp::class)?->getId());
+        $this->assertSame('original-id', $child->last(CausationStamp::class)?->getId());
+    }
+
+    public function testTheStampsOfAnUnverifiedDecodingFailureDoNotReachWhatItsSignedMessageDispatches()
+    {
+        $kernel = new TestFlowContextKernel('test', true, $this->varDir);
+        $kernel->boot();
+        FlowContextHandler::$handled = [];
+
+        $encoded = new PhpSerializer()->encode(new Envelope(new DummyMessage('Hey'), [new BusNameStamp('messenger.bus.default'), new FlowTenantStamp('good')]));
+        $unverifiedStamps = [new BusNameStamp('messenger.bus.default'), new FlowTenantStamp('evil')];
+        $failure = MessageDecodingFailedException::wrap($encoded, 'Could not retrieve the claim.')
+            ->with(...$unverifiedStamps)
+            ->with(new ReceivedStamp('async'), new UnverifiedDecodingFailureStamp($unverifiedStamps, [DummyMessage::class]));
+
+        $kernel->getContainer()->get('test.messenger.default_bus')->dispatch($failure);
+
+        $this->assertCount(2, FlowContextHandler::$handled);
+        [$decoded, $child] = FlowContextHandler::$handled;
+
+        $this->assertSame(['good'], array_map(static fn (FlowTenantStamp $stamp) => $stamp->tenant, $decoded->all(FlowTenantStamp::class)));
+        $this->assertSame(['good'], array_map(static fn (FlowTenantStamp $stamp) => $stamp->tenant, $child->all(FlowTenantStamp::class)));
+    }
+
+    public function testAMessageHandledThroughTheSyncTransportIsNotItsOwnCause()
+    {
+        $kernel = new TestFlowContextKernel('test', true, $this->varDir);
+        $kernel->boot();
+        FlowContextHandler::$handled = [];
+
+        $kernel->getContainer()->get('test.messenger.default_bus')->dispatch(new ThirdMessage());
+
+        $this->assertCount(2, FlowContextHandler::$handled);
+        [$handled, $child] = FlowContextHandler::$handled;
+
+        $this->assertInstanceOf(ThirdMessage::class, $handled->getMessage());
+        $this->assertNotNull($handled->last(ReceivedStamp::class));
+        $id = $handled->last(MessageIdStamp::class)->getId();
+        $this->assertNull($handled->last(CausationStamp::class));
+        $this->assertSame($id, $handled->last(CorrelationStamp::class)?->getId());
+
+        $this->assertInstanceOf(SecondMessage::class, $child->getMessage());
+        $this->assertSame($id, $child->last(CausationStamp::class)?->getId());
+        $this->assertSame($id, $child->last(CorrelationStamp::class)?->getId());
+    }
+
+    public function testAnApplicationDefinedMessageIdGeneratorIsUsed()
+    {
+        $kernel = new TestMessageIdGeneratorKernel('test', true, $this->varDir);
+        $kernel->boot();
+
+        $envelope = $kernel->getContainer()->get('test.messenger.default_bus')->dispatch(new DummyMessage('Hey'));
+
+        $this->assertSame('app-message-id', $envelope->last(MessageIdStamp::class)?->getId());
+    }
+
+    #[RunInSeparateProcess]
+    public function testAnApplicationDefinedMessageIdGeneratorIsUsedWithoutTheUidComponent()
+    {
+        self::hideTheUidComponent();
+
+        $kernel = new TestMessageIdGeneratorKernel('test', true, $this->varDir);
+        $kernel->boot();
+
+        $envelope = $kernel->getContainer()->get('test.messenger.default_bus')->dispatch(new DummyMessage('Hey'));
+
+        $this->assertSame('app-message-id', $envelope->last(MessageIdStamp::class)?->getId());
+    }
+
+    #[RunInSeparateProcess]
+    public function testIdentityStampsGenerateTheirOwnIdsWithoutTheUidComponent()
+    {
+        self::hideTheUidComponent();
+
+        $kernel = new TestFlowContextKernel('test', true, $this->varDir);
+        $kernel->boot();
+
+        $envelope = $kernel->getContainer()->get('test.messenger.default_bus')->dispatch(new SecondMessage());
+
+        $this->assertMatchesRegularExpression('/^[0-9a-f]{32}$/', $envelope->last(MessageIdStamp::class)->getId());
+    }
+
+    public function testAMessageHandledAfterTheCurrentBusIsTheContextOfWhatItsHandlerDispatches()
+    {
+        $kernel = new TestFlowContextKernel('test', true, $this->varDir);
+        $kernel->boot();
+        FlowContextHandler::$handled = [];
+
+        $kernel->getContainer()->get('test.messenger.default_bus')->dispatch(new FlowDelayingMessage(), [new FlowTenantStamp('root')]);
+
+        $this->assertCount(3, FlowContextHandler::$handled);
+        [$root, $delayed, $child] = FlowContextHandler::$handled;
+
+        $this->assertInstanceOf(FlowDelayingMessage::class, $root->getMessage());
+        $this->assertInstanceOf(FlowDelayedMessage::class, $delayed->getMessage());
+        $this->assertInstanceOf(SecondMessage::class, $child->getMessage());
+
+        $rootId = $root->last(MessageIdStamp::class)->getId();
+        $delayedId = $delayed->last(MessageIdStamp::class)->getId();
+        $this->assertSame($rootId, $delayed->last(CausationStamp::class)?->getId());
+        $this->assertSame($delayedId, $child->last(CausationStamp::class)?->getId());
+        $this->assertSame($rootId, $child->last(CorrelationStamp::class)?->getId());
+        $this->assertSame(['delayed'], array_map(static fn (FlowTenantStamp $stamp) => $stamp->tenant, $delayed->all(FlowTenantStamp::class)));
+        $this->assertSame(['delayed'], array_map(static fn (FlowTenantStamp $stamp) => $stamp->tenant, $child->all(FlowTenantStamp::class)));
+    }
+
+    public function testOnlyTheTransportsThatSignEveryMessageSignWhenNoHandlerAsksForIt()
+    {
+        $kernel = new TestSigningKernel('test', true, $this->varDir);
+        $kernel->boot();
+        $container = $kernel->getContainer();
+
+        $container->get('test.messenger.default_bus')->dispatch(new DummyMessage('hello'));
+
+        $this->assertCount(1, $signed = $container->get('test.messenger.transport.signed')->getSent());
+        $this->assertTrue($signed[0]->last(TrustStamp::class)?->isTrusted());
+
+        $this->assertCount(1, $plain = $container->get('test.messenger.transport.plain')->getSent());
+        $this->assertInstanceOf(DummyMessage::class, $plain[0]->getMessage());
+        $this->assertNull($plain[0]->last(TrustStamp::class));
+
+        $this->assertInstanceOf(PhpSerializer::class, $container->get('test.messenger.transport.serializer_locator')->get('plain'));
+    }
+
+    public function testTheSyncTransportSendsASignedMessageToAFailureTransportThatSignsEveryMessage()
+    {
+        $kernel = new TestSignedSyncRetryKernel('test', true, $this->varDir);
+        $kernel->boot();
+        $container = $kernel->getContainer();
+
+        FailingDummyMessageHandler::$calls = 0;
+
+        $container->get('test.messenger.default_bus')->dispatch(new DummyMessage('Hey'));
+
+        $this->assertSame(2, FailingDummyMessageHandler::$calls);
+        $this->assertCount(1, $failed = $container->get('test.messenger.transport.failed')->getSent());
+        $this->assertInstanceOf(DummyMessage::class, $failed[0]->getMessage());
+        $this->assertTrue($failed[0]->last(TrustStamp::class)?->isTrusted());
+        $this->assertSame('sync_with_retry', $failed[0]->last(SentToFailureTransportStamp::class)?->getOriginalReceiverName());
+    }
+
+    public function testAFailureTransportThatSignsEveryMessageKeepsTheFailuresOfATransportThatDoesNotSignAsUnverified()
+    {
+        $kernel = new TestSignedFailureTransportKernel('test', true, $this->varDir);
+        $kernel->boot();
+        $serializer = $kernel->getContainer()->get('test.messenger.transport.serializer_locator')->get('failed');
+
+        $failed = $serializer->decode($encoded = $serializer->encode(new Envelope(new DummyMessage('hello'), [new ReceivedStamp('plain')])));
+
+        $this->assertSame('unverified', $encoded['headers']['Sign-Trust']);
+        $this->assertInstanceOf(DummyMessage::class, $failed->getMessage());
+        $this->assertFalse($failed->last(TrustStamp::class)?->isTrusted());
+
+        $failed = $serializer->decode($serializer->encode(new Envelope(new RedispatchMessage(new DummyMessage('hello'), 'plain'), [new ReceivedStamp('plain')])));
+
+        $this->assertInstanceOf(RedispatchMessage::class, $failed->getMessage());
+        $this->assertFalse($failed->last(TrustStamp::class)?->isTrusted());
+
+        try {
+            $kernel->getContainer()->get('test.messenger.default_bus')->dispatch($failed);
+            $this->fail('The handler of a message signed as unverified must refuse it.');
+        } catch (HandlerFailedException $e) {
+            $this->assertInstanceOf(InvalidMessageSignatureException::class, current($e->getWrappedExceptions()));
+        }
+    }
+
+    public function testTheInteropSerializerMapsTheIdentityStampsAndTheStampsOfTheAutoconfiguredMappers()
+    {
+        $kernel = new TestInteropSerializerKernel('test', true, $this->varDir);
+        $kernel->boot();
+        $serializer = $kernel->getContainer()->get('test.messenger.transport.interop_serializer');
+
+        $encoded = $serializer->encode(new Envelope(new DummyMessage('Hey'), [new MessageIdStamp('message-id'), new FlowTenantStamp('acme')]));
+
+        $this->assertSame('message-id', $encoded['headers']['message_id'] ?? null);
+        $this->assertSame('acme', $encoded['headers']['tenant'] ?? null);
+
+        $envelope = $serializer->decode($encoded);
+
+        $this->assertSame('message-id', $envelope->last(MessageIdStamp::class)?->getId());
+        $this->assertSame('acme', $envelope->last(FlowTenantStamp::class)?->tenant);
+    }
+
+    public function testAnOutboxCreatedFromADsnForwardsItsMessagesWhenConsumed()
+    {
+        $kernel = new TestOutboxDsnKernel('test', true, $this->varDir);
+        $kernel->boot();
+        $container = $kernel->getContainer();
+        $bus = $container->get('test.messenger.default_bus');
+        $orders = $container->get('test.messenger.receiver_locator')->get('orders');
+        $outbox = $container->get('test.messenger.receiver_locator')->get('orders.outbox');
+
+        $bus->dispatch(new DummyMessage('Hey'));
+
+        $this->assertSame([], $orders->get());
+        $this->assertCount(1, $outbox->get());
+
+        $dispatcher = new EventDispatcher();
+        $dispatcher->addSubscriber(new StopWorkerOnMessageLimitListener(1));
+        new Worker(['orders.outbox' => $outbox], $bus, $dispatcher)->run();
+
+        $this->assertSame([], $outbox->get());
+        $this->assertCount(1, $forwarded = $orders->get());
+        $this->assertEquals(new DummyMessage('Hey'), $forwarded[0]->getMessage());
+    }
+
+    public function testTheTransportsAreClosedWhenTheKernelShutsDown()
+    {
+        $kernel = new TestCloseableTransportKernel('test', true, $this->varDir);
+        $kernel->boot();
+        $container = $kernel->getContainer();
+        $transport = $container->get('test.messenger.transport.async');
+        $this->assertInstanceOf(InMemoryTransport::class, $container->get('test.messenger.transport.memory'));
+
+        $container->get('test.messenger.default_bus')->dispatch(new DummyMessage('Hey'));
+        $this->assertTrue($transport->connected);
+
+        $container->get('services_resetter')->reset();
+        $this->assertTrue($transport->connected);
+
+        $kernel->shutdown();
+        $this->assertFalse($transport->connected);
+        $this->assertSame(1, $transport->closeCount);
+    }
+
+    private static function hideTheUidComponent(): void
+    {
+        ClassExistsMock::register(ContainerBuilder::class);
+        ClassExistsMock::withMockedClasses([Uuid::class => false]);
+    }
 }
 
 class TestMessengerKernel extends AbstractKernel
@@ -122,6 +518,48 @@ class TestMessengerKernel extends AbstractKernel
             ->alias('test.messenger.default_bus', 'messenger.default_bus')->public()
             ->alias('test.messenger.transport.async', 'messenger.transport.async')->public()
         ;
+    }
+}
+
+class TestDeduplicationKernel extends AbstractKernel
+{
+    use KernelTrait;
+
+    public function __construct(string $env, bool $debug, private string $dir, private string $lockFactory = 'lock.dedup.factory', private bool $withDefaultLockFactory = false)
+    {
+        parent::__construct($env, $debug);
+    }
+
+    public function getProjectDir(): string
+    {
+        return $this->dir;
+    }
+
+    public function registerBundles(): iterable
+    {
+        yield new MessengerBundle();
+    }
+
+    private function configureContainer(ContainerConfigurator $container): void
+    {
+        $container->extension('messenger', [
+            'deduplication' => ['lock_factory' => $this->lockFactory],
+            'transports' => ['async' => ['dsn' => 'in-memory://', 'retry_strategy' => ['max_retries' => 0]]],
+            'routing' => [DummyMessage::class => 'async'],
+        ]);
+        $services = $container->services()
+            ->set('lock.dedup.factory', LockFactory::class)
+                ->args([inline_service(InMemoryStore::class)])
+            ->alias('test.lock.dedup.factory', 'lock.dedup.factory')->public()
+            ->alias('test.messenger.default_bus', 'messenger.default_bus')->public()
+            ->alias('test.messenger.transport.async', 'messenger.transport.async')->public()
+            ->alias('test.event_dispatcher', 'event_dispatcher')->public()
+        ;
+
+        if ($this->withDefaultLockFactory) {
+            $services->set('lock.factory', LockFactory::class)
+                ->args([inline_service(InMemoryStore::class)]);
+        }
     }
 }
 
@@ -162,5 +600,548 @@ class TestSyncRetryKernel extends AbstractKernel
             ->alias('test.messenger.default_bus', 'messenger.default_bus')->public()
             ->alias('test.messenger.transport.failed', 'messenger.transport.failed')->public()
         ;
+    }
+}
+
+class TestFlowContextKernel extends AbstractKernel
+{
+    use KernelTrait;
+
+    public function __construct(string $env, bool $debug, private string $dir)
+    {
+        parent::__construct($env, $debug);
+    }
+
+    public function getProjectDir(): string
+    {
+        return $this->dir;
+    }
+
+    public function registerBundles(): iterable
+    {
+        yield new MessengerBundle();
+    }
+
+    private function configureContainer(ContainerConfigurator $container): void
+    {
+        $container->extension('messenger', [
+            'identity_stamps' => true,
+            'transports' => [
+                'async' => 'in-memory://',
+                'sync' => 'sync://',
+            ],
+            'routing' => [ThirdMessage::class => 'sync'],
+        ]);
+        $container->services()
+            ->set(FlowContextHandler::class)->autowire()->autoconfigure()
+            ->alias('test.messenger.default_bus', 'messenger.default_bus')->public()
+        ;
+    }
+}
+
+class TestMessageIdGeneratorKernel extends AbstractKernel
+{
+    use KernelTrait;
+
+    public function __construct(string $env, bool $debug, private string $dir)
+    {
+        parent::__construct($env, $debug);
+    }
+
+    public function getProjectDir(): string
+    {
+        return $this->dir;
+    }
+
+    public function registerBundles(): iterable
+    {
+        yield new MessengerBundle();
+    }
+
+    public static function generateMessageId(): string
+    {
+        return 'app-message-id';
+    }
+
+    private function configureContainer(ContainerConfigurator $container): void
+    {
+        $container->extension('messenger', [
+            'identity_stamps' => true,
+            'transports' => ['async' => 'in-memory://'],
+            'routing' => [DummyMessage::class => 'async'],
+        ]);
+        $container->services()
+            ->set('messenger.message_id_generator', \Closure::class)
+                ->factory([\Closure::class, 'fromCallable'])
+                ->args([[self::class, 'generateMessageId']])
+            ->alias('test.messenger.default_bus', 'messenger.default_bus')->public()
+        ;
+    }
+}
+
+class FlowContextHandler
+{
+    /** @var list<Envelope> */
+    public static array $handled = [];
+
+    public function __construct(
+        private MessageBusInterface $bus,
+    ) {
+    }
+
+    #[AsMessageHandler]
+    public function onDummyMessage(DummyMessage $message, Envelope $envelope): void
+    {
+        self::$handled[] = $envelope;
+        $this->bus->dispatch(new SecondMessage());
+    }
+
+    #[AsMessageHandler]
+    public function onThirdMessage(ThirdMessage $message, Envelope $envelope): void
+    {
+        self::$handled[] = $envelope;
+        $this->bus->dispatch(new SecondMessage());
+    }
+
+    #[AsMessageHandler]
+    public function onSecondMessage(SecondMessage $message, Envelope $envelope): void
+    {
+        self::$handled[] = $envelope;
+    }
+
+    #[AsMessageHandler]
+    public function onFlowDelayingMessage(FlowDelayingMessage $message, Envelope $envelope): void
+    {
+        self::$handled[] = $envelope;
+        $this->bus->dispatch(new FlowDelayedMessage(), [new DispatchAfterCurrentBusStamp(), new FlowTenantStamp('delayed')]);
+    }
+
+    #[AsMessageHandler]
+    public function onFlowDelayedMessage(FlowDelayedMessage $message, Envelope $envelope): void
+    {
+        self::$handled[] = $envelope;
+        $this->bus->dispatch(new SecondMessage());
+    }
+}
+
+class FlowDelayingMessage
+{
+}
+
+class FlowDelayedMessage
+{
+}
+
+class FlowTenantStamp implements PropagatedStampInterface
+{
+    public function __construct(
+        public readonly string $tenant,
+    ) {
+    }
+}
+
+class TestSigningKernel extends AbstractKernel
+{
+    use KernelTrait;
+
+    public function __construct(string $env, bool $debug, private string $dir)
+    {
+        parent::__construct($env, $debug);
+    }
+
+    public function getProjectDir(): string
+    {
+        return $this->dir;
+    }
+
+    public function registerBundles(): iterable
+    {
+        yield new MessengerBundle();
+    }
+
+    protected function build(ContainerBuilder $container): void
+    {
+        // the handler of RedispatchMessage asks for a signature: remove it so that no handler does
+        $container->addCompilerPass(new class implements CompilerPassInterface {
+            public function process(ContainerBuilder $container): void
+            {
+                $container->removeDefinition('messenger.redispatch_message_handler');
+            }
+        }, PassConfig::TYPE_BEFORE_OPTIMIZATION, 100);
+    }
+
+    private function configureContainer(ContainerConfigurator $container): void
+    {
+        $container->parameters()->set('kernel.secret', 's3cr3t');
+        $container->extension('messenger', [
+            'transports' => [
+                'signed' => ['dsn' => 'in-memory://?serialize=true', 'sign' => true],
+                'plain' => 'in-memory://?serialize=true',
+            ],
+            'routing' => [DummyMessage::class => ['signed', 'plain']],
+        ]);
+        $container->services()
+            ->alias('test.messenger.default_bus', 'messenger.default_bus')->public()
+            ->alias('test.messenger.transport.signed', 'messenger.transport.signed')->public()
+            ->alias('test.messenger.transport.plain', 'messenger.transport.plain')->public()
+            ->alias('test.messenger.transport.serializer_locator', 'messenger.transport.serializer_locator')->public()
+        ;
+    }
+}
+
+class TestSignedSyncRetryKernel extends AbstractKernel
+{
+    use KernelTrait;
+
+    public function __construct(string $env, bool $debug, private string $dir)
+    {
+        parent::__construct($env, $debug);
+    }
+
+    public function getProjectDir(): string
+    {
+        return $this->dir;
+    }
+
+    public function registerBundles(): iterable
+    {
+        yield new MessengerBundle();
+    }
+
+    private function configureContainer(ContainerConfigurator $container): void
+    {
+        $container->parameters()->set('kernel.secret', 's3cr3t');
+        $container->extension('messenger', [
+            'failure_transport' => 'failed',
+            'transports' => [
+                'sync_with_retry' => [
+                    'dsn' => 'sync://?retry=true&failure_transport=true',
+                    'retry_strategy' => ['max_retries' => 1],
+                    'sign' => true,
+                ],
+                'failed' => ['dsn' => 'in-memory://?serialize=true', 'sign' => true],
+            ],
+            'routing' => [DummyMessage::class => 'sync_with_retry'],
+        ]);
+        $container->services()
+            ->set(FailingDummyMessageHandler::class)->autoconfigure()
+            ->alias('test.messenger.default_bus', 'messenger.default_bus')->public()
+            ->alias('test.messenger.transport.failed', 'messenger.transport.failed')->public()
+        ;
+    }
+}
+
+class TestSignedFailureTransportKernel extends AbstractKernel
+{
+    use KernelTrait;
+
+    public function __construct(string $env, bool $debug, private string $dir)
+    {
+        parent::__construct($env, $debug);
+    }
+
+    public function getProjectDir(): string
+    {
+        return $this->dir;
+    }
+
+    public function registerBundles(): iterable
+    {
+        yield new MessengerBundle();
+    }
+
+    private function configureContainer(ContainerConfigurator $container): void
+    {
+        $container->parameters()->set('kernel.secret', 's3cr3t');
+        $container->extension('messenger', [
+            'failure_transport' => 'failed',
+            'transports' => [
+                'plain' => 'in-memory://?serialize=true',
+                'failed' => ['dsn' => 'in-memory://?serialize=true', 'sign' => true],
+            ],
+        ]);
+        $container->services()
+            ->alias('test.messenger.default_bus', 'messenger.default_bus')->public()
+            ->alias('test.messenger.transport.serializer_locator', 'messenger.transport.serializer_locator')->public()
+        ;
+    }
+}
+
+class TestAttributeMiddlewareKernel extends AbstractKernel
+{
+    use KernelTrait;
+
+    public function __construct(string $env, bool $debug, private string $dir)
+    {
+        parent::__construct($env, $debug);
+    }
+
+    public function getProjectDir(): string
+    {
+        return $this->dir;
+    }
+
+    public function registerBundles(): iterable
+    {
+        yield new MessengerBundle();
+    }
+
+    private function configureContainer(ContainerConfigurator $container): void
+    {
+        $container->extension('messenger', [
+            'transports' => ['async' => 'in-memory://'],
+            'routing' => [DummyMessage::class => 'async'],
+        ]);
+        $container->services()
+            ->set(FirstAttributeMiddleware::class)->autowire()->autoconfigure()
+            ->set(SecondAttributeMiddleware::class)->autowire()->autoconfigure()
+            ->alias('test.messenger.default_bus', 'messenger.default_bus')->public()
+        ;
+    }
+}
+
+class TestTypedBusesKernel extends AbstractKernel
+{
+    use KernelTrait;
+
+    public function __construct(string $env, bool $debug, private string $dir)
+    {
+        parent::__construct($env, $debug);
+    }
+
+    public function getProjectDir(): string
+    {
+        return $this->dir;
+    }
+
+    public function registerBundles(): iterable
+    {
+        yield new MessengerBundle();
+    }
+
+    private function configureContainer(ContainerConfigurator $container): void
+    {
+        $container->extension('messenger', [
+            'default_bus' => 'command.bus',
+            'buses' => [
+                'command.bus' => ['messages' => DummyCommand::class, 'unwrap_exceptions' => true],
+                'query.bus' => ['messages' => [DummyMessageInterface::class]],
+            ],
+        ]);
+        $container->services()
+            ->set(TypedBusesHandler::class)->autoconfigure()
+            ->alias('test.command.bus', 'command.bus')->public()
+            ->alias('test.query.bus', 'query.bus')->public()
+        ;
+    }
+}
+
+abstract class AttributeRecordingMiddleware implements MiddlewareInterface
+{
+    /** @var list<class-string> */
+    public static array $calls = [];
+
+    public function handle(Envelope $envelope, StackInterface $stack): Envelope
+    {
+        self::$calls[] = static::class;
+
+        return $stack->next()->handle($envelope, $stack);
+    }
+}
+
+#[AsMessageMiddleware(bus: 'messenger.bus.default', after: SecondAttributeMiddleware::class)]
+class FirstAttributeMiddleware extends AttributeRecordingMiddleware
+{
+}
+
+#[AsMessageMiddleware(bus: 'messenger.bus.default')]
+class SecondAttributeMiddleware extends AttributeRecordingMiddleware
+{
+}
+
+class TypedBusesHandler
+{
+    #[AsMessageHandler]
+    public function onCommand(DummyCommand $command): void
+    {
+        throw new \DomainException('The command failed.');
+    }
+
+    #[AsMessageHandler]
+    public function onQuery(DummyMessage $query): string
+    {
+        return \sprintf('Handled "%s"', $query->getMessage());
+    }
+
+    #[AsMessageHandler]
+    public function onAudited(AuditedMessage $message): void
+    {
+    }
+}
+
+interface AuditedMessage
+{
+}
+
+class AuditedDummyMessage extends DummyMessage implements AuditedMessage
+{
+}
+
+class TestInteropSerializerKernel extends AbstractKernel
+{
+    use KernelTrait;
+
+    public function __construct(string $env, bool $debug, private string $dir)
+    {
+        parent::__construct($env, $debug);
+    }
+
+    public function getProjectDir(): string
+    {
+        return $this->dir;
+    }
+
+    public function registerBundles(): iterable
+    {
+        yield new MessengerBundle();
+    }
+
+    private function configureContainer(ContainerConfigurator $container): void
+    {
+        $container->extension('messenger', [
+            'transports' => ['orders' => ['dsn' => 'in-memory://', 'serializer' => 'messenger.transport.interop_serializer']],
+        ]);
+        $container->services()
+            ->set('serializer', Serializer::class)
+                ->args([[inline_service(ObjectNormalizer::class)], [inline_service(JsonEncoder::class)]])
+            ->set(TenantStampHeaderMapper::class)->autoconfigure()
+            ->alias('test.messenger.transport.interop_serializer', 'messenger.transport.interop_serializer')->public()
+        ;
+    }
+}
+
+class TenantStampHeaderMapper implements StampHeaderMapperInterface
+{
+    public function toHeaders(Envelope $envelope): array
+    {
+        return ($stamp = $envelope->last(FlowTenantStamp::class)) ? ['tenant' => $stamp->tenant] : [];
+    }
+
+    public function toStamps(array $headers): array
+    {
+        return \is_string($tenant = $headers['tenant'] ?? null) ? [new FlowTenantStamp($tenant)] : [];
+    }
+}
+
+class TestOutboxDsnKernel extends AbstractKernel
+{
+    use KernelTrait;
+
+    public function __construct(string $env, bool $debug, private string $dir)
+    {
+        parent::__construct($env, $debug);
+    }
+
+    public function getProjectDir(): string
+    {
+        return $this->dir;
+    }
+
+    public function registerBundles(): iterable
+    {
+        yield new MessengerBundle();
+    }
+
+    private function configureContainer(ContainerConfigurator $container): void
+    {
+        $container->extension('messenger', [
+            'transports' => [
+                'orders' => ['dsn' => 'in-memory://', 'outbox' => 'in-memory://?serialize=true'],
+            ],
+            'routing' => [DummyMessage::class => 'orders'],
+        ]);
+        $container->services()
+            ->alias('test.messenger.default_bus', 'messenger.default_bus')->public()
+            ->alias('test.messenger.receiver_locator', 'messenger.receiver_locator')->public()
+        ;
+    }
+}
+
+class TestCloseableTransportKernel extends AbstractKernel
+{
+    use KernelTrait;
+
+    public function __construct(string $env, bool $debug, private string $dir)
+    {
+        parent::__construct($env, $debug);
+    }
+
+    public function getProjectDir(): string
+    {
+        return $this->dir;
+    }
+
+    public function registerBundles(): iterable
+    {
+        yield new MessengerBundle();
+    }
+
+    private function configureContainer(ContainerConfigurator $container): void
+    {
+        $container->extension('messenger', [
+            'transports' => ['async' => 'closeable://', 'memory' => 'in-memory://'],
+            'routing' => [DummyMessage::class => 'async'],
+        ]);
+        $container->services()
+            ->set(CloseableTransportFactory::class)->tag('messenger.transport_factory')
+            ->alias('test.messenger.default_bus', 'messenger.default_bus')->public()
+            ->alias('test.messenger.transport.async', 'messenger.transport.async')->public()
+            ->alias('test.messenger.transport.memory', 'messenger.transport.memory')->public()
+        ;
+    }
+}
+
+class CloseableTransportFactory implements TransportFactoryInterface
+{
+    public function createTransport(string $dsn, array $options, SerializerInterface $serializer): TransportInterface
+    {
+        return new CloseableTransport();
+    }
+
+    public function supports(string $dsn, array $options): bool
+    {
+        return str_starts_with($dsn, 'closeable://');
+    }
+}
+
+class CloseableTransport implements TransportInterface, CloseableTransportInterface
+{
+    public bool $connected = false;
+    public int $closeCount = 0;
+
+    public function get(): iterable
+    {
+        return [];
+    }
+
+    public function ack(Envelope $envelope): void
+    {
+    }
+
+    public function reject(Envelope $envelope): void
+    {
+    }
+
+    public function send(Envelope $envelope): Envelope
+    {
+        $this->connected = true;
+
+        return $envelope;
+    }
+
+    public function close(): void
+    {
+        $this->connected = false;
+        ++$this->closeCount;
     }
 }

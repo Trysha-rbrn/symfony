@@ -100,9 +100,11 @@ trait ExpiringStoreTestTrait
         $store = $this->getStore();
 
         $store->save($key);
-        $store->putOffExpiration($key, 1);
+        $store->putOffExpiration($key, 10);
         $this->assertGreaterThanOrEqual(0, $key->getRemainingLifetime());
-        $this->assertLessThanOrEqual(1, $key->getRemainingLifetime());
+        $this->assertLessThanOrEqual(10, $key->getRemainingLifetime());
+
+        $store->delete($key);
     }
 
     public function testExpiredLockCleaned()
@@ -125,5 +127,7 @@ trait ExpiringStoreTestTrait
 
         $store->save($key2);
         $this->assertTrue($store->exists($key2));
+
+        $store->delete($key2);
     }
 }

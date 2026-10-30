@@ -11,13 +11,16 @@
 
 namespace Symfony\Component\HttpKernel\Tests;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\TestCase;
+use Symfony\Component\Config\ConfigCache;
 use Symfony\Component\Config\Loader\LoaderInterface;
 use Symfony\Component\DependencyInjection\Compiler\CompilerPassInterface;
 use Symfony\Component\DependencyInjection\Compiler\ResettableServicePass;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\ContainerInterface;
+use Symfony\Component\DependencyInjection\Definition;
 use Symfony\Component\DependencyInjection\Extension\ExtensionInterface;
 use Symfony\Component\DependencyInjection\Kernel\AbstractBundle;
 use Symfony\Component\DependencyInjection\Reference;
@@ -30,10 +33,13 @@ use Symfony\Component\HttpKernel\Bundle\Bundle;
 use Symfony\Component\HttpKernel\Bundle\BundleAdapter;
 use Symfony\Component\HttpKernel\Bundle\BundleInterface;
 use Symfony\Component\HttpKernel\CacheWarmer\WarmableInterface;
+use Symfony\Component\HttpKernel\HttpCache\HttpCache;
+use Symfony\Component\HttpKernel\HttpCache\Store;
 use Symfony\Component\HttpKernel\HttpKernel;
 use Symfony\Component\HttpKernel\HttpKernelInterface;
 use Symfony\Component\HttpKernel\Kernel;
 use Symfony\Component\HttpKernel\KernelInterface;
+use Symfony\Component\HttpKernel\TerminableInterface;
 use Symfony\Component\HttpKernel\Tests\Fixtures\KernelWithoutBundles;
 use Symfony\Component\HttpKernel\Tests\Fixtures\ResettableService;
 
@@ -116,6 +122,56 @@ class KernelTest extends TestCase
 
         $this->assertFileDoesNotExist($legacyContainerDir);
         $this->assertFileDoesNotExist($legacyContainerDir.'.legacy');
+    }
+
+    #[DataProvider('provideFailingContainerBuilds')]
+    public function testContainerBuildLockIsReleasedWhenContainerFailsToBuild(\Closure $createKernel, string $exceptionMessage)
+    {
+        $cacheDir = __DIR__.'/Fixtures/var/cache/container-build-lock-'.uniqid('', true);
+
+        $kernel = $createKernel($cacheDir);
+
+        try {
+            $kernel->boot();
+            $this->fail('A failing container build should throw a RuntimeException.');
+        } catch (\RuntimeException $e) {
+            $this->assertSame($exceptionMessage, $e->getMessage());
+        }
+
+        $lockFiles = glob($cacheDir.'/*.php.lock');
+        $this->assertCount(1, $lockFiles, 'A failed boot should leave exactly one build lock file behind.');
+
+        $probe = fopen($lockFiles[0], 'r+');
+        $this->assertIsResource($probe);
+
+        // The probe must never block: when the lock is still held, the test has to fail instead of hanging.
+        $this->assertTrue(flock($probe, \LOCK_EX | \LOCK_NB), 'The build lock should be released when building the container fails.');
+
+        flock($probe, \LOCK_UN);
+        fclose($probe);
+
+        try {
+            $createKernel($cacheDir)->boot();
+            $this->fail('A second boot on the same lock path should throw the same RuntimeException.');
+        } catch (\RuntimeException $e) {
+            $this->assertSame($exceptionMessage, $e->getMessage());
+        }
+    }
+
+    public static function provideFailingContainerBuilds(): iterable
+    {
+        yield 'build failure' => [static fn (string $cacheDir): BrokenBuildContainerKernel => new BrokenBuildContainerKernel($cacheDir), 'Container build failed'];
+        yield 'compile failure' => [static fn (string $cacheDir): BrokenCompileContainerKernel => new BrokenCompileContainerKernel($cacheDir), 'Container compile failed'];
+        yield 'dump failure' => [static fn (string $cacheDir): BrokenDumpContainerKernel => new BrokenDumpContainerKernel($cacheDir), 'Container dump failed'];
+    }
+
+    public function testContainerBuildLockIsHeldWhileDumpingAndReleasedAfterBoot()
+    {
+        $kernel = new DumpProbingKernel(__DIR__.'/Fixtures/var/cache/container-build-lock-'.uniqid('', true));
+        $kernel->boot();
+
+        $this->assertTrue($kernel->lockHeldWhileDumping, 'The build lock should be held while the container is dumped.');
+        $this->assertFalse($kernel->isLockHeld(), 'The build lock should be released once the kernel is booted.');
     }
 
     public function testBootInitializesBundlesAndContainer()
@@ -615,6 +671,50 @@ class KernelTest extends TestCase
         $this->assertSame('cached: /worker-second', $secondResponse->getContent());
     }
 
+    public function testTerminateGoesThroughHttpCache()
+    {
+        $httpKernel = new RoutingTerminableHttpKernel();
+
+        $kernel = new CustomProjectDirKernel(static function (ContainerBuilder $container) {
+            $container->register('kernel', CustomProjectDirKernel::class)
+                ->setSynthetic(true)
+                ->setPublic(true);
+            $container->register('http_cache', HttpCache::class)
+                ->setPublic(true)
+                ->setArguments([new Reference('kernel'), new Definition(Store::class, [__DIR__.'/Fixtures/var/http_cache'])]);
+        }, $httpKernel, 'http_cache_terminate');
+
+        $request = Request::create('/page');
+        $kernel->terminate($request, $kernel->handle($request));
+
+        $this->assertSame(1, $httpKernel->handleCount);
+        $this->assertSame(['page'], $httpKernel->terminatedRoutes);
+
+        $request = Request::create('/page');
+        $kernel->terminate($request, $kernel->handle($request));
+
+        $this->assertSame(1, $httpKernel->handleCount);
+        $this->assertSame(['page'], $httpKernel->terminatedRoutes);
+    }
+
+    public function testTerminateFallsBackToHttpKernelWhenHttpCacheIsNotTerminable()
+    {
+        $httpKernel = new RoutingTerminableHttpKernel();
+
+        $kernel = new CustomProjectDirKernel(static function (ContainerBuilder $container) {
+            $container->register('http_cache', RecordingHttpCache::class)
+                ->setPublic(true);
+        }, $httpKernel, 'http_cache_not_terminable');
+
+        $kernel->boot();
+
+        $request = Request::create('/page');
+        $kernel->terminate($request, $kernel->handle($request));
+
+        $this->assertSame(0, $httpKernel->handleCount);
+        $this->assertSame([null], $httpKernel->terminatedRoutes);
+    }
+
     #[Group('time-sensitive')]
     public function testKernelStartTimeIsResetWhileBootingAlreadyBootedKernel()
     {
@@ -758,7 +858,6 @@ class TestKernel implements HttpKernelInterface
     }
 }
 
-
 class CustomProjectDirKernel extends Kernel implements WarmableInterface
 {
     public bool $warmedUp = false;
@@ -805,6 +904,141 @@ class CustomProjectDirKernel extends Kernel implements WarmableInterface
     protected function getHttpKernel(): HttpKernelInterface
     {
         return $this->httpKernel;
+    }
+}
+
+class BrokenBuildContainerKernel extends Kernel
+{
+    public function __construct(
+        private readonly string $cacheDir,
+    ) {
+        parent::__construct('test', true);
+    }
+
+    public function registerBundles(): iterable
+    {
+        return [];
+    }
+
+    public function registerContainerConfiguration(LoaderInterface $loader): void
+    {
+    }
+
+    public function getCacheDir(): string
+    {
+        return $this->cacheDir;
+    }
+
+    protected function buildContainer(): ContainerBuilder
+    {
+        throw new \RuntimeException('Container build failed');
+    }
+}
+
+class BrokenCompileContainerKernel extends Kernel implements CompilerPassInterface
+{
+    public function __construct(
+        private readonly string $cacheDir,
+    ) {
+        parent::__construct('test', true);
+    }
+
+    public function registerBundles(): iterable
+    {
+        return [];
+    }
+
+    public function registerContainerConfiguration(LoaderInterface $loader): void
+    {
+    }
+
+    public function getCacheDir(): string
+    {
+        return $this->cacheDir;
+    }
+
+    public function process(ContainerBuilder $container): void
+    {
+        throw new \RuntimeException('Container compile failed');
+    }
+}
+
+class BrokenDumpContainerKernel extends Kernel
+{
+    public function __construct(
+        private readonly string $cacheDir,
+    ) {
+        parent::__construct('test', true);
+    }
+
+    public function registerBundles(): iterable
+    {
+        return [];
+    }
+
+    public function registerContainerConfiguration(LoaderInterface $loader): void
+    {
+    }
+
+    public function getCacheDir(): string
+    {
+        return $this->cacheDir;
+    }
+
+    protected function dumpContainer(ConfigCache $cache, ContainerBuilder $container, string $class, string $baseClass): void
+    {
+        throw new \RuntimeException('Container dump failed');
+    }
+}
+
+class DumpProbingKernel extends Kernel
+{
+    public bool $lockHeldWhileDumping = false;
+
+    public function __construct(
+        private readonly string $cacheDir,
+    ) {
+        parent::__construct('test', true);
+    }
+
+    public function registerBundles(): iterable
+    {
+        return [];
+    }
+
+    public function registerContainerConfiguration(LoaderInterface $loader): void
+    {
+    }
+
+    public function getCacheDir(): string
+    {
+        return $this->cacheDir;
+    }
+
+    public function isLockHeld(): bool
+    {
+        if (!$probe = fopen($this->getBuildDir().'/'.$this->getContainerClass().'.php.lock', 'r+')) {
+            return false;
+        }
+
+        try {
+            if (flock($probe, \LOCK_EX | \LOCK_NB)) {
+                flock($probe, \LOCK_UN);
+
+                return false;
+            }
+
+            return true;
+        } finally {
+            fclose($probe);
+        }
+    }
+
+    protected function dumpContainer(ConfigCache $cache, ContainerBuilder $container, string $class, string $baseClass): void
+    {
+        $this->lockHeldWhileDumping = $this->isLockHeld();
+
+        parent::dumpContainer($cache, $container, $class, $baseClass);
     }
 }
 
@@ -958,6 +1192,25 @@ class KernelForTestWithLoadClassCache extends KernelForTest
 {
     public function doLoadClassCache(): void
     {
+    }
+}
+
+class RoutingTerminableHttpKernel implements HttpKernelInterface, TerminableInterface
+{
+    public int $handleCount = 0;
+    public array $terminatedRoutes = [];
+
+    public function handle(Request $request, int $type = self::MAIN_REQUEST, bool $catch = true): Response
+    {
+        ++$this->handleCount;
+        $request->attributes->set('_route', 'page');
+
+        return (new Response('page'))->setPublic()->setSharedMaxAge(60);
+    }
+
+    public function terminate(Request $request, Response $response): void
+    {
+        $this->terminatedRoutes[] = $request->attributes->get('_route');
     }
 }
 

@@ -14,7 +14,9 @@ namespace Symfony\Component\Config\Tests\Definition;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Config\Definition\BaseNode;
+use Symfony\Component\Config\Definition\Builder\TreeBuilder;
 use Symfony\Component\Config\Definition\NodeInterface;
+use Symfony\Component\Config\Definition\Processor;
 
 class BaseNodeTest extends TestCase
 {
@@ -77,5 +79,140 @@ class BaseNodeTest extends TestCase
             'name and separator' => ['foo', ['foo', null, '/']],
             'name, parent and separator' => ['foo.bar/baz/bim', ['bim', 'foo.bar/baz', '/']],
         ];
+    }
+
+    public function testEnvVarsAreInlined()
+    {
+        $tree = (new TreeBuilder('root'))
+            ->getRootNode()
+                ->children()
+                    ->scalarNode('static')->resolvesAtCompileTime()->end()
+                    ->scalarNode('dynamic')->end()
+                ->end()
+            ->end()
+            ->buildTree()
+        ;
+
+        BaseNode::setPlaceholderUniquePrefix('env_test');
+        BaseNode::setPlaceholderResolver(static fn (mixed $value): mixed => 'env_test_FOO' === $value ? 'resolved' : $value);
+
+        try {
+            $finalized = $tree->finalize($tree->normalize(['static' => 'env_test_FOO', 'dynamic' => 'env_test_FOO']));
+        } finally {
+            BaseNode::resetPlaceholders();
+        }
+
+        $this->assertSame(['static' => 'resolved', 'dynamic' => 'env_test_FOO'], $finalized);
+    }
+
+    public function testInlinedEnvVarsAreResolvedOnceConfigsAreMerged()
+    {
+        $tree = (new TreeBuilder('root'))
+            ->getRootNode()
+                ->children()
+                    ->scalarNode('static')->resolvesAtCompileTime()->end()
+                ->end()
+            ->end()
+            ->buildTree()
+        ;
+
+        BaseNode::setPlaceholderUniquePrefix('env_test');
+        BaseNode::setPlaceholderResolver(static fn (mixed $value): mixed => 'env_test_FOO' === $value ? throw new \RuntimeException('FOO is not defined.') : $value);
+
+        try {
+            $config = (new Processor())->process($tree, [['static' => 'env_test_FOO'], ['static' => 'bar']]);
+        } finally {
+            BaseNode::resetPlaceholders();
+        }
+
+        $this->assertSame(['static' => 'bar'], $config);
+    }
+
+    public function testInlinedEnvVarsAreNotValidatedAsPlaceholders()
+    {
+        $tree = (new TreeBuilder('root'))
+            ->getRootNode()
+                ->children()
+                    ->enumNode('mode')->values(['fast', 'safe'])->resolvesAtCompileTime()->end()
+                ->end()
+            ->end()
+            ->buildTree()
+        ;
+
+        BaseNode::setPlaceholder('env_test_FOO', ['string' => '']);
+
+        try {
+            $finalized = $tree->finalize($tree->normalize(['mode' => 'env_test_FOO']));
+        } finally {
+            BaseNode::resetPlaceholders();
+        }
+
+        $this->assertSame(['mode' => 'env_test_FOO'], $finalized);
+    }
+
+    public function testInlinedEnvVarsInsideAStringAreNotValidatedAsPlaceholders()
+    {
+        $tree = (new TreeBuilder('root'))
+            ->getRootNode()
+                ->children()
+                    ->scalarNode('url')
+                        ->resolvesAtCompileTime()
+                        ->validate()->ifTrue(static fn ($v) => !str_starts_with($v, 'http://localhost/'))->thenInvalid('Not a local URL.')->end()
+                    ->end()
+                ->end()
+            ->end()
+            ->buildTree()
+        ;
+
+        BaseNode::setPlaceholder('env_test_HOST', ['string' => '']);
+
+        try {
+            $finalized = $tree->finalize($tree->normalize(['url' => 'http://env_test_HOST/api']));
+        } finally {
+            BaseNode::resetPlaceholders();
+        }
+
+        $this->assertSame(['url' => 'http://env_test_HOST/api'], $finalized);
+    }
+
+    public function testInlinedEnvVarsCanBeArrays()
+    {
+        $tree = (new TreeBuilder('root'))
+            ->getRootNode()
+                ->children()
+                    ->arrayNode('locales')->resolvesAtCompileTime()->scalarPrototype()->end()->end()
+                ->end()
+            ->end()
+            ->buildTree()
+        ;
+
+        BaseNode::setPlaceholderUniquePrefix('env_test');
+        BaseNode::setPlaceholderResolver(static fn (mixed $value): mixed => 'env_test_FOO' === $value ? ['en', 'fr'] : $value);
+
+        try {
+            $normalized = $tree->normalize(['locales' => 'env_test_FOO']);
+        } finally {
+            BaseNode::resetPlaceholders();
+        }
+
+        $this->assertSame(['locales' => ['en', 'fr']], $normalized);
+    }
+
+    public function testResetPlaceholdersDropsTheResolver()
+    {
+        $tree = (new TreeBuilder('root'))
+            ->getRootNode()
+                ->children()
+                    ->scalarNode('static')->resolvesAtCompileTime()->end()
+                ->end()
+            ->end()
+            ->buildTree()
+        ;
+
+        BaseNode::setPlaceholderUniquePrefix('env_test');
+        BaseNode::setPlaceholderResolver(static fn (mixed $value): mixed => 'resolved');
+        BaseNode::resetPlaceholders();
+
+        $this->assertSame(['static' => 'env_test_FOO'], $tree->finalize($tree->normalize(['static' => 'env_test_FOO'])));
     }
 }

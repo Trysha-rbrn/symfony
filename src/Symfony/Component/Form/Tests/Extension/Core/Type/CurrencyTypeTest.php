@@ -11,7 +11,9 @@
 
 namespace Symfony\Component\Form\Tests\Extension\Core\Type;
 
+use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\RequiresPhpExtension;
+use Symfony\Bridge\PhpUnit\ClockMock;
 use Symfony\Component\Form\ChoiceList\View\ChoiceView;
 use Symfony\Component\Form\Extension\Core\Type\CurrencyType;
 use Symfony\Component\Intl\Util\IntlTestHelper;
@@ -73,6 +75,17 @@ class CurrencyTypeTest extends BaseTypeTestCase
             ->createView()->vars['choices'];
 
         $this->assertContainsEquals(new ChoiceView('SIT', 'SIT', 'tolar slovène'), $choices);
+    }
+
+    #[Group('time-sensitive')]
+    public function testActiveAtDefaultsToToday()
+    {
+        ClockMock::withClockMock(1136116800);
+
+        $choices = $this->factory->create(static::TESTED_TYPE)
+            ->createView()->vars['choices'];
+
+        $this->assertContains('SIT', array_column($choices, 'value'));
     }
 
     #[RequiresPhpExtension('intl')]
@@ -137,6 +150,37 @@ class CurrencyTypeTest extends BaseTypeTestCase
 
         $this->assertNotContainsEquals($sit, $activeChoices);
         $this->assertContainsEquals($sit, $notActiveChoices);
+    }
+
+    public function testNullActiveAtListsLegalTenderCurrenciesWhateverTheirDates()
+    {
+        $choices = $this->factory
+            ->create(static::TESTED_TYPE, null, [
+                'active_at' => null,
+            ])
+            ->createView()->vars['choices'];
+
+        $values = array_map(static fn (ChoiceView $choice) => $choice->value, $choices);
+
+        $this->assertContains('EUR', $values);
+        $this->assertContains('SIT', $values);
+        $this->assertNotContains('USN', $values);
+    }
+
+    public function testNullActiveAtListsNonLegalTenderCurrenciesWhateverTheirDates()
+    {
+        $choices = $this->factory
+            ->create(static::TESTED_TYPE, null, [
+                'active_at' => null,
+                'legal_tender' => false,
+            ])
+            ->createView()->vars['choices'];
+
+        $values = array_map(static fn (ChoiceView $choice) => $choice->value, $choices);
+
+        $this->assertContains('USN', $values);
+        $this->assertNotContains('EUR', $values);
+        $this->assertNotContains('SIT', $values);
     }
 
     public function testAnExceptionShouldBeThrownWhenTheActiveAtAndNotActiveAtOptionsAreBothSet()

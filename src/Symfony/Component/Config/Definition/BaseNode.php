@@ -30,6 +30,7 @@ abstract class BaseNode implements NodeInterface
 
     private static array $placeholderUniquePrefixes = [];
     private static array $placeholders = [];
+    private static ?\Closure $placeholderResolver = null;
 
     protected string $name;
     protected array $normalizationClosures = [];
@@ -89,6 +90,18 @@ abstract class BaseNode implements NodeInterface
     }
 
     /**
+     * Registers the resolver that gives the actual value of a dynamic placeholder.
+     *
+     * Nodes that declare they resolve at compile time use it to replace placeholders by their actual value, once configurations are merged, or before normalizing array nodes.
+     *
+     * @internal
+     */
+    public static function setPlaceholderResolver(?\Closure $resolver): void
+    {
+        self::$placeholderResolver = $resolver;
+    }
+
+    /**
      * Resets all current placeholders available.
      *
      * @internal
@@ -97,6 +110,7 @@ abstract class BaseNode implements NodeInterface
     {
         self::$placeholderUniquePrefixes = [];
         self::$placeholders = [];
+        self::$placeholderResolver = null;
     }
 
     public function setAttribute(string $key, mixed $value): void
@@ -378,11 +392,21 @@ abstract class BaseNode implements NodeInterface
 
     final public function normalize(mixed $value): mixed
     {
+        // an array node cannot normalize a placeholder, the other nodes resolve it in finalize() so that a value overridden by a later configuration is not read
+        if (null !== self::$placeholderResolver && !$this->allowPlaceholders() && $this->getAttribute('resolves_at_compile_time', false)) {
+            $value = (self::$placeholderResolver)($value, $this->getPath());
+        }
+
         $value = $this->preNormalize($value);
 
         // run custom normalization closures
         foreach ($this->normalizationClosures as $closure) {
             $value = $closure($value);
+        }
+
+        // the node declared that it resolves at compile time, so there is no dynamic value to validate
+        if ($this->getAttribute('resolves_at_compile_time', false) && self::containsPlaceholder($value)) {
+            return $value;
         }
 
         // resolve placeholder value
@@ -441,6 +465,14 @@ abstract class BaseNode implements NodeInterface
 
     final public function finalize(mixed $value): mixed
     {
+        if (null !== self::$placeholderResolver && $this->getAttribute('resolves_at_compile_time', false)) {
+            $value = (self::$placeholderResolver)($value, $this->getPath());
+        }
+
+        if ($this->getAttribute('resolves_at_compile_time', false) && self::containsPlaceholder($value)) {
+            return $value;
+        }
+
         if ($value !== $placeholders = self::resolvePlaceholderValue($value)) {
             foreach ($placeholders as $placeholder) {
                 $this->handlingPlaceholder = $value;
@@ -521,6 +553,30 @@ abstract class BaseNode implements NodeInterface
     protected function getValidPlaceholderTypes(): array
     {
         return [];
+    }
+
+    /**
+     * Tells whether a value is a placeholder or holds one inside a string, as "http://%env(HOST)%/" does.
+     */
+    private static function containsPlaceholder(mixed $value): bool
+    {
+        if (!\is_string($value)) {
+            return false;
+        }
+
+        foreach (self::$placeholderUniquePrefixes as $placeholderUniquePrefix) {
+            if (str_contains($value, $placeholderUniquePrefix)) {
+                return true;
+            }
+        }
+
+        foreach (self::$placeholders as $placeholder => $values) {
+            if (str_contains($value, $placeholder)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static function resolvePlaceholderValue(mixed $value): mixed

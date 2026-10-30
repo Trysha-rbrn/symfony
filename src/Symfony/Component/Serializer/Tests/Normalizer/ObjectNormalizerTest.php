@@ -17,8 +17,10 @@ use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\IgnoreDeprecations;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\PropertyAccess\Exception\InvalidTypeException;
+use Symfony\Component\PropertyAccess\Exception\UnexpectedTypeException;
 use Symfony\Component\PropertyAccess\PropertyAccessorBuilder;
 use Symfony\Component\PropertyAccess\PropertyAccessorInterface;
+use Symfony\Component\PropertyInfo\Attribute\WithAccessors;
 use Symfony\Component\PropertyInfo\Extractor\PhpDocExtractor;
 use Symfony\Component\PropertyInfo\Extractor\PhpStanExtractor;
 use Symfony\Component\PropertyInfo\Extractor\ReflectionExtractor;
@@ -30,6 +32,7 @@ use Symfony\Component\Serializer\Attribute\DiscriminatorMap;
 use Symfony\Component\Serializer\Attribute\Groups;
 use Symfony\Component\Serializer\Attribute\Ignore;
 use Symfony\Component\Serializer\Attribute\SerializedName;
+use Symfony\Component\Serializer\Attribute\SerializedPath;
 use Symfony\Component\Serializer\Exception\ExtraAttributesException;
 use Symfony\Component\Serializer\Exception\LogicException;
 use Symfony\Component\Serializer\Exception\MissingConstructorArgumentsException;
@@ -1166,6 +1169,37 @@ class ObjectNormalizerTest extends TestCase
         $this->assertSame(['inner_foo' => 'foo'], $normalizer->normalize($dummy, 'json', ['groups' => 'read']));
     }
 
+    public function testNormalizeWithPropertyPathDoesNotDependOnTheFirstNormalizedObject()
+    {
+        $classMetadataFactory = new ClassMetadataFactory(new YamlFileLoader(__DIR__.'/../Fixtures/property-path-mapping.yaml'));
+        $normalizer = new ObjectNormalizer($classMetadataFactory, new MetadataAwareNameConverter($classMetadataFactory));
+
+        try {
+            $normalizer->normalize(new ObjectWithNullableInner(), 'json', ['groups' => 'read']);
+            $this->fail(\sprintf('Expected a "%s".', UnexpectedTypeException::class));
+        } catch (UnexpectedTypeException) {
+        }
+
+        $dummy = new ObjectWithNullableInner();
+        $dummy->inner = new ObjectInner();
+        $dummy->inner->foo = 'foo';
+
+        $this->assertSame(['inner_foo' => 'foo'], $normalizer->normalize($dummy, 'json', ['groups' => 'read']));
+    }
+
+    public function testNormalizeWithPropertyPathSkipsUninitializedPropertiesPerObject()
+    {
+        $classMetadataFactory = new ClassMetadataFactory(new YamlFileLoader(__DIR__.'/../Fixtures/property-path-mapping.yaml'));
+        $normalizer = new ObjectNormalizer($classMetadataFactory, new MetadataAwareNameConverter($classMetadataFactory));
+
+        $dummy = new ObjectWithUninitializedInner();
+        $dummy->inner = new ObjectInner();
+        $dummy->inner->foo = 'foo';
+
+        $this->assertSame([], $normalizer->normalize(new ObjectWithUninitializedInner(), 'json', ['groups' => 'read']));
+        $this->assertSame(['inner_foo' => 'foo'], $normalizer->normalize($dummy, 'json', ['groups' => 'read']));
+    }
+
     public function testDenormalizeWithPropertyPath()
     {
         $classMetadataFactory = new ClassMetadataFactory(new YamlFileLoader(__DIR__.'/../Fixtures/property-path-mapping.yaml'));
@@ -1207,6 +1241,24 @@ class ObjectNormalizerTest extends TestCase
         $this->assertSame([], $normalizer->normalize($class));
     }
 
+    public function testDenormalizeDoesNotMixUpAttributesOfClassesWithSimilarNames()
+    {
+        (new ObjectNormalizer())->denormalize(['Lineid' => 1], Order::class);
+
+        $this->assertSame(5, (new ObjectNormalizer())->denormalize(['id' => 5], OrderLine::class)->id);
+    }
+
+    public function testNormalizeDoesNotMixUpAttributesOfClassesWithSimilarNames()
+    {
+        $classMetadataFactory = new ClassMetadataFactory(new AttributeLoader());
+        (new ObjectNormalizer($classMetadataFactory))->normalize(new Order());
+
+        $line = new OrderLine();
+        $line->id = 5;
+
+        $this->assertSame(['id' => 5], (new ObjectNormalizer($classMetadataFactory))->normalize($line));
+    }
+
     // accessors
 
     protected function getNormalizerForAccessors($accessorPrefixes = null): ObjectNormalizer
@@ -1227,7 +1279,7 @@ class ObjectNormalizerTest extends TestCase
 
     public function testNormalizeWithAnExtractorThatDoesNotExtractPropertyNames()
     {
-        // an extractor written against PropertyInfoExtractorInterface before getProperty() was added to it
+        // an extractor written before PropertyNameExtractorInterface existed
         $extractor = new class implements PropertyInfoExtractorInterface {
             public function getTypes(string $class, string $property, array $context = []): ?array
             {
@@ -1506,6 +1558,68 @@ class ObjectNormalizerTest extends TestCase
         ], $normalizedSwappedHasserIsser);
     }
 
+    public function testSerializedNamesOnPropertiesNamedLikeAccessors()
+    {
+        $object = new class {
+            #[SerializedName('get_ready')]
+            private bool $getReady = false;
+
+            #[SerializedName('has_answers')]
+            private bool $hasAnswers = true;
+
+            #[SerializedName('can_subscribe')]
+            private bool $canSubscribe = false;
+
+            #[SerializedName('is_active')]
+            private bool $isActive = true;
+
+            public function getReady(): bool
+            {
+                return $this->getReady;
+            }
+
+            public function hasAnswers(): bool
+            {
+                return $this->hasAnswers;
+            }
+
+            public function canSubscribe(): bool
+            {
+                return $this->canSubscribe;
+            }
+
+            public function isActive(): bool
+            {
+                return $this->isActive;
+            }
+        };
+        $metadataFactory = new ClassMetadataFactory(new AttributeLoader());
+        $normalizer = new ObjectNormalizer($metadataFactory, new MetadataAwareNameConverter($metadataFactory));
+
+        $this->assertSame([
+            'get_ready' => false,
+            'has_answers' => true,
+            'can_subscribe' => false,
+            'is_active' => true,
+        ], $normalizer->normalize($object));
+    }
+
+    public function testSerializedPathOnPropertyNamedLikeItsAccessor()
+    {
+        $object = new class {
+            #[SerializedPath('[flags][active]')]
+            private bool $isActive = true;
+
+            public function isActive(): bool
+            {
+                return $this->isActive;
+            }
+        };
+        $normalizer = new ObjectNormalizer(new ClassMetadataFactory(new AttributeLoader()));
+
+        $this->assertSame(['flags' => ['active' => true]], $normalizer->normalize($object));
+    }
+
     public function testIsserPrefersBaseNameWhenNoCollision()
     {
         $normalizer = new ObjectNormalizer();
@@ -1538,6 +1652,60 @@ class ObjectNormalizerTest extends TestCase
             'isPublished' => true,
             'published' => 'live',
         ], $normalizer->normalize($object));
+    }
+
+    public function testNormalizeDoesNotAddAttributesForSetters()
+    {
+        $normalizer = new ObjectNormalizer();
+
+        $object = new ObjectWithIsPrefixedPropertiesAndSetters(true, false);
+
+        $this->assertSame(['published' => true, 'children' => false], $normalizer->normalize($object));
+    }
+
+    public function testNormalizeDoesNotAddAttributesForWithAccessorsSetters()
+    {
+        $normalizer = new ObjectNormalizer();
+
+        $this->assertSame(['enabled' => true], $normalizer->normalize(new ObjectWithAccessorsSetterOnIsPrefixedProperty()));
+    }
+
+    public function testNormalizeWithAPropertyInfoExtractorWithoutPropertyNameExtractors()
+    {
+        $reflectionExtractor = new ReflectionExtractor();
+        $propertyInfoExtractor = new PropertyInfoExtractor([$reflectionExtractor], [$reflectionExtractor], [], [$reflectionExtractor], [$reflectionExtractor]);
+        $normalizer = new ObjectNormalizer(null, null, null, null, null, null, [], $propertyInfoExtractor);
+
+        $object = new ObjectWithIsPrefixedPropertiesAndSetters(true, false);
+
+        $this->assertSame(['published' => true, 'children' => false], $normalizer->normalize($object));
+    }
+
+    public function testNormalizeKeepsTheConventionalNamesOfGettersWithAcronyms()
+    {
+        $classMetadataFactory = new ClassMetadataFactory(new AttributeLoader());
+        $object = new ObjectWithAcronymGetters();
+
+        $this->assertSame(['uRL' => 'https://symfony.com', 'iD' => 42], (new ObjectNormalizer())->normalize($object));
+        $this->assertSame(['uRL' => 'https://symfony.com', 'identifier' => 42], (new ObjectNormalizer($classMetadataFactory, new MetadataAwareNameConverter($classMetadataFactory)))->normalize($object));
+    }
+
+    public function testNormalizeIgnoresMethodsWithUppercaseAccessorPrefixes()
+    {
+        $normalizer = new ObjectNormalizer();
+
+        $this->assertSame([], $normalizer->normalize(new ObjectWithUppercaseAccessorPrefixes()));
+    }
+
+    public function testNormalizeWithAccessorsOnGettersWithUppercaseLetters()
+    {
+        if (!interface_exists(PropertyNameExtractorInterface::class)) {
+            $this->markTestSkipped('Test requires symfony/property-info 8.2+');
+        }
+
+        $normalizer = new ObjectNormalizer();
+
+        $this->assertSame(['url' => 'https://symfony.com', 'isbn' => '978-2-1234-5680-3'], $normalizer->normalize(new ObjectWithAccessorsOnGettersWithUppercaseLetters()));
     }
 
     public function testIsserWithPublicPropertyCollision()
@@ -1736,6 +1904,133 @@ class ObjectNormalizerTest extends TestCase
         $this->assertArrayNotHasKey('voidProperty', $normalized);
         $this->assertArrayNotHasKey('neverProperty', $normalized);
         $this->assertEquals('value', $normalized['normalProperty']);
+    }
+
+    public function testIgnoredAttributesCannotBeWrittenThroughSetterAliases()
+    {
+        $object = new class {
+            private int $barData = 0;
+            public int $bazData = 0;
+
+            public function setBarData(int $value): void
+            {
+                $this->barData = $value;
+            }
+
+            public function getBarData(): int
+            {
+                return $this->barData;
+            }
+        };
+        $normalizer = new ObjectNormalizer();
+        $normalizer->denormalize(['bArDaTa' => 42, 'bar_data' => 43, 'bar data' => 44, 'bazData' => 21], $object::class, null, [
+            AbstractNormalizer::OBJECT_TO_POPULATE => $object,
+            AbstractNormalizer::IGNORED_ATTRIBUTES => ['barData'],
+        ]);
+
+        $this->assertSame(0, $object->getBarData());
+        $this->assertSame(21, $object->bazData);
+    }
+
+    public function testIgnoredAttributesCannotBeWrittenThroughAdderAliases()
+    {
+        $object = new class {
+            private array $lineItems = [];
+
+            public function addLineItem(string $item): void
+            {
+                $this->lineItems[] = $item;
+            }
+
+            public function removeLineItem(string $item): void
+            {
+            }
+
+            public function getLineItems(): array
+            {
+                return $this->lineItems;
+            }
+        };
+        $normalizer = new ObjectNormalizer();
+        $normalizer->denormalize(['lInEiTeMs' => ['item']], $object::class, null, [
+            AbstractNormalizer::OBJECT_TO_POPULATE => $object,
+            AbstractNormalizer::IGNORED_ATTRIBUTES => ['lineItems'],
+        ]);
+
+        $this->assertSame([], $object->getLineItems());
+    }
+
+    public function testIgnoredAttributesKeepOtherMagicProperties()
+    {
+        $object = new class {
+            public array $values = [];
+
+            public function __set(string $name, mixed $value): void
+            {
+                $this->values[$name] = $value;
+            }
+        };
+        $normalizer = new ObjectNormalizer();
+        $normalizer->denormalize(['barData' => 42, 'BarData' => 43, 'bazData' => 21], $object::class, null, [
+            AbstractNormalizer::OBJECT_TO_POPULATE => $object,
+            AbstractNormalizer::IGNORED_ATTRIBUTES => ['barData'],
+        ]);
+
+        $this->assertSame(['BarData' => 43, 'bazData' => 21], $object->values);
+    }
+
+    public function testIgnoredAttributesKeepCaseSensitiveProperties()
+    {
+        $object = new class {
+            public int $barData = 0;
+            public int $bArDaTa = 0;
+        };
+        $normalizer = new ObjectNormalizer();
+        $normalizer->denormalize(['barData' => 42, 'bArDaTa' => 21], $object::class, null, [
+            AbstractNormalizer::OBJECT_TO_POPULATE => $object,
+            AbstractNormalizer::IGNORED_ATTRIBUTES => ['barData'],
+        ]);
+
+        $this->assertSame(0, $object->barData);
+        $this->assertSame(21, $object->bArDaTa);
+    }
+
+    public function testIgnoredAttributesKeepSingularAndPluralProperties()
+    {
+        $object = new class {
+            public ?string $category = null;
+            public array $categories = [];
+
+            public function setCategory(?string $category): void
+            {
+                $this->category = $category;
+            }
+
+            public function addCategory(string $category): void
+            {
+                $this->categories[] = $category;
+            }
+
+            public function removeCategory(string $category): void
+            {
+            }
+        };
+        $normalizer = new ObjectNormalizer();
+        $normalizer->denormalize(['category' => 'main', 'categories' => ['a']], $object::class, null, [
+            AbstractNormalizer::OBJECT_TO_POPULATE => $object,
+            AbstractNormalizer::IGNORED_ATTRIBUTES => ['category'],
+        ]);
+
+        $this->assertNull($object->category);
+        $this->assertSame(['a'], $object->categories);
+
+        $normalizer->denormalize(['category' => 'main', 'categories' => ['b']], $object::class, null, [
+            AbstractNormalizer::OBJECT_TO_POPULATE => $object,
+            AbstractNormalizer::IGNORED_ATTRIBUTES => ['categories'],
+        ]);
+
+        $this->assertSame('main', $object->category);
+        $this->assertSame(['a'], $object->categories);
     }
 
     public function testMetadataIsAppliedToTheRightValue()
@@ -2040,6 +2335,26 @@ class ObjectInner
 class ObjectWithArrayProperty
 {
     public array $values = [];
+}
+
+class ObjectWithNullableInner
+{
+    public ?ObjectInner $inner = null;
+}
+
+class ObjectWithUninitializedInner
+{
+    public ObjectInner $inner;
+}
+
+class Order
+{
+    private ?int $Lineid = null;
+}
+
+class OrderLine
+{
+    public ?int $id = null;
 }
 
 class LazyObjectInner extends ObjectInner
@@ -2469,6 +2784,106 @@ class ObjectWithIsserAndPublicPropertyNoGetter
     public function isPublished(): bool
     {
         return $this->isPublished;
+    }
+}
+
+class ObjectWithIsPrefixedPropertiesAndSetters
+{
+    public function __construct(
+        private bool $isPublished,
+        private bool $hasChildren,
+    ) {
+    }
+
+    public function isPublished(): bool
+    {
+        return $this->isPublished;
+    }
+
+    public function setIsPublished(bool $isPublished): void
+    {
+        $this->isPublished = $isPublished;
+    }
+
+    public function hasChildren(): bool
+    {
+        return $this->hasChildren;
+    }
+
+    public function setHasChildren(bool $hasChildren = true): static
+    {
+        $this->hasChildren = $hasChildren;
+
+        return $this;
+    }
+}
+
+class ObjectWithAccessorsSetterOnIsPrefixedProperty
+{
+    #[WithAccessors(setter: 'enable')]
+    private bool $isEnabled = true;
+
+    public function isEnabled(): bool
+    {
+        return $this->isEnabled;
+    }
+
+    public function enable(bool $enabled = true): static
+    {
+        $this->isEnabled = $enabled;
+
+        return $this;
+    }
+}
+
+class ObjectWithAcronymGetters
+{
+    private string $url = 'https://symfony.com';
+    private int $id = 42;
+
+    public function getURL(): string
+    {
+        return $this->url;
+    }
+
+    #[SerializedName('identifier')]
+    public function getID(): int
+    {
+        return $this->id;
+    }
+}
+
+class ObjectWithUppercaseAccessorPrefixes
+{
+    private string $foo = 'foo';
+
+    public function GetFoo(): string
+    {
+        return $this->foo;
+    }
+
+    public function ISBN(): string
+    {
+        return '978-2-1234-5680-3';
+    }
+}
+
+class ObjectWithAccessorsOnGettersWithUppercaseLetters
+{
+    #[WithAccessors(getter: 'getURL')]
+    private string $url = 'https://symfony.com';
+
+    #[WithAccessors(getter: 'ISBN')]
+    private string $isbn = '978-2-1234-5680-3';
+
+    public function getURL(): string
+    {
+        return $this->url;
+    }
+
+    public function ISBN(): string
+    {
+        return $this->isbn;
     }
 }
 

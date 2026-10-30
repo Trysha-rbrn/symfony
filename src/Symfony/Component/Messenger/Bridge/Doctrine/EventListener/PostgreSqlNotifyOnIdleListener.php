@@ -12,6 +12,8 @@
 namespace Symfony\Component\Messenger\Bridge\Doctrine\EventListener;
 
 use Doctrine\DBAL\ArrayParameterType;
+use Doctrine\DBAL\Exception as DBALException;
+use Doctrine\DBAL\Exception\ConnectionLost;
 use Doctrine\DBAL\Types\Types;
 use Psr\Clock\ClockInterface;
 use Psr\Log\LoggerInterface;
@@ -34,6 +36,7 @@ class PostgreSqlNotifyOnIdleListener implements EventSubscriberInterface
     private ?PostgreSqlConnection $activeConnection = null;
     private ?float $deadline = null;
     private ?int $sleepCapMs = null;
+    private bool $connectionLost = false;
     /** @var list<string> */
     private array $queueNames = [];
 
@@ -57,6 +60,7 @@ class PostgreSqlNotifyOnIdleListener implements EventSubscriberInterface
     public function onWorkerStarted(WorkerStartedEvent $event): void
     {
         $this->activeConnection = null;
+        $this->connectionLost = false;
         $this->deadline = $event->getDeadline();
         $this->queueNames = [];
 
@@ -98,7 +102,7 @@ class PostgreSqlNotifyOnIdleListener implements EventSubscriberInterface
             return;
         }
 
-        $now = $this->clock?->now()->format('U.u') ?? microtime(true);
+        $now = null !== $this->clock ? self::toTimestamp($this->clock->now()) : microtime(true);
 
         // Cap by worker deadline (--time-limit) — checked first to avoid a SQL query
         // in getEarliestDelayedMessageTime() when the worker is already past its deadline.
@@ -109,22 +113,41 @@ class PostgreSqlNotifyOnIdleListener implements EventSubscriberInterface
             }
         }
 
-        // Cap by earliest delayed message across all PG queues: wake up in time to process it
-        if (null !== $earliest = $this->getEarliestDelayedMessageTime()) {
-            $msUntilEarliest = ($earliest->format('U.u') - $now) * 1000;
-            if (0 >= $timeout = min($timeout, $msUntilEarliest)) {
+        try {
+            $earliest = $this->getEarliestDelayedMessageTime();
+
+            if ($this->connectionLost) {
+                $this->connectionLost = false;
+                $this->logger?->info('Worker can wait for PostgreSQL LISTEN/NOTIFY wake-up again, the database connection is back.');
+            }
+
+            // Cap by earliest delayed message across all PG queues: wake up in time to process it
+            if (null !== $earliest) {
+                $msUntilEarliest = (self::toTimestamp($earliest) - $now) * 1000;
+                if (0 >= $timeout = min($timeout, $msUntilEarliest)) {
+                    return;
+                }
+            }
+
+            // Cap by sleep duration when non-PG transports are present to ensure they are still polled regularly
+            if (0 >= $timeout = (int) min($timeout, $this->sleepCapMs ?? $timeout)) {
                 return;
             }
+
+            $this->logger?->debug('Worker waiting for PostgreSQL LISTEN/NOTIFY wake-up.', ['timeout_ms' => $timeout]);
+
+            $this->activeConnection->waitForNotify($timeout);
+        } catch (DBALException $e) {
+            if (!$this->activeConnection->closeIfDisconnected() && !$e instanceof ConnectionLost) {
+                throw $e;
+            }
+
+            // The worker polls its receivers next, and DoctrineReceiver::get() reports the error if the database is still unreachable
+            if (!$this->connectionLost) {
+                $this->connectionLost = true;
+                $this->logger?->warning('Worker cannot wait for PostgreSQL LISTEN/NOTIFY wake-up, the database connection is lost: {error}', ['error' => $e->getMessage(), 'exception' => $e]);
+            }
         }
-
-        // Cap by sleep duration when non-PG transports are present to ensure they are still polled regularly
-        if (0 >= $timeout = (int) min($timeout, $this->sleepCapMs ?? $timeout)) {
-            return;
-        }
-
-        $this->logger?->debug('Worker waiting for PostgreSQL LISTEN/NOTIFY wake-up.', ['timeout_ms' => $timeout]);
-
-        $this->activeConnection->waitForNotify($timeout);
     }
 
     public static function getSubscribedEvents(): array
@@ -176,7 +199,7 @@ class PostgreSqlNotifyOnIdleListener implements EventSubscriberInterface
         $sql = \sprintf('SELECT MIN(available_at) FROM %s WHERE queue_name IN (?) AND available_at > ? AND delivered_at IS NULL', $config['table_name']);
         $result = $dbal->executeQuery($sql, [
             $this->queueNames,
-            $this->clock?->now() ?? new \DateTimeImmutable(),
+            ($this->clock?->now() ?? \DateTimeImmutable::createFromTimestamp(microtime(true)))->setTimezone(new \DateTimeZone('UTC')),
         ], [
             ArrayParameterType::STRING,
             Types::DATETIME_IMMUTABLE,
@@ -187,5 +210,10 @@ class PostgreSqlNotifyOnIdleListener implements EventSubscriberInterface
         }
 
         return new \DateTimeImmutable($result, new \DateTimeZone('UTC'));
+    }
+
+    private static function toTimestamp(\DateTimeInterface $date): float
+    {
+        return \PHP_INT_SIZE >= 8 ? $date->getTimestamp() + $date->getMicrosecond() / 1e6 : (float) $date->format('U.u');
     }
 }

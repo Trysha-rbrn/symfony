@@ -35,6 +35,8 @@ trait FollowRedirectsTrait
             return new AsyncResponse($this->client, $method, $url, $options);
         }
 
+        // $url already contains the query: it must not be added again to redirect targets
+        unset($options['query']);
         $options['max_redirects'] = 0;
         $redirectHeaders = [
             'scheme' => parse_url($url, \PHP_URL_SCHEME),
@@ -57,7 +59,7 @@ trait FollowRedirectsTrait
 
             $statusCode = $context->getStatusCode();
 
-            if ($statusCode < 300 || 400 <= $statusCode || null === $url = $context->getInfo('redirect_url')) {
+            if ($statusCode < 300 || 400 <= $statusCode || null === ($url = $context->getInfo('redirect_url')) || (str_starts_with($url, 'http:') && str_starts_with($context->getInfo('url'), 'https:'))) {
                 $context->passthru();
 
                 yield $chunk;

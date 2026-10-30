@@ -1,0 +1,37 @@
+<?php
+
+return [
+    'Names' => [
+        'afar', 'abhasiakielâ', 'atšehkielâ', 4 => 'adangme', 'adyge', 8 => 'afrikaans', 10 => 'aghem', 'ainukielâ', 'akankielâ', 15 => 'aleutkielâ', 17 => 'maadâaltaikielâ', 'amharakielâ', 'aragoniakielâ', 22 => 'angika',
+        25 => 'arabiakielâ', 27 => 'mapudungun', 29 => 'arapahokielâ', 35 => 'assamkielâ', 'asukielâ', 38 => 'asturiakielâ', 40 => 'avarkielâ', 42 => 'awadhikielâ', 'aymarakielâ', 'azerbaidžankielâ', 'baškirkielâ', 47 => 'balikielâ',
+        49 => 'basaakielâ', 53 => 'vielgisruošâkielâ', 55 => 'bembakielâ', 57 => 'benakielâ', 60 => 'bulgariakielâ', 63 => 'bhožpurikielâ', 'bislama', 66 => 'binikielâ', 69 => 'siksikakielâ', 72 => 'bambarakielâ', 'banglakielâ',
+        'tiibetkielâ', 77 => 'bretonkielâ', 80 => 'bodokielâ', 'bosniakielâ', 84 => 'bugikielâ', 86 => 'blinkielâ', 88 => 'katalankielâ', 94 => 'tšetšenkielâ', 'cebuanokielâ', 'kigakielâ', 'chamorrokielâ', 100 => 'chuukkielâ', 'marikielâ',
+        103 => 'choctawkielâ', 105 => 'cherokeekielâ', 'cheyennekielâ', 108 => 'sorani kurdikielâ', 110 => 'korsikakielâ', 121 => 'Seychellij kreoliranska', 'tšeekikielâ', 125 => 'kirkkoslaavi', 'tšuvaskielâ', 'kymrikielâ', 'tanskakielâ', 'dakotakielâ', 'dargikielâ', 'taitakielâ',
+        'saksakielâ', 135 => 'dogribkielâ', 137 => 'zarmakielâ', 139 => 'vyelisorbi', 141 => 'dualakielâ', 143 => 'divehikielâ', 'jola-fonyi', 146 => 'Dzongkha', 'dazakielâ', 'embukielâ', 'ewekielâ', 'efikkielâ', 153 => 'ekajuk',
+        'kreikakielâ', 156 => 'eŋgâlâskielâ', 158 => 'esperantokielâ', 'espanjakielâ', 161 => 'eestikielâ', 'baskikielâ', 'ewondokielâ', 165 => 'persiakielâ', 168 => 'fulakielâ', 'suomâkielâ', 'filipinokielâ', 172 => 'fidžikielâ', 'fäärikielâ', 'fonkielâ',
+        'ranskakielâ', 182 => 'friulikielâ', 'viestârfriisi', 'iirikielâ', 'gakielâ', 191 => 'skottilâš gaelikielâ', 'ge’ez', 'kiribatikielâ', 'galiciakielâ', 197 => 'guaranikielâ', 200 => 'gorontalokielâ', 203 => 'toovláš kreikakielâ', 'Sveitsi saksakielâ', 'gudžaratikielâ',
+        208 => 'gusiikielâ', 'manks', 'gwich’inkielâ', 'hausakielâ', 214 => 'hawaijikielâ', 216 => 'hepreakielâ', 'hindikielâ', 219 => 'hiligainokielâ', 221 => 'hmongkielâ', 224 => 'kroatiakielâ', 226 => 'pajesorbi', 228 => 'Haiti kreoli',
+        'uŋgarkielâ', 'hupakielâ', 232 => 'armeniakielâ', 'hererokielâ', 'interlingua', 'ibankielâ', 'ibibiokielâ', 'indonesiakielâ', 239 => 'igbokielâ', 243 => 'ilocano', 'inguškielâ', 'ido', 'islandkielâ', 248 => 'italiakielâ', 'inuktitut',
+        251 => 'jaapaankielâ', 253 => 'lojban', 'ngomba', 'machame', 259 => 'jaavakielâ', 'georgiakielâ', 262 => 'kabylkielâ', 'kachin', 'jju', 'kambakielâ', 267 => 'kabardikielâ', 269 => 'tyap', 'makonde', 'Kap Verde kreoli',
+        274 => 'koro', 277 => 'khasi', 279 => 'koyra chiini', 281 => 'kikujukielâ', 283 => 'kuanjama', 'kazakkielâ', 'kako', 'kalaallisut', 'kalenjikielâ', 'khmerkielâ', 'kimbundu', 'kannada', 'koreakielâ', 293 => 'konkani',
+        295 => 'kpellekielâ', 'kanurikielâ', 'karachai-balkarkielâ', 300 => 'kärjilkielâ', 'kurukhkielâ', 'kashmirkielâ', 'shambala', 'bafia', 'kölnkielâ', 'kurdikielâ', 'kumykkielâ', 309 => 'komikielâ', 'kornikielâ', 313 => 'kirgiskielâ', 'läättinkielâ', 'ladinokielâ',
+        'langokielâ', 319 => 'luxemburgkielâ', 'lezgikielâ', 322 => 'luganda', 'limburgkielâ', 327 => 'lakotakielâ', 330 => 'lingala', 'laokielâ', 334 => 'lozi', 'taveluri', 337 => 'liettuakielâ', 339 => 'katangaluba', 'lulualuba',
+        342 => 'lunda', 'luo', 'lusai', 'luhya', 'latviakielâ', 349 => 'madurakielâ', 351 => 'magahi', 'maithili', 'makasar', 355 => 'masaikielâ', 357 => 'mokšakielâ', 359 => 'mendekielâ', 'merukielâ', 'morisyen',
+        'malagaskielâ', 364 => 'makua-meetto', 'meta’', 'marshallkielâ', 368 => 'maorikielâ', 'micmac', 371 => 'minangkabau', 'makedoniakielâ', 'malajam', 'mongoliakielâ', 376 => 'manipuri', 378 => 'mohawkkielâ', 'moore', 'marathikielâ',
+        382 => 'viestârmari', 'malaiji', 'maltakielâ', 'mundang', 'muskogeekielâ', 'mirandeskielâ', 391 => 'burmakielâ', 393 => 'ersäkielâ', 'mazandarani', 'naurukielâ', 397 => 'napolikielâ', 'nama', 'tárukielâ bokmål', 'tave-nbedele', 402 => 'nepalkielâ',
+        'newari', 'ndonga', 'niaskielâ', 'niuekielâ', 408 => 'hollandkielâ', 'kwasio', 'tárukielâ nynorsk', 'ngiemboon', 413 => 'tárukielâ', 'nogaikielâ', 'toovláš tárukielâ', 417 => 'n’ko', 'maadâ-nbedele', 'tavesotho', 'nuer', 'navajokielâ',
+        423 => 'njanža', 425 => 'nyankolekielâ', 428 => 'oksitan', 435 => 'oromokielâ', 'orija', 'ossetkielâ', 440 => 'pandžabi', 'pangasinankielâ', 443 => 'pampangakielâ', 'papiamentu', 'palaukielâ', 447 => 'Nigeria pidgin',
+        455 => 'puolakielâ', 460 => 'toovláš preussikielâ', 462 => 'paštu', 'portugalkielâ', 'quechua', 'ki’che’', 468 => 'rapanui', 'rarotonga', 474 => 'retoroomaankielâ', 'rundi', 'romaniakielâ', 'rombo', 'roomaankielâ', 480 => 'ruošâkielâ',
+        483 => 'aromaniakielâ', 'ruandakielâ', 'rwa', 'sanskrit', 'sandawe', 'jakutkielâ', 490 => 'samburukielâ', 492 => 'santalikielâ', 494 => 'ngambay', 'sangu', 'sardiniakielâ', 'sisiliakielâ', 'skootikielâ', 'sindhi', 502 => 'tavekielâ',
+        504 => 'sena', 507 => 'koyraboro senni', 'sango', 512 => 'tašelhit', 'shankielâ', 515 => 'sinhala', 520 => 'slovakiakielâ', 522 => 'sloveniakielâ', 526 => 'samoakielâ', 'maadâsämikielâ', 'juulevsämikielâ', 'anarâškielâ', 'nuorttâlâškielâ',
+        'shona', 'soninke', 'somalikielâ', 535 => 'albaniakielâ', 'serbiakielâ', 'sranantongo', 539 => 'swazikielâ', 'saho', 'maadâsotho', 544 => 'sundakielâ', 'sukumakielâ', 549 => 'ruotâkielâ', 'swahilikielâ', 'komorikielâ', 553 => 'syyriakielâ',
+        555 => 'tamilkielâ', 558 => 'telugu', 'temnekielâ', 'ateso', 562 => 'tetum', 'tadžikkielâ', 565 => 'thaikielâ', 567 => 'tigrinyakielâ', 'tigrekielâ', 570 => 'turkmenkielâ', 574 => 'klingonkielâ', 578 => 'tswanakielâ',
+        'tongakielâ', 582 => 'tok pisin', 'tuurkikielâ', 585 => 'taroko', 587 => 'tsongakielâ', 590 => 'tatarkielâ', 593 => 'tumbukakielâ', 'tuvalukielâ', 596 => 'tasawaq', 'tahitikielâ', 'tuvakielâ', 'Koskâatlas tamazight', 'udmurtkielâ', 'uigurkielâ',
+        603 => 'ukrainakielâ', 'umbundu', 'urdu', 'uzbekkielâ', 'vaikielâ', 'vendakielâ', 610 => 'vepsäkielâ', 'vietnamkielâ', 615 => 'volapük', 618 => 'vunjo', 'walloonkielâ', 'walliskielâ', 'wolaitakielâ', 'waraykielâ', 625 => 'wolofkielâ',
+        627 => 'kalmukkielâ', 629 => 'xhosakielâ', 632 => 'soga', 635 => 'yangben', 'yemba', 'jiddish', 'yorubakielâ', 640 => 'kantonkielâ', 646 => 'standard tamazight', 'mandarinkiinakielâ', 'zulukielâ', 'zunikielâ', 'zazakielâ',
+    ],
+    'LocalizedNames' => [
+        'ar_001' => 'standard arabiakielâ', 'de_AT' => 'Nuorttâriijkâ saksakielâ', 'de_CH' => 'Sveitsi pajesaksakielâ', 'en_AU' => 'Australia eŋgâlâskielâ', 'en_CA' => 'Kanada eŋgâlâskielâ', 'en_GB' => 'Britannia eŋgâlâskielâ', 'en_US' => 'Amerika eŋgâlâskielâ', 'es_419' => 'Läättin-Amerika espanjakielâ', 'es_ES' => 'Espanja espanjakielâ', 'es_MX' => 'Meksiko espanjakielâ',
+        'fr_CA' => 'Kanada ranskakielâ', 'fr_CH' => 'Sveitsi ranskakielâ', 'nds_NL' => 'Vuáládâhenâmij saksakielâ', 'nl_BE' => 'hollandkielâ (flaami)', 'pt_BR' => 'Brasilia portugalkielâ', 'pt_PT' => 'Portugal portugalkielâ', 'sw_CD' => 'Kongo swahilikielâ', 'zh_Hans' => 'oovtâkiärdánis kiinakielâ', 'zh_Hant' => 'ärbivuáválâš kiinakielâ',
+    ],
+];

@@ -69,6 +69,22 @@ class BinaryFileResponseTest extends ResponseTestCase
         $this->assertSame('attachment; filename=f__.html; filename*=utf-8\'\'f%C3%B6%C3%B6.html', $response->headers->get('Content-Disposition'));
     }
 
+    public function testSetContentDispositionGeneratesSafeFallbackFilenameForTrailingNewline()
+    {
+        $response = new BinaryFileResponse(__FILE__);
+        $response->setContentDisposition(ResponseHeaderBag::DISPOSITION_ATTACHMENT, "foo\n");
+
+        $this->assertSame('attachment; filename=foo_; filename*=utf-8\'\'foo%0A', $response->headers->get('Content-Disposition'));
+    }
+
+    public function testSetContentDispositionRejectsTrailingNewlineInFallback()
+    {
+        $response = new BinaryFileResponse(__FILE__);
+        $this->expectException(\InvalidArgumentException::class);
+
+        $response->setContentDisposition(ResponseHeaderBag::DISPOSITION_ATTACHMENT, 'foo', "foo\n");
+    }
+
     public function testSetContentDispositionGeneratesSafeFallbackFilenameForWronglyEncodedFilename()
     {
         $response = new BinaryFileResponse(__FILE__);
@@ -145,7 +161,9 @@ class BinaryFileResponseTest extends ResponseTestCase
             ['bytes=0-', 0, 35, 'bytes 0-34/35'],
             ['bytes=0-34', 0, 35, 'bytes 0-34/35'],
             ['bytes=-35', 0, 35, 'bytes 0-34/35'],
+            ['bytes=-40', 0, 35, 'bytes 0-34/35'],
             ['bytes=1-4', 1, 4, 'bytes 1-4/35'],
+            ['Bytes=1-4', 1, 4, 'bytes 1-4/35'],
             ['bytes=-5', 30, 5, 'bytes 30-34/35'],
             ['bytes=30-', 30, 5, 'bytes 30-34/35'],
             ['bytes=30-30', 30, 1, 'bytes 30-30/35'],
@@ -200,6 +218,19 @@ class BinaryFileResponseTest extends ResponseTestCase
             // Syntactical invalid range-request should also return the full resource
             ['bytes=20-10'],
             ['bytes=50-40'],
+            ['bytes=-'],
+            ['bytes=abc-def'],
+            ['bytes=1-2-3'],
+            ['bytes=-5-10'],
+            ['bytes=+5-10'],
+            ['bytes=0x10-20'],
+            ['bytes=1e1-20'],
+            // lists of ranges are not supported and must be ignored
+            ['bytes=0-4,10-14'],
+            ['bytes=0-4, 10-14'],
+            ['bytes=0-4 ,10-14'],
+            ['bytes=-5,0-4'],
+            ['bytes=0-,10-14'],
             // range units other than bytes must be ignored
             ['unknown=10-20'],
         ];
@@ -258,7 +289,6 @@ class BinaryFileResponseTest extends ResponseTestCase
     public static function provideInvalidRanges()
     {
         return [
-            ['bytes=-40'],
             ['bytes=40-50'],
         ];
     }
@@ -449,6 +479,22 @@ class BinaryFileResponseTest extends ResponseTestCase
 
         $this->assertSame(BinaryFileResponse::HTTP_NOT_MODIFIED, $response->getStatusCode());
         $this->assertFalse($response->headers->has('Content-Type'));
+    }
+
+    public function testPrepareNotAddingContentLengthHeaderIfNotSuccessfulResponse()
+    {
+        $request = Request::create('/');
+        $request->headers->set('Range', 'bytes=0-10');
+
+        $response = new BinaryFileResponse(__DIR__.'/File/Fixtures/test.gif', 404);
+        $response->prepare($request);
+
+        $this->expectOutputString('');
+        $response->sendContent();
+
+        $this->assertSame(404, $response->getStatusCode());
+        $this->assertFalse($response->headers->has('Content-Length'));
+        $this->assertFalse($response->headers->has('Content-Range'));
     }
 
     public function testContentTypeIsCorrectlyDetected()

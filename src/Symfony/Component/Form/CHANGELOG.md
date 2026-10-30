@@ -5,6 +5,7 @@ CHANGELOG
 ---
 
  * Guess the `empty_data` option from the type of the mapped property when that type refuses `null`
+ * Add `TypeInfoFormTypeGuesser` to guess the type of a field and whether it is required from the declared type of its property
  * Add `BoundsType` to render a lower and an upper bound of the same inner type
  * Add `#[AsFormType]` and `#[FormField]` attributes to derive a form type from the properties of a data class
  * Add the `allow_array_submission` option to let `PRE_SUBMIT` listeners turn a submitted array into data the form accepts
@@ -12,13 +13,17 @@ CHANGELOG
  * Deprecate the `regions` option of `TimezoneType`, it has had no effect since 5.0
  * Add `PolymorphicCollectionType` for collections whose entries do not all share the same type
  * Add `inputmode="numeric"` to `IntegerType` when the `grouping` option is enabled
- * Add the `choice_help` option to `ChoiceType`
- * Add `$help` parameter to `ChoiceListFactoryInterface::createView()`
+ * Add the `sort_choices` option to `ChoiceType`
+ * Add the `choice_help` option to `ChoiceType` and the `$help` argument to `ChoiceListFactoryInterface::createView()`
  * Add the `form_id` view variable, holding the id to render on the `<form>` element of a root form when a child uses `form_attr`
  * Allow the `group_by` option of `ChoiceType` to return `TranslatableInterface` instances
  * Add the `FormEvents::POST_VALIDATE` event, dispatched on each form of the tree after the validation of the root form
  * Deprecate the `FormTypePasswordHasherExtension` class and the `registerPassword()` and `hashPasswords()` methods of `PasswordHasherListener`, passwords are now hashed during the `form.post_validate` event
  * Add the `entry_name` option to `CollectionType` and `PolymorphicCollectionType` to name the entry forms after a property of the entries instead of their keys
+ * Create the entries of `CollectionType` from the view data instead of the model data, so that a model transformer can provide the entries
+ * Pass the data of the fields to the constructor of the `data_class` when it has required arguments or promoted readonly properties
+ * Replace the data of a form with a new instance when a field mapped to one of its promoted readonly properties changes
+ * Make `FormTypeGuesserChain` remember its guesses for each class and property, guessers should not depend on the current request or user
 
 8.1
 ---

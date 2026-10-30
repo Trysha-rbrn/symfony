@@ -75,7 +75,8 @@ class AuthenticatedVoter implements CacheableVoterInterface
                 continue;
             }
 
-            if ($token instanceof OfflineTokenInterface) {
+            // a guest is never authenticated, while how an offline user authenticated is unknown
+            if ($token instanceof OfflineTokenInterface && null !== $token->getUser()) {
                 throw new InvalidArgumentException('Cannot decide on authentication attributes when an offline token is used.');
             }
 
@@ -132,6 +133,17 @@ class AuthenticatedVoter implements CacheableVoterInterface
             foreach (self::DENIAL_REASONS as $deniedAttribute => $reason) {
                 if (\in_array($deniedAttribute, $attributes, true)) {
                     $vote?->addReason($reason);
+
+                    break;
+                }
+            }
+
+            foreach ([self::IS_AUTHENTICATED_VERY_RECENTLY, self::IS_AUTHENTICATED_RECENTLY, self::IS_AUTHENTICATED_FULLY] as $attribute) {
+                if (null !== $vote && \in_array($attribute, $attributes, true)) {
+                    // a remembered user only has to prove their credentials again, while anyone else has to log in
+                    if (self::IS_AUTHENTICATED_FULLY !== $attribute || $this->authenticationTrustResolver->isRememberMe($token)) {
+                        $vote->requestReAuthentication($attribute);
+                    }
 
                     break;
                 }

@@ -11,10 +11,12 @@
 
 namespace Symfony\Component\Messenger\Command;
 
+use Psr\Clock\ClockInterface;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\SignalableCommandInterface;
 use Symfony\Component\Console\Exception\RuntimeException;
+use Symfony\Component\Console\Helper\CommandInvocation;
 use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
@@ -58,8 +60,9 @@ class FailedMessagesRetryCommand extends AbstractFailedMessagesCommand implement
         private ?LoggerInterface $logger = null,
         ?PhpSerializer $phpSerializer = null,
         private ?array $signals = null,
+        ?ClockInterface $clock = null,
     ) {
-        parent::__construct($globalReceiverName, $failureTransports, $phpSerializer);
+        parent::__construct($globalReceiverName, $failureTransports, $phpSerializer, $clock);
     }
 
     protected function configure(): void
@@ -78,7 +81,7 @@ class FailedMessagesRetryCommand extends AbstractFailedMessagesCommand implement
             ->setHelp(<<<'EOF'
                 The <info>%command.name%</info> retries message in the failure transport.
 
-                    <info>php %command.full_name%</info>
+                    <info>%command.invocation%</info>
 
                 The command will interactively ask if each message should be retried,
                 discarded or skipped.
@@ -86,22 +89,22 @@ class FailedMessagesRetryCommand extends AbstractFailedMessagesCommand implement
                 Some transports support retrying a specific message id, which comes
                 from the <info>messenger:failed:show</info> command.
 
-                    <info>php %command.full_name% {id}</info>
+                    <info>%command.invocation% {id}</info>
 
                 Or pass multiple ids at once to process multiple messages:
 
-                <info>php %command.full_name% {id1} {id2} {id3}</info>
+                <info>%command.invocation% {id1} {id2} {id3}</info>
 
                 Add "--redispatch" to send selected messages through the bus again, allowing
                 their configured transport to process them instead of this command:
 
-                    <info>php %command.full_name% {id1} {id2} --force --redispatch</info>
+                    <info>%command.invocation% {id1} {id2} --force --redispatch</info>
 
                 Instead of ids, messages can be selected by class name, by failure time, or by both:
 
-                    <info>php %command.full_name% --class-filter='App\Message\SendEmail'</info>
-                    <info>php %command.full_name% --failed-after='-1 hour'</info>
-                    <info>php %command.full_name% --failed-after='2024-05-01 08:00' --failed-before='2024-05-01 09:30'</info>
+                    <info>%command.invocation% --class-filter='App\Message\SendEmail'</info>
+                    <info>%command.invocation% --failed-after='-1 hour'</info>
+                    <info>%command.invocation% --failed-after='2024-05-01 08:00' --failed-before='2024-05-01 09:30'</info>
 
                 The "--failed-after" and "--failed-before" options accept any expression supported by
                 DateTimeImmutable and both bounds are inclusive. The failure time comes from the message
@@ -148,7 +151,7 @@ class FailedMessagesRetryCommand extends AbstractFailedMessagesCommand implement
 
         $this->printPendingMessagesMessage($failureTransportName, $io);
 
-        $io->writeln(\sprintf('To retry all the messages, run <comment>messenger:consume %s</comment>', $failureTransportName));
+        $io->writeln(\sprintf('To retry all the messages, run <comment>%s %s</comment>', CommandInvocation::formatEscaped('messenger:consume'), $failureTransportName));
 
         $shouldForce = $input->getOption('force');
         $shouldRedispatch = $input->getOption('redispatch');
@@ -258,7 +261,7 @@ class FailedMessagesRetryCommand extends AbstractFailedMessagesCommand implement
     private function runWorker(string $failureTransportName, ReceiverInterface $receiver, SymfonyStyle $io, SymfonyStyle $errorIo, bool $shouldForce, bool $shouldRedispatch): int
     {
         $count = 0;
-        $listener = function (WorkerMessageReceivedEvent $messageReceivedEvent) use ($io, $errorIo, $receiver, $shouldForce, $shouldRedispatch, &$count) {
+        $listener = function (WorkerMessageReceivedEvent $messageReceivedEvent) use ($failureTransportName, $io, $errorIo, $receiver, $shouldForce, $shouldRedispatch, &$count) {
             ++$count;
             $envelope = $messageReceivedEvent->getEnvelope();
 
@@ -296,7 +299,7 @@ class FailedMessagesRetryCommand extends AbstractFailedMessagesCommand implement
             }
 
             if ('skip' === $choice) {
-                $this->scopedDispatcher->dispatch(new WorkerMessageSkipEvent($envelope, $envelope->last(SentToFailureTransportStamp::class)->getOriginalReceiverName()));
+                $this->scopedDispatcher->dispatch(new WorkerMessageSkipEvent($envelope, $envelope->last(SentToFailureTransportStamp::class)?->getOriginalReceiverName() ?? $failureTransportName));
             }
 
             $messageReceivedEvent->shouldHandle(false);

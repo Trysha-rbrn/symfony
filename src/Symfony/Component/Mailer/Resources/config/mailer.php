@@ -49,6 +49,7 @@ return static function (ContainerConfigurator $container) {
             ->args([
                 abstract_arg('transports'),
             ])
+            ->tag('kernel.reset', ['method' => 'close', 'on_shutdown' => 'only'])
 
         ->set('mailer.transport_factory', Transport::class)
             ->args([
@@ -81,6 +82,7 @@ return static function (ContainerConfigurator $container) {
         ->set('mailer.message_logger_listener', MessageLoggerListener::class)
             ->tag('kernel.event_subscriber')
             ->tag('kernel.reset', ['method' => 'reset'])
+            ->tag('kernel.test_state', ['keep' => true])
             ->tag('container.remove_if_missing', ['service' => ['profiler', 'test.client']])
 
         ->set('mailer.messenger_transport_listener', MessengerTransportListener::class)

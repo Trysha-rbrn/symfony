@@ -11,7 +11,6 @@
 
 namespace Symfony\Component\DependencyInjection\Loader\Configurator;
 
-use Symfony\Component\HttpKernel\EventListener\RateLimitAttributeListener;
 use Symfony\Component\RateLimiter\RateLimiterBuilder;
 use Symfony\Component\RateLimiter\RateLimiterFactory;
 
@@ -20,6 +19,7 @@ return static function (ContainerConfigurator $container) {
         ->set('cache.rate_limiter')
             ->parent('cache.app')
             ->tag('cache.pool')
+            ->tag('kernel.test_state', ['method' => 'clear'])
             ->tag('container.remove_if_missing', ['service' => 'cache.app'])
 
         ->set('limiter', RateLimiterFactory::class)
@@ -29,10 +29,6 @@ return static function (ContainerConfigurator $container) {
                 abstract_arg('storage'),
                 null,
             ])
-
-        ->set('rate_limiter.attribute_listener', RateLimitAttributeListener::class)
-            ->tag('kernel.event_subscriber')
-            ->args([tagged_locator('rate_limiter', 'name')])
 
         ->set('limiter_builder', RateLimiterBuilder::class)
             ->args([

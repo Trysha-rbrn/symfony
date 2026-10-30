@@ -22,6 +22,7 @@ use Symfony\Component\Cache\Traits\ContractsTrait;
 use Symfony\Contracts\Cache\CacheInterface;
 use Symfony\Contracts\Cache\NamespacedPoolInterface;
 use Symfony\Contracts\Service\ResetInterface;
+use Symfony\Contracts\Service\ShutdownInterface;
 
 /**
  * Chains several adapters together.
@@ -79,7 +80,8 @@ class ChainAdapter implements AdapterInterface, CacheInterface, NamespacedPoolIn
                 $item->metadata = $item->newMetadata = $sourceItem->metadata = $sourceMetadata;
 
                 if (isset($item->metadata[CacheItem::METADATA_EXPIRY])) {
-                    $item->expiresAt(\DateTimeImmutable::createFromFormat('U.u', \sprintf('%.6F', $item->metadata[CacheItem::METADATA_EXPIRY])));
+                    $expiry = $item->metadata[CacheItem::METADATA_EXPIRY];
+                    $item->expiresAt(\PHP_INT_SIZE >= 8 ? \DateTimeImmutable::createFromTimestamp($expiry) : \DateTimeImmutable::createFromFormat('U.u', \sprintf('%.6F', $expiry)));
                 } elseif (0 < $defaultLifetime) {
                     $item->expiresAfter($defaultLifetime);
                     $item->newMetadata[CacheItem::METADATA_EXPIRY] = $item->expiry;
@@ -315,10 +317,15 @@ class ChainAdapter implements AdapterInterface, CacheInterface, NamespacedPoolIn
         return $clone;
     }
 
-    public function reset(): void
+    /**
+     * @param bool $shutdown Whether the pool is being shut down
+     */
+    public function reset(/* bool $shutdown = false */): void
     {
         foreach ($this->adapters as $adapter) {
-            if ($adapter instanceof ResetInterface) {
+            if ($adapter instanceof ShutdownInterface) {
+                $adapter->reset(...\func_get_args());
+            } elseif ($adapter instanceof ResetInterface) {
                 $adapter->reset();
             }
         }

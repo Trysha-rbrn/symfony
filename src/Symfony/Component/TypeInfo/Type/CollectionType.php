@@ -14,6 +14,7 @@ namespace Symfony\Component\TypeInfo\Type;
 use Symfony\Component\TypeInfo\Exception\InvalidArgumentException;
 use Symfony\Component\TypeInfo\Type;
 use Symfony\Component\TypeInfo\TypeIdentifier;
+use Symfony\Component\TypeInfo\TypeMismatch;
 
 /**
  * Represents a key/value collection type.
@@ -155,32 +156,28 @@ class CollectionType extends Type implements WrappingTypeInterface
 
     public function getCollectionKeyType(): Type
     {
-        $defaultCollectionKeyType = self::arrayKey();
-
         if ($this->type instanceof GenericType) {
             return match (\count($this->type->getVariableTypes())) {
                 2 => $this->type->getVariableTypes()[0],
                 1 => self::int(),
-                default => $defaultCollectionKeyType,
+                default => self::arrayKey(),
             };
         }
 
-        return $defaultCollectionKeyType;
+        return self::arrayKey();
     }
 
     public function getCollectionValueType(): Type
     {
-        $defaultCollectionValueType = self::mixed();
-
         if ($this->type instanceof GenericType) {
             return match (\count($this->type->getVariableTypes())) {
                 2 => $this->type->getVariableTypes()[1],
                 1 => $this->type->getVariableTypes()[0],
-                default => $defaultCollectionValueType,
+                default => self::mixed(),
             };
         }
 
-        return $defaultCollectionValueType;
+        return self::mixed();
     }
 
     /**
@@ -214,6 +211,29 @@ class CollectionType extends Type implements WrappingTypeInterface
         }
 
         return true;
+    }
+
+    public function getMismatches(mixed $value): array
+    {
+        if (!\is_array($value) || ($this->isList() && !array_is_list($value)) || !parent::accepts($value)) {
+            return parent::getMismatches($value);
+        }
+
+        $keyType = $this->getCollectionKeyType();
+        $valueType = $this->getCollectionValueType();
+        $mismatches = [];
+
+        foreach ($value as $k => $v) {
+            if (!$keyType->accepts($k)) {
+                return [new TypeMismatch('', $this, 'array')];
+            }
+
+            foreach ($valueType->getMismatches($v) as $mismatch) {
+                $mismatches[] = $mismatch->withParentPath("[$k]");
+            }
+        }
+
+        return $mismatches;
     }
 
     /**

@@ -11,6 +11,7 @@
 
 namespace Symfony\Component\Tui\Tests\Widget;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Tui\Ansi\AnsiUtils;
 use Symfony\Component\Tui\Render\RenderContext;
@@ -75,6 +76,17 @@ class TextTest extends TestCase
         $this->assertSame(20, AnsiUtils::visibleWidth($lines[0]));
     }
 
+    public function testRenderStyledTextEndingWithInvalidUtf8()
+    {
+        // "crème café" in ISO-8859-1
+        $text = new TextWidget("cr\xE8me caf\xE9");
+        $text->setStyle(new Style(color: 'gray'));
+        $lines = $this->renderWidget($text, 20, 24);
+
+        $this->assertCount(1, $lines);
+        $this->assertSame(20, AnsiUtils::visibleWidth($lines[0]));
+    }
+
     public function testRenderLineWidthWithBackground()
     {
         $text = new TextWidget('Hello');
@@ -116,6 +128,21 @@ class TextTest extends TestCase
 
         // Should contain ellipsis (...)
         $this->assertStringContainsString('...', $lines[0]);
+    }
+
+    #[DataProvider('crLineEndingsProvider')]
+    public function testRenderSplitsLinesAtCrLineEndings(bool $truncate)
+    {
+        $text = new TextWidget("Hello\r\nWorld\rAgain", $truncate);
+        $lines = $this->renderWidget($text, 20, 24);
+
+        $this->assertSame(['Hello', 'World', 'Again'], array_map(static fn (string $line): string => rtrim(AnsiUtils::stripAnsiCodes($line), ' '), $lines));
+    }
+
+    public static function crLineEndingsProvider(): iterable
+    {
+        yield 'wrapped' => [false];
+        yield 'truncated' => [true];
     }
 
     public function testRenderTruncatedMultilineText()

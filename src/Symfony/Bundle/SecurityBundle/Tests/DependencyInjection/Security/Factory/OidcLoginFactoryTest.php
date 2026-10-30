@@ -19,6 +19,8 @@ use Symfony\Component\Config\Definition\Exception\InvalidConfigurationException;
 use Symfony\Component\DependencyInjection\ChildDefinition;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Reference;
+use Symfony\Component\HttpClient\MockHttpClient;
+use Symfony\Component\Security\Http\Authenticator\Oidc\OidcClientInterface;
 use Symfony\Component\Security\Http\OAuth2\ClientAuthentication\NoClientAuthentication;
 
 class OidcLoginFactoryTest extends TestCase
@@ -62,6 +64,62 @@ class OidcLoginFactoryTest extends TestCase
 
         // the per-firewall discovery definition carries the kernel.reset tag with method reset
         $this->assertSame(['kernel.reset' => [['method' => 'reset']]], $discoveryMain->getTags());
+    }
+
+    public function testTheDiscoveryUrlIsLeftRelativeToTheIssuerByDefault()
+    {
+        $container = new ContainerBuilder();
+
+        $config = [
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_authentication' => 'app.client_authentication',
+            'check_path' => '/oidc/callback',
+        ];
+
+        $factory = new OidcLoginFactory();
+        $factory->createAuthenticator($container, 'main', $this->processConfig($config, $factory), 'userprovider');
+
+        $discovery = $container->getDefinition('security.authenticator.oidc_login.discovery.main');
+        $this->assertArrayNotHasKey('index_2', $discovery->getArguments());
+        $this->assertSame('https://provider.example.com', $discovery->getArgument(3));
+    }
+
+    public function testDiscoveryUriNamesTheDocumentUrlAndLeavesTheIssuerAlone()
+    {
+        $container = new ContainerBuilder();
+
+        $config = [
+            'provider_uri' => 'https://provider.example.com',
+            'discovery_uri' => 'https://provider.internal/.well-known/openid-configuration',
+            'client_id' => 'my-client-id',
+            'client_authentication' => 'app.client_authentication',
+            'check_path' => '/oidc/callback',
+        ];
+
+        $factory = new OidcLoginFactory();
+        $factory->createAuthenticator($container, 'main', $this->processConfig($config, $factory), 'userprovider');
+
+        $discovery = $container->getDefinition('security.authenticator.oidc_login.discovery.main');
+        $this->assertSame('https://provider.internal/.well-known/openid-configuration', $discovery->getArgument(2));
+        $this->assertSame('https://provider.example.com', $discovery->getArgument(3));
+    }
+
+    public function testTheServicesThatReachTheProviderAreLazy()
+    {
+        $container = new ContainerBuilder();
+        $factory = new OidcLoginFactory();
+
+        $config = $this->processConfig([
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_authentication' => 'app.client_authentication',
+        ], $factory);
+        $factory->createAuthenticator($container, 'main', $config, 'userprovider');
+
+        $this->assertTrue($container->getDefinition('security.authenticator.oidc_login.discovery.main')->isLazy());
+        $this->assertTrue($container->getDefinition('security.authenticator.oidc_login.client.main')->isLazy());
+        $this->assertTrue($container->getDefinition('security.authenticator.oidc_login.signature_verifier.main')->isLazy());
     }
 
     public function testFirewallUserProviderIsInjected()
@@ -225,6 +283,21 @@ class OidcLoginFactoryTest extends TestCase
             'client_id' => 'my-client-id',
             'client_authentication' => 'app.client_authentication',
             'authorization_params' => ['code_challenge' => ''],
+        ], $factory);
+    }
+
+    public function testAuthorizationParamsCannotNameTheDpopKey()
+    {
+        $factory = new OidcLoginFactory();
+
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('nor "dpop_jkt": the authenticator manages these');
+
+        $this->processConfig([
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_authentication' => 'app.client_authentication',
+            'authorization_params' => ['dpop_jkt' => 'another-key-thumbprint'],
         ], $factory);
     }
 
@@ -468,6 +541,55 @@ class OidcLoginFactoryTest extends TestCase
         ], $factory);
     }
 
+    #[DataProvider('provideInvalidDiscoveryUris')]
+    public function testRejectsNonHttpsDiscoveryUri(string $uri)
+    {
+        $factory = new OidcLoginFactory();
+
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('The OIDC "discovery_uri" must use HTTPS');
+
+        $this->processConfig([
+            'provider_uri' => 'https://provider.example.com',
+            'discovery_uri' => $uri,
+            'client_id' => 'my-client-id',
+            'client_authentication' => 'app.client_authentication',
+        ], $factory);
+    }
+
+    public static function provideInvalidDiscoveryUris(): iterable
+    {
+        yield 'remote HTTP' => ['http://provider.internal/.well-known/openid-configuration'];
+        yield 'relative path' => ['private/config'];
+        yield 'scheme-relative URL' => ['//localhost/config'];
+        yield 'scheme without a host' => ['https:config'];
+        yield 'non-HTTP loopback URL' => ['ftp://localhost/config'];
+    }
+
+    #[DataProvider('provideSecureDiscoveryUris')]
+    public function testAcceptsSecureDiscoveryUris(string $uri)
+    {
+        $factory = new OidcLoginFactory();
+        $config = $this->processConfig([
+            'provider_uri' => 'https://provider.example.com',
+            'discovery_uri' => $uri,
+            'client_id' => 'my-client-id',
+            'client_authentication' => 'none',
+        ], $factory);
+
+        $this->assertSame($uri, $config['discovery_uri']);
+    }
+
+    public static function provideSecureDiscoveryUris(): iterable
+    {
+        yield 'HTTPS' => ['https://metadata.example.com/config?tenant=app'];
+        yield 'uppercase scheme' => ['HTTPS://metadata.example.com/config'];
+        yield 'localhost' => ['http://localhost:8080/config'];
+        yield 'IPv4 loopback' => ['http://127.0.0.1:8080/config'];
+        yield 'IPv6 loopback' => ['http://[::1]:8080/config'];
+        yield 'localhost subdomain' => ['http://provider.localhost/config'];
+    }
+
     public function testAcceptsAnUppercaseSchemeInTheProviderUri()
     {
         // a URI scheme is case-insensitive, and parse_url() returns it as it is written
@@ -651,6 +773,23 @@ class OidcLoginFactoryTest extends TestCase
         $this->assertEquals(new Reference('app.client_authentication'), $client->getArgument(3));
     }
 
+    public function testTheClientOfTheFirewallIsAutowirable()
+    {
+        $container = new ContainerBuilder();
+
+        $config = [
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_authentication' => 'app.client_authentication',
+        ];
+
+        $factory = new OidcLoginFactory();
+        $factory->createAuthenticator($container, 'main', $this->processConfig($config, $factory), 'userprovider');
+
+        $this->assertSame('security.authenticator.oidc_login.client.main', (string) $container->getAlias(OidcClientInterface::class.' $mainOidcClient'));
+        $this->assertSame(OidcClientInterface::class.' $mainOidcClient', (string) $container->getAlias('.'.OidcClientInterface::class.' $main'));
+    }
+
     /**
      * A public client points at the ready-made service rather than declaring one of its
      * own, as the "none" method has nothing to configure.
@@ -780,6 +919,75 @@ class OidcLoginFactoryTest extends TestCase
         $this->assertSame(self::SIGNING_KEY, $signingKey->getArgument(0));
     }
 
+    /**
+     * An assertion names the issuer, which is the only value draft-ietf-oauth-rfc7523bis accepts.
+     *
+     * The discovery of the firewall is what answers it, rather than the configured
+     * "provider_uri", because the two are compared ignoring a trailing slash and what a
+     * provider verifies an audience against is the spelling it announces itself.
+     */
+    #[DataProvider('provideAssertionMethods')]
+    public function testAnAssertionNamesTheIssuerAsItsAudienceByDefault(array $method)
+    {
+        $container = new ContainerBuilder();
+        $config = [
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_authentication' => $method,
+        ];
+
+        $factory = new OidcLoginFactory();
+        $factory->createAuthenticator($container, 'main', $this->processConfig($config, $factory), 'userprovider');
+
+        $this->assertEquals(
+            new Reference('security.authenticator.oidc_login.discovery.main'),
+            $container->getDefinition('security.authenticator.oidc_login.client_authentication.main')->getArgument(4),
+        );
+    }
+
+    /**
+     * The endpoint stays reachable for a provider that refuses the issuer.
+     *
+     * OIDC Core 1.0, Section 9 let one expect it, so a deployment facing such a provider is not
+     * left without a way to authenticate its client.
+     */
+    #[DataProvider('provideAssertionMethods')]
+    public function testAnAssertionNamesTheTokenEndpointWhenAskedTo(array $method)
+    {
+        $method[array_key_first($method)]['audience'] = 'token_endpoint';
+        $container = new ContainerBuilder();
+        $config = [
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_authentication' => $method,
+        ];
+
+        $factory = new OidcLoginFactory();
+        $factory->createAuthenticator($container, 'main', $this->processConfig($config, $factory), 'userprovider');
+
+        $this->assertNull($container->getDefinition('security.authenticator.oidc_login.client_authentication.main')->getArgument(4));
+    }
+
+    public static function provideAssertionMethods(): iterable
+    {
+        yield 'private_key_jwt' => [['private_key_jwt' => ['key' => self::SIGNING_KEY]]];
+        yield 'client_secret_jwt' => [['client_secret_jwt' => ['secret' => 'a-client-secret-of-thirty-two-by']]];
+    }
+
+    public function testAnAssertionRefusesAnAudienceThatIsNeitherOfTheTwo()
+    {
+        $config = [
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_authentication' => ['private_key_jwt' => ['key' => self::SIGNING_KEY, 'audience' => 'https://provider.example.com/other']],
+        ];
+
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('The value "https://provider.example.com/other" is not allowed for path "oidc-login.client_authentication.private_key_jwt.audience". Permissible values: "issuer", "token_endpoint"');
+
+        $this->processConfig($config, new OidcLoginFactory());
+    }
+
     public function testThePrivateKeyJwtMethodTakesTheKeyAlone()
     {
         $container = new ContainerBuilder();
@@ -797,6 +1005,221 @@ class OidcLoginFactoryTest extends TestCase
         $this->assertSame(self::SIGNING_KEY, $clientAuthentication->getArgument(0)->getArgument(0));
         $this->assertSame('RS256', $clientAuthentication->getArgument(1));
         $this->assertSame(60, $clientAuthentication->getArgument(2));
+    }
+
+    public function testTheTlsClientAuthMethodTakesNoParameter()
+    {
+        $container = new ContainerBuilder();
+
+        $config = [
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_certificate' => '/certs/client.pem',
+            'client_authentication' => ['tls_client_auth' => true],
+        ];
+
+        $factory = new OidcLoginFactory();
+        $factory->createAuthenticator($container, 'main', $this->processConfig($config, $factory), 'userprovider');
+
+        $this->assertFalse($container->hasDefinition('security.authenticator.oidc_login.client_authentication.main'));
+        $this->assertSame('security.oauth2.client_authentication.tls_client_auth', (string) $container->getDefinition('security.authenticator.oidc_login.client.main')->getArgument(3));
+    }
+
+    public function testTheSelfSignedTlsClientAuthMethodTakesNoParameter()
+    {
+        $container = new ContainerBuilder();
+
+        $config = [
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_certificate' => '/certs/self-signed.pem',
+            'client_authentication' => 'self_signed_tls_client_auth',
+        ];
+
+        $factory = new OidcLoginFactory();
+        $factory->createAuthenticator($container, 'main', $this->processConfig($config, $factory), 'userprovider');
+
+        $this->assertSame('security.oauth2.client_authentication.self_signed_tls_client_auth', (string) $container->getDefinition('security.authenticator.oidc_login.client.main')->getArgument(3));
+    }
+
+    public function testTheClientCertificateIsCarriedByTheRequestsOfTheOidcClientAlone()
+    {
+        $container = new ContainerBuilder();
+
+        $config = [
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_certificate' => [
+                'certificate' => '/certs/client.pem',
+                'key' => '/certs/client.key',
+                'passphrase' => 'my-passphrase',
+            ],
+            'client_authentication' => ['tls_client_auth' => true],
+        ];
+
+        $factory = new OidcLoginFactory();
+        $factory->createAuthenticator($container, 'main', $this->processConfig($config, $factory), 'userprovider');
+
+        $client = $container->getDefinition('security.authenticator.oidc_login.client.main');
+        $this->assertSame('http_client', (string) $client->getArgument(0), 'the HTTP client of the firewall is handed over as it is, so nothing else it serves carries the certificate');
+        $this->assertSame([
+            'local_cert' => '/certs/client.pem',
+            'local_pk' => '/certs/client.key',
+            'passphrase' => 'my-passphrase',
+        ], $client->getArgument(4));
+    }
+
+    public function testTheClientCertificateTakesThePathAlone()
+    {
+        $container = new ContainerBuilder();
+
+        $config = [
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_certificate' => '/certs/client.pem',
+            'client_authentication' => ['client_secret_post' => 'my-secret'],
+        ];
+
+        $factory = new OidcLoginFactory();
+        $factory->createAuthenticator($container, 'main', $this->processConfig($config, $factory), 'userprovider');
+
+        $this->assertSame(['local_cert' => '/certs/client.pem', 'local_pk' => null, 'passphrase' => null], $container->getDefinition('security.authenticator.oidc_login.client.main')->getArgument(4));
+    }
+
+    public function testAClientCertificateWithoutAKeyDoesNotTakeTheKeyOfTheHttpClient()
+    {
+        $container = new ContainerBuilder();
+
+        $config = [
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_certificate' => '/certs/client.pem',
+            'client_authentication' => 'tls_client_auth',
+        ];
+
+        $factory = new OidcLoginFactory();
+        $factory->createAuthenticator($container, 'main', $this->processConfig($config, $factory), 'userprovider');
+
+        $options = $container->getDefinition('security.authenticator.oidc_login.client.main')->getArgument(4);
+        $httpClient = (new MockHttpClient())->withOptions(['local_pk' => '/certs/other.key', 'passphrase' => 'other-passphrase']);
+        $requestOptions = $httpClient->request('POST', 'https://provider.example.com/token', $options)->getRequestOptions();
+
+        $this->assertSame('/certs/client.pem', $requestOptions['local_cert']);
+        $this->assertNull($requestOptions['local_pk']);
+        $this->assertNull($requestOptions['passphrase']);
+    }
+
+    public function testAClientMayPresentACertificateWithoutAuthenticatingWithIt()
+    {
+        $container = new ContainerBuilder();
+
+        $config = [
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_certificate' => '/certs/client.pem',
+            'client_authentication' => ['client_secret_basic' => 'my-secret'],
+        ];
+
+        $factory = new OidcLoginFactory();
+        $factory->createAuthenticator($container, 'main', $this->processConfig($config, $factory), 'userprovider');
+
+        $this->assertSame(['local_cert' => '/certs/client.pem', 'local_pk' => null, 'passphrase' => null], $container->getDefinition('security.authenticator.oidc_login.client.main')->getArgument(4));
+    }
+
+    public function testAClientWithoutACertificateSendsNoOptionOfItsOwn()
+    {
+        $container = new ContainerBuilder();
+
+        $config = [
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_authentication' => ['client_secret_post' => 'my-secret'],
+        ];
+
+        $factory = new OidcLoginFactory();
+        $factory->createAuthenticator($container, 'main', $this->processConfig($config, $factory), 'userprovider');
+
+        $this->assertSame([], $container->getDefinition('security.authenticator.oidc_login.client.main')->getArgument(4));
+    }
+
+    public function testOnlyTheAliasesOfTheRequestedEndpointsAreChecked()
+    {
+        $container = new ContainerBuilder();
+
+        $config = [
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_certificate' => '/certs/client.pem',
+            'client_authentication' => 'tls_client_auth',
+            'user_data_source' => 'userinfo',
+        ];
+
+        $factory = new OidcLoginFactory();
+        $factory->createAuthenticator($container, 'main', $this->processConfig($config, $factory), 'userprovider');
+
+        $discovery = $container->getDefinition('security.authenticator.oidc_login.discovery.main');
+        $this->assertSame(['authorization_endpoint', 'token_endpoint', 'userinfo_endpoint'], $discovery->getArgument(6));
+        $this->assertSame(['token_endpoint', 'userinfo_endpoint'], $discovery->getArgument(7), 'the authorization endpoint is reached by the browser, which presents no certificate');
+    }
+
+    public function testNoAliasIsCheckedWithoutAClientCertificate()
+    {
+        $container = new ContainerBuilder();
+
+        $config = [
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_authentication' => ['client_secret_post' => 'my-secret'],
+            'user_data_source' => 'userinfo',
+        ];
+
+        $factory = new OidcLoginFactory();
+        $factory->createAuthenticator($container, 'main', $this->processConfig($config, $factory), 'userprovider');
+
+        $this->assertSame([], $container->getDefinition('security.authenticator.oidc_login.discovery.main')->getArgument(7), 'a provider announcing an unusable alias must not take down a firewall that reads none');
+    }
+
+    #[DataProvider('provideMutualTlsMethodsWithoutACertificate')]
+    public function testRejectsAMutualTlsMethodWithoutACertificate(array $clientAuthentication)
+    {
+        $factory = new OidcLoginFactory();
+
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('The OIDC "tls_client_auth" and "self_signed_tls_client_auth" methods require the "client_certificate" option.');
+
+        $this->processConfig([
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_authentication' => $clientAuthentication,
+        ], $factory);
+    }
+
+    public static function provideMutualTlsMethodsWithoutACertificate(): iterable
+    {
+        yield 'tls_client_auth' => [['tls_client_auth' => true]];
+        yield 'self_signed_tls_client_auth' => [['self_signed_tls_client_auth' => true]];
+    }
+
+    #[DataProvider('provideMutualTlsMethodsSetToFalse')]
+    public function testRejectsAMutualTlsMethodSetToFalse(array $clientAuthentication)
+    {
+        $factory = new OidcLoginFactory();
+
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('options only take true');
+
+        $this->processConfig([
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_certificate' => '/certs/client.pem',
+            'client_authentication' => $clientAuthentication,
+        ], $factory);
+    }
+
+    public static function provideMutualTlsMethodsSetToFalse(): iterable
+    {
+        yield 'tls_client_auth' => [['tls_client_auth' => false]];
+        yield 'self_signed_tls_client_auth' => [['self_signed_tls_client_auth' => false]];
     }
 
     /**
@@ -917,11 +1340,11 @@ class OidcLoginFactoryTest extends TestCase
      * injecting into the OIDC client.
      */
     #[DataProvider('provideClientAuthenticationShapes')]
-    public function testEveryAcceptedShapeOfTheClientAuthenticationNode(array|string $clientAuthentication, string $expectedServiceId)
+    public function testEveryAcceptedShapeOfTheClientAuthenticationNode(array|string $clientAuthentication, string $expectedServiceId, array $extraConfig = [])
     {
         $container = new ContainerBuilder();
 
-        $config = [
+        $config = $extraConfig + [
             'provider_uri' => 'https://provider.example.com',
             'client_id' => 'my-client-id',
             'client_authentication' => $clientAuthentication,
@@ -949,6 +1372,13 @@ class OidcLoginFactoryTest extends TestCase
         yield 'none as a mapping' => [['none' => true], 'security.oauth2.client_authentication.none'];
         yield 'none as a null mapping' => [['none' => null], 'security.oauth2.client_authentication.none'];
         yield 'none as a string' => ['none', 'security.oauth2.client_authentication.none'];
+        $withCertificate = ['client_certificate' => '/certs/client.pem'];
+
+        yield 'tls_client_auth as a mapping' => [['tls_client_auth' => true], 'security.oauth2.client_authentication.tls_client_auth', $withCertificate];
+        yield 'tls_client_auth as a null mapping' => [['tls_client_auth' => null], 'security.oauth2.client_authentication.tls_client_auth', $withCertificate];
+        yield 'tls_client_auth as a string' => ['tls_client_auth', 'security.oauth2.client_authentication.tls_client_auth', $withCertificate];
+        yield 'self_signed_tls_client_auth as a mapping' => [['self_signed_tls_client_auth' => true], 'security.oauth2.client_authentication.self_signed_tls_client_auth', $withCertificate];
+        yield 'self_signed_tls_client_auth as a string' => ['self_signed_tls_client_auth', 'security.oauth2.client_authentication.self_signed_tls_client_auth', $withCertificate];
         yield 'a service as a mapping' => [['id' => 'app.client_authentication'], 'app.client_authentication'];
         yield 'a service as a string' => ['app.client_authentication', 'app.client_authentication'];
     }
@@ -1321,6 +1751,106 @@ class OidcLoginFactoryTest extends TestCase
             'client_authentication' => 'app.client_authentication',
             'http_client' => '',
         ], $factory);
+    }
+
+    /**
+     * The proof factory reaches both the client, which signs the requests it makes, and the
+     * authenticator, which names the key in the authorization request.
+     */
+    public function testTheDpopProofFactoryIsBuiltFromTheConfiguration()
+    {
+        $container = new ContainerBuilder();
+        $config = [
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_authentication' => ['client_secret_basic' => 'a-secret'],
+            'dpop' => ['key' => self::SIGNING_KEY, 'algorithm' => 'ES256'],
+        ];
+
+        $factory = new OidcLoginFactory();
+        $factory->createAuthenticator($container, 'main', $this->processConfig($config, $factory), 'userprovider');
+
+        $proofFactory = $container->getDefinition('security.authenticator.oidc_login.dpop.main');
+        $this->assertSame('security.oauth2.dpop.proof_factory', $proofFactory->getParent());
+        $this->assertSame('ES256', $proofFactory->getArgument(1));
+        $this->assertSame(self::SIGNING_KEY, $proofFactory->getArgument(0)->getArgument(0));
+
+        $reference = new Reference('security.authenticator.oidc_login.dpop.main');
+        $this->assertEquals($reference, $container->getDefinition('security.authenticator.oidc_login.client.main')->getArgument(5));
+        $this->assertEquals($reference, $container->getDefinition('security.authenticator.oidc_login.main')->getArgument(13));
+    }
+
+    /**
+     * A firewall that binds nothing to a key asks for the bearer token the client defaults to.
+     */
+    public function testNoDpopProofFactoryIsWiredWithoutDpop()
+    {
+        $container = new ContainerBuilder();
+        $config = [
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_authentication' => ['client_secret_basic' => 'a-secret'],
+        ];
+
+        $factory = new OidcLoginFactory();
+        $factory->createAuthenticator($container, 'main', $this->processConfig($config, $factory), 'userprovider');
+
+        $this->assertFalse($container->hasDefinition('security.authenticator.oidc_login.dpop.main'));
+        $this->assertNull($container->getDefinition('security.authenticator.oidc_login.client.main')->getArgument(5));
+        $this->assertNull($container->getDefinition('security.authenticator.oidc_login.main')->getArgument(13));
+    }
+
+    public function testTheDpopNodeTakesTheKeyAlone()
+    {
+        $config = [
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_authentication' => ['client_secret_basic' => 'a-secret'],
+            'dpop' => self::SIGNING_KEY,
+        ];
+
+        $finalized = $this->processConfig($config, new OidcLoginFactory());
+
+        $this->assertSame(self::SIGNING_KEY, $finalized['dpop']['key']);
+        $this->assertSame('ES256', $finalized['dpop']['algorithm']);
+    }
+
+    /**
+     * Nothing is bound to a key unless the firewall says so.
+     */
+    public function testNothingIsWiredForDpopByDefault()
+    {
+        $container = new ContainerBuilder();
+        $config = [
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_authentication' => ['client_secret_basic' => 'a-secret'],
+        ];
+
+        $factory = new OidcLoginFactory();
+        $factory->createAuthenticator($container, 'main', $this->processConfig($config, $factory), 'userprovider');
+
+        $this->assertFalse($container->hasDefinition('security.authenticator.oidc_login.dpop.main'));
+        $this->assertNull($container->getDefinition('security.authenticator.oidc_login.client.main')->getArgument(5));
+        $this->assertNull($container->getDefinition('security.authenticator.oidc_login.main')->getArgument(13));
+    }
+
+    /**
+     * RFC 9449, Section 4.2 excludes symmetric algorithms.
+     */
+    public function testTheDpopNodeRefusesAMacAlgorithm()
+    {
+        $config = [
+            'provider_uri' => 'https://provider.example.com',
+            'client_id' => 'my-client-id',
+            'client_authentication' => ['client_secret_basic' => 'a-secret'],
+            'dpop' => ['key' => self::SIGNING_KEY, 'algorithm' => 'HS256'],
+        ];
+
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('The value "HS256" is not allowed for path "oidc-login.dpop.algorithm".');
+
+        $this->processConfig($config, new OidcLoginFactory());
     }
 
     private function processConfig(array $config, OidcLoginFactory $factory): array

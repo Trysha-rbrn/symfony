@@ -84,7 +84,8 @@ class GlobResource implements \IteratorAggregate, SelfCheckingResourceInterface
     public function __serialize(): array
     {
         if (!isset($this->hash)) {
-            $this->directories = $this->snapshotDirectories();
+            // mtimes and inodes differ from one checkout to another, so they are left out when a reproducible build is requested
+            $this->directories = isset($_SERVER['SOURCE_DATE_EPOCH']) ? null : $this->snapshotDirectories();
             $this->hash = $this->computeHash();
         }
 
@@ -107,6 +108,7 @@ class GlobResource implements \IteratorAggregate, SelfCheckingResourceInterface
             }
         }
 
+        // Read by position, as the keys of payloads written by __sleep() before 6.4.26 are mangled property names; append new fields at the end
         $this->prefix = array_shift($data);
         $this->pattern = array_shift($data);
         $this->recursive = array_shift($data);

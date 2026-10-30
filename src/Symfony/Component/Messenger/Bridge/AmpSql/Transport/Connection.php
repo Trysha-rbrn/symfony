@@ -35,18 +35,25 @@ final class Connection
         'table_name' => 'messenger_amp_messages',
     ];
 
+    // 400 parameters per statement, far below the limit of every backend
+    private const MAX_BATCH_ROWS = 100;
+    // keeps the statements of a batch below the packet size limit of the server
+    private const MAX_BATCH_SIZE = 1048576;
+    private const LISTING_BATCH_SIZE = 100;
+
     private bool $autoSetup;
     private string $queueName;
     private int $redeliverTimeout;
     private string $tableName;
     private bool $versionValidated = false;
+    private ?SqlConnection $connection = null;
 
     /**
-     * @param SqlConnection|MysqlConnectionPool|PostgresConnectionPool|SqliteConnectionPool $connection
-     * @param array<string, mixed>                                                          $configuration
+     * @param \Closure(): (SqlConnection|MysqlConnectionPool|PostgresConnectionPool|SqliteConnectionPool) $connectionFactory Creates the connection on first use and after close()
+     * @param array<string, mixed>                                                                        $configuration
      */
     public function __construct(
-        private SqlConnection $connection,
+        private \Closure $connectionFactory,
         private BackendInterface $backend,
         array $configuration = [],
     ) {
@@ -64,7 +71,7 @@ final class Connection
         $transaction = null;
 
         try {
-            $transaction = $this->connection->beginTransaction();
+            $transaction = $this->getConnection()->beginTransaction();
             $id = self::normalizeId($this->backend->insert($transaction, $this->tableName, base64_encode($body), json_encode($headers, \JSON_THROW_ON_ERROR), $this->queueName, $delay));
             $transaction->commit();
 
@@ -75,6 +82,56 @@ final class Connection
         }
     }
 
+    /**
+     * Inserts messages in one transaction, with as few statements as possible.
+     *
+     * @param non-empty-array<array{string, array<string, string>, int}> $messages The arguments of send() for each message
+     *
+     * @return array<int|string> The inserted IDs by the key of the messages, when the backend tells them
+     */
+    public function sendBatch(#[\SensitiveParameter] array $messages): array
+    {
+        $this->ensureSetup();
+        $transaction = null;
+
+        try {
+            $batches = [];
+            $batch = [];
+            $batchSize = 0;
+
+            foreach ($messages as $key => [$body, $headers, $delay]) {
+                $message = [base64_encode($body), json_encode($headers, \JSON_THROW_ON_ERROR), $delay];
+                $size = \strlen($message[0]) + \strlen($message[1]);
+
+                if ($batch && (self::MAX_BATCH_ROWS === \count($batch) || self::MAX_BATCH_SIZE < $batchSize + $size)) {
+                    $batches[] = $batch;
+                    $batch = [];
+                    $batchSize = 0;
+                }
+
+                $batch[$key] = $message;
+                $batchSize += $size;
+            }
+
+            $batches[] = $batch;
+            $ids = [];
+            $transaction = $this->getConnection()->beginTransaction();
+
+            foreach ($batches as $batch) {
+                if ($batchIds = $this->backend->insertBatch($transaction, $this->tableName, array_values($batch), $this->queueName)) {
+                    $ids += array_combine(array_keys($batch), array_map(self::normalizeId(...), $batchIds));
+                }
+            }
+
+            $transaction->commit();
+
+            return $ids;
+        } catch (\Throwable $e) {
+            $this->rollback($transaction);
+            throw $this->createTransportException('Could not send the messages to AMPHP SQL.', $e);
+        }
+    }
+
     /** @return list<array{id: int|string, body: string, headers: array<string, string>}> */
     public function get(int $fetchSize = 1): array
     {
@@ -82,11 +139,11 @@ final class Connection
         $transaction = null;
 
         try {
-            $transaction = $this->connection->beginTransaction();
+            $transaction = $this->getConnection()->beginTransaction();
             $now = $this->backend->getNowExpression();
             [$criteria, $params] = $this->getAvailabilityCriteria($now);
             $result = $transaction->execute(
-                \sprintf('SELECT id, body, headers FROM %s WHERE %s ORDER BY available_at ASC, id ASC LIMIT ?%s', $this->tableName, $criteria, $this->backend->getClaimLockSql()),
+                \sprintf('SELECT id, body, headers FROM %s WHERE %s ORDER BY available_at ASC, delivered_at ASC, id ASC LIMIT ?%s', $this->tableName, $criteria, $this->backend->getClaimLockSql()),
                 [...$params, max(1, $fetchSize)],
             );
 
@@ -131,7 +188,7 @@ final class Connection
 
         $this->ensureSetup();
         try {
-            $this->connection->execute(
+            $this->getConnection()->execute(
                 \sprintf('UPDATE %s SET delivered_at = %s WHERE id = ? AND queue_name = ?', $this->tableName, $this->backend->getNowExpression()),
                 [$id, $this->queueName],
             );
@@ -144,7 +201,7 @@ final class Connection
     {
         try {
             $this->ensureSupportedVersion();
-            $this->backend->setup($this->connection, $this->tableName);
+            $this->backend->setup($this->getConnection(), $this->tableName);
             $this->autoSetup = false;
         } catch (\Throwable $e) {
             throw $this->createTransportException('Could not set up the AMPHP SQL transport.', $e);
@@ -157,7 +214,7 @@ final class Connection
 
         try {
             [$criteria, $params] = $this->getAvailabilityCriteria($this->backend->getNowExpression());
-            $count = $this->connection->execute(
+            $count = $this->getConnection()->execute(
                 \sprintf('SELECT COUNT(id) AS message_count FROM %s WHERE %s', $this->tableName, $criteria),
                 $params,
             )->fetchRow()['message_count'] ?? 0;
@@ -182,20 +239,62 @@ final class Connection
 
         try {
             [$criteria, $params] = $this->getAvailabilityCriteria($this->backend->getNowExpression());
-            $sql = \sprintf('SELECT id, body, headers FROM %s WHERE %s ORDER BY available_at ASC, id ASC', $this->tableName, $criteria);
+            $sql = \sprintf('SELECT id, body, headers FROM %s WHERE %s ORDER BY available_at ASC, delivered_at ASC, id ASC', $this->tableName, $criteria);
             if (null !== $limit) {
                 $sql .= ' LIMIT ?';
                 $params[] = max(0, $limit);
             }
 
             $rows = [];
-            foreach ($this->connection->execute($sql, $params) as $row) {
+            foreach ($this->getConnection()->execute($sql, $params) as $row) {
                 $rows[] = self::normalizeRow($row);
             }
 
             return $rows;
         } catch (\Throwable $e) {
             throw $this->createTransportException('Could not list messages in AMPHP SQL.', $e);
+        }
+    }
+
+    /**
+     * Reads the available messages in batches, so that they are not all loaded in memory at once.
+     *
+     * The messages that were never delivered come first, then the ones whose delivery timed out.
+     * The messages that become available after the listing started are not listed.
+     *
+     * @return \Generator<int, array{id: int|string, body: string, headers: array<string, string>}>
+     */
+    public function findAllInBatches(): \Generator
+    {
+        $this->ensureSetup();
+
+        try {
+            $start = $this->getConnection()->execute(\sprintf('SELECT %s AS now, (SELECT MAX(id) FROM %s) AS max_id', $this->backend->getNowExpression(), $this->tableName))->fetchRow();
+        } catch (\Throwable $e) {
+            throw $this->createTransportException('Could not list messages in AMPHP SQL.', $e);
+        }
+
+        if (null === $maxId = $start['max_id'] ?? null) {
+            return;
+        }
+
+        foreach ([false, true] as $deliveryTimedOut) {
+            $after = null;
+
+            do {
+                try {
+                    $rows = $this->findAvailableRows($start['now'], $maxId, $deliveryTimedOut, $after);
+                    $messages = array_map(self::normalizeRow(...), $rows);
+                } catch (\Throwable $e) {
+                    throw $this->createTransportException('Could not list messages in AMPHP SQL.', $e);
+                }
+
+                foreach ($messages as $message) {
+                    yield $message;
+                }
+
+                $after = end($rows);
+            } while (self::LISTING_BATCH_SIZE === \count($rows));
         }
     }
 
@@ -208,7 +307,7 @@ final class Connection
 
         $this->ensureSetup();
         try {
-            $row = $this->connection->execute(
+            $row = $this->getConnection()->execute(
                 \sprintf('SELECT id, body, headers FROM %s WHERE id = ? AND queue_name = ?', $this->tableName),
                 [$id, $this->queueName],
             )->fetchRow();
@@ -221,14 +320,20 @@ final class Connection
 
     public function close(): void
     {
-        $this->connection->close();
+        $this->connection?->close();
+        $this->connection = null;
+    }
+
+    private function getConnection(): SqlConnection
+    {
+        return $this->connection ??= ($this->connectionFactory)();
     }
 
     private function delete(int|string $id, string $operation): void
     {
         $this->ensureSetup();
         try {
-            $this->connection->execute(\sprintf('DELETE FROM %s WHERE id = ? AND queue_name = ?', $this->tableName), [$id, $this->queueName]);
+            $this->getConnection()->execute(\sprintf('DELETE FROM %s WHERE id = ? AND queue_name = ?', $this->tableName), [$id, $this->queueName]);
         } catch (\Throwable $e) {
             throw $this->createTransportException(\sprintf('Could not %s the AMPHP SQL message.', $operation), $e);
         }
@@ -258,10 +363,54 @@ final class Connection
         ];
     }
 
+    /**
+     * @param array<string, mixed>|null $after The last row of the previous batch
+     *
+     * @return list<array<string, mixed>>
+     */
+    private function findAvailableRows(mixed $now, mixed $maxId, bool $deliveryTimedOut, ?array $after): array
+    {
+        $sql = \sprintf('SELECT id, body, headers, available_at, delivered_at FROM %s WHERE queue_name = ? AND available_at <= ? AND id <= ?', $this->tableName);
+        $params = [$this->queueName, $now, $maxId];
+
+        if ($deliveryTimedOut) {
+            $sql .= ' AND delivered_at < ?';
+            $params[] = $now - $this->redeliverTimeout * 1000;
+        }
+
+        $rows = [];
+
+        if (null !== $after) {
+            // the next rows are read in the order of the index, so the database does not sort the rows that have the same "available_at"
+            $nextQueries = $deliveryTimedOut ? [
+                [' AND available_at = ? AND delivered_at = ? AND id > ? ORDER BY id ASC', [$after['available_at'], $after['delivered_at'], $after['id']]],
+                [' AND available_at = ? AND delivered_at > ? ORDER BY delivered_at ASC, id ASC', [$after['available_at'], $after['delivered_at']]],
+            ] : [
+                [' AND delivered_at IS NULL AND available_at = ? AND id > ? ORDER BY '.$this->backend->getNeverDeliveredOrderBy(), [$after['available_at'], $after['id']]],
+            ];
+
+            foreach ($nextQueries as [$condition, $values]) {
+                array_push($rows, ...iterator_to_array($this->getConnection()->execute($sql.$condition.' LIMIT ?', [...$params, ...$values, self::LISTING_BATCH_SIZE - \count($rows)]), false));
+
+                if (self::LISTING_BATCH_SIZE === \count($rows)) {
+                    return $rows;
+                }
+            }
+
+            $sql .= ' AND available_at > ?';
+            $params[] = $after['available_at'];
+        }
+
+        // SQLite sorts the rows that have the same "available_at" unless "delivered_at" is in the ORDER BY and its condition is not written "IS NULL"
+        $sql .= ($deliveryTimedOut ? ' ORDER BY available_at ASC, delivered_at ASC, id ASC' : ' AND NOT (delivered_at IS NOT NULL) ORDER BY available_at ASC, '.$this->backend->getNeverDeliveredOrderBy()).' LIMIT ?';
+
+        return [...$rows, ...iterator_to_array($this->getConnection()->execute($sql, [...$params, self::LISTING_BATCH_SIZE - \count($rows)]), false)];
+    }
+
     private function ensureSupportedVersion(): void
     {
         if (!$this->versionValidated) {
-            $this->backend->validateVersion($this->connection);
+            $this->backend->validateVersion($this->getConnection());
             $this->versionValidated = true;
         }
     }

@@ -93,6 +93,38 @@ class UnicodeStringTest extends AbstractUnicodeTestCase
         }];
     }
 
+    #[DataProvider('provideTrimPrefixGraphemeClusters')]
+    public function testTrimPrefixGraphemeClusters(string $expected, string $string, $prefix)
+    {
+        $this->assertSame($expected, (new UnicodeString($string))->trimPrefix($prefix)->toString());
+        $this->assertSame($expected, (new UnicodeString($string))->ignoreCase()->trimPrefix($prefix)->toString());
+    }
+
+    public static function provideTrimPrefixGraphemeClusters(): iterable
+    {
+        yield ["q\u{0301}x", "q\u{0301}x", 'q'];
+        yield ['x', "q\u{0301}x", "q\u{0301}"];
+        yield ["\r\nx", "\r\nx", "\r"];
+        yield ['x', "\r\nx", ["\r", "\r\n"]];
+    }
+
+    #[DataProvider('provideTrimSuffixGraphemeClusters')]
+    public function testTrimSuffixGraphemeClusters(string $expected, string $string, $suffix)
+    {
+        $this->assertSame($expected, (new UnicodeString($string))->trimSuffix($suffix)->toString());
+        $this->assertSame($expected, (new UnicodeString($string))->ignoreCase()->trimSuffix($suffix)->toString());
+    }
+
+    public static function provideTrimSuffixGraphemeClusters(): iterable
+    {
+        yield ["a\r\n", "a\r\n", "\n"];
+        yield ['a', "a\r\n", "\r\n"];
+        yield ["xq\u{0301}", "xq\u{0301}", "\u{0301}"];
+        yield ["\u{1F469}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F469}", "\u{1F469}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F469}", "\u{1F469}"];
+        yield ["\u{1F1EB}\u{1F1F7}\u{1F1EB}", "\u{1F1EB}\u{1F1F7}\u{1F1EB}", "\u{1F1F7}\u{1F1EB}"];
+        yield ["\u{1F1EB}\u{1F1F7}", "\u{1F1EB}\u{1F1F7}\u{1F1EB}", ["\u{1F1F7}\u{1F1EB}", "\u{1F1EB}"]];
+    }
+
     protected static function createFromString(string $string): AbstractString
     {
         return new UnicodeString($string);
@@ -140,6 +172,23 @@ class UnicodeStringTest extends AbstractUnicodeTestCase
                         static::createFromString('च्'),
                         static::createFromString('छे'),
                         static::createFromString('द'),
+                    ],
+                    null,
+                ],
+                [
+                    "ab\u{200B}é",
+                    "\u{200B}",
+                    [
+                        static::createFromString('ab'),
+                        static::createFromString('é'),
+                    ],
+                    null,
+                ],
+                [
+                    'café',
+                    "\u{200B}",
+                    [
+                        static::createFromString('café'),
                     ],
                     null,
                 ],
@@ -299,13 +348,25 @@ class UnicodeStringTest extends AbstractUnicodeTestCase
 
     public static function provideReplace(): array
     {
-        return array_merge(
+        $tests = array_merge(
             parent::provideReplace(),
             [
+                ['cafX', 1, 'café', 'é', 'X', UnicodeString::NFD],
                 ['Das Innenministerium', 1, 'Das Außenministerium', 'Auß', 'Inn'],
                 ['दछेच्नुद-दछेच्नु-ददछेच्नु', 2, 'दछेच्नुअ-दछेच्नु-अदछेच्नु', 'अ', 'द'],
+                ['abXé', 1, "ab\u{200B}é", "\u{200B}", 'X'],
+                ['café', 0, 'café', "\u{200B}", 'X'],
+                ['caféX', 1, "café\0", "\0", 'X'],
+                ["a\u{00AD}bé X", 1, "a\u{00AD}bé ab", 'ab', 'X'],
+                ['می خواهم', 1, "می\u{200C}خواهم", "\u{200C}", ' '],
             ]
         );
+
+        if (\extension_loaded('intl')) {
+            $tests[] = ["X q\u{0303}", 1, "q q\u{0303}", 'q', 'X'];
+        }
+
+        return $tests;
     }
 
     public static function provideReplaceIgnoreCase(): array
@@ -315,6 +376,10 @@ class UnicodeStringTest extends AbstractUnicodeTestCase
             [
                 ['Das Aussenministerium', 1, 'Das Außenministerium', 'auß', 'Auss'],
                 ['दछेच्नुद-दछेच्नु-ददछेच्नु', 2, 'दछेच्नुअ-दछेच्नु-अदछेच्नु', 'अ', 'द'],
+                ['abXé', 1, "ab\u{200B}é", "\u{200B}", 'X'],
+                ["A\u{00AD}Bé X", 1, "A\u{00AD}Bé AB", 'ab', 'X'],
+                ['STRAXEé', 1, 'STRAẞEé', 'ß', 'X'],
+                ['می خواهم', 1, "می\u{200C}خواهم", "\u{200C}", ' '],
             ]
         );
     }
@@ -344,6 +409,74 @@ class UnicodeStringTest extends AbstractUnicodeTestCase
                 [true, '06', '6'],
                 [true, '0', '0'],
                 [true, '10', '0'],
+                [false, "a\r\n", "\n"],
+                [true, "a\r\n", "\r\n"],
+                [false, "xq\u{0301}", "\u{0301}"],
+                [false, "\u{1F469}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F469}", "\u{1F469}"],
+                [false, "\u{1F1EB}\u{1F1F7}\u{1F1EB}", "\u{1F1F7}\u{1F1EB}"],
+                [true, "\u{1F1EB}\u{1F1F7}\u{1F1EB}\u{1F1F7}", "\u{1F1EB}\u{1F1F7}"],
+            ]
+        );
+    }
+
+    public static function provideEndsWithIgnoreCase(): array
+    {
+        return array_merge(
+            parent::provideEndsWithIgnoreCase(),
+            [
+                [false, "a\r\n", "\n"],
+                [false, "XQ\u{0301}", "\u{0301}"],
+            ]
+        );
+    }
+
+    public static function provideTrim(): array
+    {
+        return array_merge(
+            parent::provideTrim(),
+            [
+                [" \u{0301}x", " \u{0301}x ", null],
+                ['x', "\r\nx\r\n", null],
+                ['x', "\r\nx\r\n", "\r\n"],
+                ['x', "\nx\r", "\r\n"],
+                ["\r\nx\r\n", "\r\nx\r\n", "\n"],
+                ['x', "e\u{0301}xé", 'é'],
+                ['x', "éxe\u{0301}", "e\u{0301}"],
+                ['x', "\u{3000}x\u{3000}", "\u{3000}"],
+                ["q\u{0301}xq\u{0301}", "q\u{0301}xq\u{0301}", 'q'],
+                ['x', "q\u{0301}xq\u{0301}", "q\u{0301}"],
+                ["\u{1F1F7}\u{1F1EB}x", "\u{1F1F7}\u{1F1EB}x\u{1F1EB}\u{1F1F7}", "\u{1F1EB}\u{1F1F7}"],
+                ["\u{1F469}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F469}x", "\u{1F469}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F469}x\u{1F469}", "\u{1F469}"],
+                ['x', "\u{1F469}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F469}x", "\u{1F469}\u{200D}\u{2764}\u{FE0F}\u{200D}\u{1F469}"],
+                ["q\u{0301}xq\u{0301}", "q\u{0301}xq\u{0301}", 'a..z'],
+                ['x', "q\u{0301}bxq\u{0301}a", "q\u{0301}a..c"],
+                ['é', "\r\né\r\n", "\0..\u{A0}"],
+                ["\u{1F64B}\u{200D}\u{2642}\u{FE0F}x", "\u{1F64B}\u{200D}\u{2642}\u{FE0F}x\u{1F600}", "\u{1F600}..\u{1F64F}"],
+            ]
+        );
+    }
+
+    public static function provideTrimStart(): array
+    {
+        return array_merge(
+            parent::provideTrimStart(),
+            [
+                ["q\u{0301}a", "q\u{0301}a", 'q'],
+                [" \u{0301}x", "  \u{0301}x", null],
+                ["\r\nx", "\r\nx", "\r"],
+            ]
+        );
+    }
+
+    public static function provideTrimEnd(): array
+    {
+        return array_merge(
+            parent::provideTrimEnd(),
+            [
+                ["x \u{0301}", "x \u{0301} \t", null],
+                ["x\u{0600} ", "x\u{0600} ", null],
+                ["a\r\n", "a\r\n", "\n"],
+                ["a\r\n", "a\r\n", "\n..\n"],
             ]
         );
     }

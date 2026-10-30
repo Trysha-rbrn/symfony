@@ -62,15 +62,15 @@ class XliffUpdateSourcesCommand extends Command
 
                 You can specify directories to update in the command arguments:
 
-                  <info>php %command.full_name% path/to/dir path/to/another/dir</info>
+                  <info>%command.invocation% path/to/dir path/to/another/dir</info>
 
                 To restrict the updates to one or more locales, including the default locale itself, use the <comment>--locales</comment> option:
 
-                  <info>php %command.full_name% --locales en --locales fr</info>
+                  <info>%command.invocation% --locales en --locales fr</info>
 
                 You can specify one or more domains to target with the <comment>--domains</comment> option. By default, all available domains for the targeted locales are used.
 
-                  <info>php %command.full_name% --domains messages</info>
+                  <info>%command.invocation% --domains messages</info>
 
                 EOF,
             )
@@ -176,6 +176,12 @@ class XliffUpdateSourcesCommand extends Command
 
     public function complete(CompletionInput $input, CompletionSuggestions $suggestions): void
     {
+        if ($input->mustSuggestArgumentValuesFor('paths') && method_exists($suggestions, 'suggestDirectories')) {
+            $suggestions->suggestDirectories();
+
+            return;
+        }
+
         if ($input->mustSuggestOptionValuesFor('locales')) {
             $suggestions->suggestValues($this->enabledLocales);
 

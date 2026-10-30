@@ -13,6 +13,7 @@ namespace Symfony\Component\KeyManagement\Bridge\DoctrineDbal;
 
 use Doctrine\DBAL\ParameterType;
 use Doctrine\DBAL\Platforms\AbstractPlatform;
+use Doctrine\DBAL\Types\Exception\ValueNotConvertible;
 use Doctrine\DBAL\Types\Type;
 use Symfony\Component\KeyManagement\Envelope;
 use Symfony\Component\KeyManagement\EnvelopeDecrypterInterface;
@@ -35,6 +36,13 @@ use Symfony\Component\KeyManagement\Exception\InvalidArgumentException;
  * {@see \Doctrine\DBAL\Types\BlobType} handing its value over. Both paths
  * settle it into bytes before doing anything else with it.
  *
+ * A value of zero bytes is not an envelope and is rejected rather than handed
+ * to the parent Type, so that nothing reaches it without being authenticated.
+ * An empty plaintext is unaffected, since it is written as a non-empty
+ * envelope like any other value. Anything that does not frame an envelope
+ * is reported as a {@see ValueNotConvertible}, which is how a Type is
+ * expected to report a stored value it cannot read.
+ *
  * What `$key` names, and what a row ends up carrying, is decided by the
  * encrypter given to this type, exactly as {@see EnvelopeEncrypterInterface}
  * describes. With an {@see EnvelopeEncrypter} it is a master key: every row
@@ -44,6 +52,14 @@ use Symfony\Component\KeyManagement\Exception\InvalidArgumentException;
  * stored data key and carry a 16-byte reference to it, so the KMS is consulted
  * once per data key and per process, and that key can later be rewrapped under
  * another provider without rewriting a single row.
+ *
+ * The configured key and `$typeName` are authenticated as the AAD on both paths.
+ * Pass a stable parent type name to keep values readable when its PHP class changes.
+ * A null `$typeName` uses the parent PHP class for direct callers that omit the argument.
+ * Values written under a different key or type name are refused.
+ * The encrypted declaration's name and the parent instance's configuration aren't authenticated.
+ * The envelope binds the AAD locally, so the KMS needn't support authenticated data.
+ * A DBAL type never sees the row, so the type can't authenticate row identity.
  *
  * Needs the `Type` constructor that DBAL 4.3 unsealed, so that a subclass may
  * declare its own parameters.
@@ -59,6 +75,7 @@ use Symfony\Component\KeyManagement\Exception\InvalidArgumentException;
  *         Type::getTypeRegistry()->get('string'),
  *         $container->get(EnvelopeEncrypterInterface::class),
  *         'alias/app-key',
+ *         'string',
  *     );
  *     Type::getTypeRegistry()->register('app_user_email', $type);
  *
@@ -75,11 +92,32 @@ class EncryptedType extends Type
 {
     use BinaryColumn;
 
+    /**
+     * Tells this context from anything else authenticated under the same key.
+     */
+    private const string CONTEXT_LABEL = 'symfony/key-management/doctrine-dbal/encrypted-type/v1';
+
+    private readonly string $context;
+
+    /**
+     * @throws InvalidArgumentException If the key or type name exceeds 65535 bytes
+     */
     public function __construct(
         private readonly Type $parentType,
         private readonly EnvelopeEncrypterInterface&EnvelopeDecrypterInterface $envelopes,
         private readonly string $key,
+        ?string $typeName = null,
     ) {
+        if (0xFFFF < $length = \strlen($key)) {
+            throw new InvalidArgumentException(\sprintf('The key of an encrypted type is at most 65535 bytes long, %d given.', $length));
+        }
+
+        $typeName ??= $parentType::class;
+        if (0xFFFF < $typeLength = \strlen($typeName)) {
+            throw new InvalidArgumentException(\sprintf('The parent type name of an encrypted type is at most 65535 bytes long, %d given.', $typeLength));
+        }
+
+        $this->context = self::CONTEXT_LABEL.pack('n', $length).$key.pack('n', $typeLength).$typeName;
     }
 
     public function convertToDatabaseValue(#[\SensitiveParameter] mixed $value, AbstractPlatform $platform): mixed
@@ -99,7 +137,7 @@ class EncryptedType extends Type
             $plaintext = var_export($plaintext, true);
         }
 
-        return $this->envelopes->encrypt($this->key, self::bytes($plaintext));
+        return $this->envelopes->encrypt($this->key, self::bytes($plaintext), $this->context);
     }
 
     public function convertToPHPValue(mixed $value, AbstractPlatform $platform): mixed
@@ -109,17 +147,14 @@ class EncryptedType extends Type
         }
 
         $bytes = self::bytes($value);
-        if ('' === $bytes) {
-            return $this->parentType->convertToPHPValue($bytes, $platform);
-        }
 
         try {
             $envelope = Envelope::fromBytes($bytes);
         } catch (InvalidArgumentException $e) {
-            throw new InvalidArgumentException('Stored value is not a valid KeyManagement envelope.', previous: $e);
+            throw new ValueNotConvertible('Stored value is not a valid KeyManagement envelope.', 0, $e);
         }
 
-        return $this->parentType->convertToPHPValue($this->envelopes->decrypt($envelope), $platform);
+        return $this->parentType->convertToPHPValue($this->envelopes->decrypt($envelope, $this->context), $platform);
     }
 
     public function getBindingType(): ParameterType

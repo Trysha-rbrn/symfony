@@ -34,8 +34,8 @@ use Jose\Component\Signature\Algorithm\RS256;
 use Jose\Component\Signature\Algorithm\RS384;
 use Jose\Component\Signature\Algorithm\RS512;
 use Symfony\Bundle\SecurityBundle\Controller\ProtectedResourceMetadataController;
-use Symfony\Bundle\SecurityBundle\Routing\ProtectedResourceMetadataRouteLoader;
 use Symfony\Component\Security\Http\AccessToken\ChainAccessTokenExtractor;
+use Symfony\Component\Security\Http\AccessToken\Dpop\DpopSenderConstraint;
 use Symfony\Component\Security\Http\AccessToken\FormEncodedBodyExtractor;
 use Symfony\Component\Security\Http\AccessToken\HeaderAccessTokenExtractor;
 use Symfony\Component\Security\Http\AccessToken\OAuth2\Oauth2TokenHandler;
@@ -57,6 +57,14 @@ return static function (ContainerConfigurator $container) {
 
     $container->services()
         ->set('security.access_token_extractor.header', HeaderAccessTokenExtractor::class)
+
+        // RFC 9449, Section 7.1: a DPoP-bound access token is presented under the "DPoP" scheme and not
+        // under "Bearer", so that a resource server never takes one for a token anybody may present
+        ->set('security.access_token_extractor.dpop_header', HeaderAccessTokenExtractor::class)
+            ->args([
+                'Authorization',
+                'DPoP',
+            ])
         ->set('security.access_token_extractor.query_string', QueryAccessTokenExtractor::class)
         ->set('security.access_token_extractor.request_body', FormEncodedBodyExtractor::class)
 
@@ -70,20 +78,33 @@ return static function (ContainerConfigurator $container) {
                 null,
                 null,
                 null,
+                null,
             ])
+
+        ->set('security.authenticator.access_token.sender_constraint.dpop', DpopSenderConstraint::class)
+            ->abstract()
+            ->args([
+                abstract_arg('signature algorithms'),
+                abstract_arg('proof replay cache'),
+                service('clock'),
+                abstract_arg('proof lifetime'),
+                abstract_arg('allowed time drift'),
+                service('logger')->nullOnInvalid(),
+            ])
+
+        // the DPoP proofs already seen and the provider sessions that ended, which every server must share
+        ->set('cache.security')
+            ->parent('cache.app')
+            ->private()
+            ->tag('cache.pool')
+            ->tag('kernel.test_state', ['method' => 'clear'])
+            ->tag('container.remove_if_missing', ['service' => 'cache.app'])
 
         ->set('security.authenticator.access_token.protected_resource_metadata_controller', ProtectedResourceMetadataController::class)
             ->public()
             ->args([
                 [],
             ])
-
-        ->set('security.authenticator.access_token.route_loader', ProtectedResourceMetadataRouteLoader::class)
-            ->args([
-                '%security.access_token.resource_metadata_paths%',
-                'security.access_token.resource_metadata_paths',
-            ])
-            ->tag('routing.route_loader')
 
         ->set('security.access.oauth2_scope_voter', OAuth2ScopeVoter::class)
             ->tag('security.voter', ['priority' => 245])
@@ -94,6 +115,7 @@ return static function (ContainerConfigurator $container) {
                 abstract_arg('realm'),
                 service('security.access.denied_handler')->nullOnInvalid(),
                 abstract_arg('resource metadata uri'),
+                abstract_arg('sender constraint'),
             ])
 
         ->set('security.authenticator.access_token.chain_extractor', ChainAccessTokenExtractor::class)
@@ -230,6 +252,14 @@ return static function (ContainerConfigurator $container) {
 
         ->set('security.access_token_handler.oidc.encryption.A256GCM', A256GCM::class)
             ->tag('security.access_token_handler.oidc.encryption_algorithm')
+
+        // the discovery documents and the keys of the providers, read by the "oidc", "oidc_user_info" and "oauth2" token handlers and by "oidc_login"
+        ->set('cache.security.discovery')
+            ->parent('cache.app')
+            ->private()
+            ->tag('cache.pool')
+            ->tag('kernel.test_state', ['method' => 'clear'])
+            ->tag('container.remove_if_missing', ['service' => 'cache.app'])
 
         // OAuth2 Introspection (RFC 7662)
         ->set('security.access_token_handler.oauth2', Oauth2TokenHandler::class)

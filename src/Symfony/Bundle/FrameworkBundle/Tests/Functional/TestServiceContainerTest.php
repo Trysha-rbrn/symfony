@@ -18,6 +18,7 @@ use Symfony\Bundle\FrameworkBundle\Test\TestContainer;
 use Symfony\Bundle\FrameworkBundle\Tests\Functional\Bundle\TestBundle\TestServiceContainer\NonPublicService;
 use Symfony\Bundle\FrameworkBundle\Tests\Functional\Bundle\TestBundle\TestServiceContainer\PrivateService;
 use Symfony\Bundle\FrameworkBundle\Tests\Functional\Bundle\TestBundle\TestServiceContainer\PublicService;
+use Symfony\Bundle\FrameworkBundle\Tests\Functional\Bundle\TestBundle\TestServiceContainer\TestStateService;
 use Symfony\Bundle\FrameworkBundle\Tests\Functional\Bundle\TestBundle\TestServiceContainer\UnusedPrivateService;
 use Symfony\Component\DependencyInjection\Exception\InvalidArgumentException;
 
@@ -59,6 +60,87 @@ class TestServiceContainerTest extends AbstractWebTestCase
         $container->set('private_service', new \stdClass());
     }
 
+    public function testPrivateServicesAreInitializedAfterBeingCreated()
+    {
+        static::bootKernel(['test_case' => 'TestServiceContainer']);
+
+        $container = static::getContainer();
+
+        $this->assertFalse($container->initialized(PrivateService::class));
+        $this->assertFalse($container->initialized('private_service'));
+        $this->assertFalse($container->initialized(NonPublicService::class));
+        $this->assertFalse($container->initialized(UnusedPrivateService::class));
+        $this->assertFalse($container->initialized('unknown'));
+        $this->assertFalse($container->initialized('service_container'));
+
+        $container->get(PrivateService::class);
+
+        $this->assertTrue($container->initialized(PrivateService::class));
+        $this->assertTrue($container->initialized('private_service'));
+        $this->assertFalse($container->initialized(NonPublicService::class));
+    }
+
+    public function testPrivateServicesAreInitializedAfterBeingSet()
+    {
+        static::bootKernel(['test_case' => 'TestServiceContainer']);
+
+        $container = static::getContainer();
+        $container->set('private_service', null);
+        $this->assertFalse($container->initialized('private_service'));
+
+        $container->set('private_service', $service = new \stdClass());
+
+        $this->assertTrue($container->initialized('private_service'));
+        $this->assertTrue($container->initialized(PrivateService::class));
+        $this->assertSame($service, $container->get('private_service'));
+
+        static::$kernel->getContainer()->reset();
+
+        $this->assertFalse($container->initialized('private_service'));
+        $this->assertFalse($container->initialized(PrivateService::class));
+    }
+
+    public function testPublicServicesAreInitializedThroughPrivateAliases()
+    {
+        static::bootKernel(['test_case' => 'TestServiceContainer']);
+
+        $container = static::getContainer();
+
+        $this->assertFalse($container->initialized(PublicService::class));
+        $this->assertFalse($container->initialized('private_public_alias'));
+
+        $container->get(PublicService::class);
+
+        $this->assertTrue($container->initialized(PublicService::class));
+        $this->assertTrue($container->initialized('private_public_alias'));
+    }
+
+    public function testDecoratedServicesAreInitializedAfterTheDecoratorIsCreated()
+    {
+        static::bootKernel(['test_case' => 'TestServiceContainer']);
+
+        $container = static::getContainer();
+        $container->set('decorated', $service = new PrivateService());
+
+        $this->assertTrue($container->initialized('decorator.inner'));
+        $this->assertFalse($container->initialized('decorated'));
+        $this->assertFalse($container->initialized('decorator'));
+        $this->assertSame($service, $container->get('decorated')->inner);
+        $this->assertTrue($container->initialized('decorated'));
+        $this->assertTrue($container->initialized('decorator'));
+    }
+
+    public function testNonSharedServicesAreNotInitialized()
+    {
+        static::bootKernel(['test_case' => 'TestServiceContainer']);
+
+        $container = static::getContainer();
+
+        $this->assertFalse($container->initialized('non_shared_service'));
+        $container->get('non_shared_service');
+        $this->assertFalse($container->initialized('non_shared_service'));
+    }
+
     public function testSetDecoratedService()
     {
         static::bootKernel(['test_case' => 'TestServiceContainer']);
@@ -97,6 +179,92 @@ class TestServiceContainerTest extends AbstractWebTestCase
         $this->expectExceptionMessage('The "non_shared_service" service is non-shared and must be replaced by a closure that should act as a factory.');
 
         $container->set('non_shared_service', new \stdClass());
+    }
+
+    public function testServicesTaggedToKeepTheirStateAreCopiedBeforeEachReset()
+    {
+        static::bootKernel(['test_case' => 'TestServiceContainer']);
+
+        $container = static::getContainer();
+        $service = $container->get('test_state.kept');
+        $service->record('foo');
+
+        $container->keepState();
+        $container->get('services_resetter')->reset();
+        $service->record('bar');
+        $container->keepState();
+        $container->get('services_resetter')->reset();
+        $service->record('baz');
+
+        $this->assertSame([['foo'], ['bar']], array_map(static fn (TestStateService $kept) => $kept->getRecords(), $container->getKeptState('test_state.kept')));
+        $this->assertSame(['baz'], $service->getRecords());
+    }
+
+    public function testServicesTaggedToKeepTheirStateAreNotInstantiatedToBeCopied()
+    {
+        static::bootKernel(['test_case' => 'TestServiceContainer']);
+
+        $container = static::getContainer();
+        $container->keepState();
+
+        $this->assertSame([], $container->getKeptState('test_state.kept_but_unused'));
+        $this->assertFalse($container->initialized('test_state.kept_but_unused'));
+    }
+
+    public function testServicesTaggedToKeepTheirStateAreCopiedBeforeTheClientRebootsTheKernel()
+    {
+        $client = static::createClient(['test_case' => 'TestServiceContainer']);
+        $client->request('GET', '/test_state/foo');
+        $client->request('GET', '/test_state/bar');
+        $client->request('GET', '/test_state/baz');
+
+        $container = $client->getContainer();
+        $this->assertSame([['foo'], ['bar']], array_map(static fn (TestStateService $kept) => $kept->getRecords(), $container->getKeptState('test_state.kept')));
+        $this->assertSame(['baz'], $container->get('test_state.kept')->getRecords());
+    }
+
+    public function testServicesTaggedToKeepTheirStateAreCopiedBeforeTheClientResetsTheKernel()
+    {
+        $client = static::createClient(['test_case' => 'TestServiceContainer']);
+        $client->disableReboot();
+        $client->request('GET', '/test_state/foo');
+        $client->request('GET', '/test_state/bar');
+
+        $container = $client->getContainer();
+        $this->assertSame([['foo']], array_map(static fn (TestStateService $kept) => $kept->getRecords(), $container->getKeptState('test_state.kept')));
+        $this->assertSame(['bar'], $container->get('test_state.kept')->getRecords());
+    }
+
+    public function testServicesTaggedWithAMethodAreCalledWhenTheKernelIsShutDown()
+    {
+        TestStateService::$clearCount = 0;
+        static::bootKernel(['test_case' => 'TestServiceContainer']);
+
+        $this->assertSame(0, TestStateService::$clearCount);
+
+        static::ensureKernelShutdown();
+
+        $this->assertSame(1, TestStateService::$clearCount);
+    }
+
+    public function testServicesTaggedWithAMethodAreCalledWhenTheKernelIsShutDownAfterAContainerReset()
+    {
+        TestStateService::$clearCount = 0;
+        static::bootKernel(['test_case' => 'TestServiceContainer']);
+        static::$kernel->getContainer()->reset();
+
+        static::ensureKernelShutdown();
+
+        $this->assertSame(1, TestStateService::$clearCount);
+    }
+
+    public function testTestStateIsIgnoredIfTestConfigIsDisabled()
+    {
+        TestStateService::$clearCount = 0;
+        static::bootKernel(['test_case' => 'TestServiceContainer', 'root_config' => 'test_disabled.yml', 'environment' => 'test_disabled']);
+        static::ensureKernelShutdown();
+
+        $this->assertSame(0, TestStateService::$clearCount);
     }
 
     #[DoesNotPerformAssertions]

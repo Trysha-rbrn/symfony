@@ -70,15 +70,28 @@ class LogoutUrlGenerator implements ResetInterface
      * Returns the action and the hidden fields of a form triggering the logout.
      *
      * Unlike the URLs, this keeps the CSRF token out of the address bar and suits a
-     * logout endpoint restricted to POST requests.
+     * logout endpoint restricted to POST requests. The fields hold the CSRF token when
+     * the firewall enables CSRF protection, under its "csrf_parameter" name, unless the
+     * route of the logout path takes it as a placeholder. Render each field as a hidden
+     * input of a form posted to the action, e.g. with Twig:
      *
-     * @return array{action: string, fields: array<string, string>}
+     *     {% set form = logout_form() %}
+     *     <form method="post" action="{{ form.action }}">
+     *         {% for name, value in form.fields %}
+     *             <input type="hidden" name="{{ name }}" value="{{ value }}">
+     *         {% endfor %}
+     *         <button>Log out</button>
+     *     </form>
+     *
+     * The "csrf_field" key gives the name of the field that contains the CSRF token, or null. A template can use it to mark this field for client-side scripts.
+     *
+     * @return array{action: string, fields: array<string, string>, csrf_field: string|null}
      */
     public function getLogoutForm(?string $key = null): array
     {
-        [$action, $fields] = $this->buildParts($key, UrlGeneratorInterface::ABSOLUTE_PATH);
+        [$action, $fields, $csrfParameter] = $this->buildParts($key, UrlGeneratorInterface::ABSOLUTE_PATH);
 
-        return ['action' => $action, 'fields' => $fields];
+        return ['action' => $action, 'fields' => $fields, 'csrf_field' => null !== $csrfParameter && \array_key_exists($csrfParameter, $fields) ? $csrfParameter : null];
     }
 
     public function setCurrentFirewall(?string $key, ?string $context = null): void
@@ -102,7 +115,7 @@ class LogoutUrlGenerator implements ResetInterface
     }
 
     /**
-     * @return array{0: string, 1: array<string, string>}
+     * @return array{0: string, 1: array<string, string>, 2: string|null}
      */
     private function buildParts(?string $key, int $referenceType): array
     {
@@ -120,7 +133,7 @@ class LogoutUrlGenerator implements ResetInterface
             }
 
             // the route may take the parameters as placeholders, only the others are left over
-            return self::splitQuery($this->router->generate($logoutPath, $parameters, $referenceType));
+            return [...self::splitQuery($this->router->generate($logoutPath, $parameters, $referenceType)), $csrfParameter];
         }
 
         if (!$this->requestStack) {
@@ -135,7 +148,7 @@ class LogoutUrlGenerator implements ResetInterface
 
         $url = UrlGeneratorInterface::ABSOLUTE_URL === $referenceType ? $request->getUriForPath($logoutPath) : $request->getBaseUrl().$logoutPath;
 
-        return [$url, $parameters];
+        return [$url, $parameters, $csrfParameter];
     }
 
     /**

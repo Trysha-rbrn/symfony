@@ -16,6 +16,7 @@ use MongoDB\BSON\ObjectId;
 use MongoDB\BSON\UTCDateTime;
 use MongoDB\Client;
 use MongoDB\Collection;
+use MongoDB\Driver\Exception\BulkWriteException;
 use MongoDB\Driver\Exception\Exception as MongoDriverException;
 use MongoDB\Driver\Session;
 use MongoDB\Driver\WriteConcern;
@@ -33,8 +34,8 @@ use Symfony\Component\Messenger\Exception\TransportException;
 class Connection
 {
     private const DEFAULT_OPTIONS = [
-        'database' => null,
-        'collection_name' => 'messenger_messages',
+        'database' => 'app',
+        'collection' => 'messenger_messages',
         'queue_name' => 'default',
         'redeliver_timeout' => 3600,
     ];
@@ -55,7 +56,7 @@ class Connection
         [$configuration, $uri] = self::buildConfiguration($dsn, $options);
 
         $client ??= new Client($uri, [], self::driverInfo());
-        $collection = $client->getCollection($configuration['database'], $configuration['collection_name']);
+        $collection = $client->getCollection($configuration['database'], $configuration['collection']);
 
         return new self($collection, $configuration['queue_name'], $configuration['redeliver_timeout'], $clock);
     }
@@ -85,7 +86,7 @@ class Connection
      * Query parameters that are not transport settings are kept and passed
      * to the MongoDB driver.
      *
-     * @return array{0: array{database: string, collection_name: string, queue_name: string, redeliver_timeout: int}, 1: string}
+     * @return array{0: array{database: string, collection: string, queue_name: string, redeliver_timeout: int}, 1: string}
      */
     public static function buildConfiguration(#[\SensitiveParameter] string $dsn, array $options = []): array
     {
@@ -93,36 +94,31 @@ class Connection
             throw new InvalidArgumentException('The given MongoDB Messenger DSN is invalid. Expecting "mongodb://" or "mongodb+srv://".');
         }
 
-        if (false === $components = parse_url($dsn)) {
-            throw new InvalidArgumentException('The given MongoDB Messenger DSN is invalid.');
-        }
-
-        $query = [];
-        if (isset($components['query'])) {
-            parse_str($components['query'], $query);
-        }
+        [$uri, $query, $path] = self::parseDsn($dsn);
 
         if ($invalidOptions = array_diff(array_keys($options), array_keys(self::DEFAULT_OPTIONS))) {
             throw new InvalidArgumentException(\sprintf('Unknown option found: [%s]. Allowed options are [%s].', implode(', ', $invalidOptions), implode(', ', array_keys(self::DEFAULT_OPTIONS))));
         }
 
-        $configuration = $options + array_intersect_key($query, self::DEFAULT_OPTIONS) + self::DEFAULT_OPTIONS;
-        $configuration['database'] ??= ltrim($components['path'] ?? '', '/') ?: null;
-
-        if (null === $configuration['database']) {
-            throw new InvalidArgumentException('The MongoDB Messenger transport requires a "database", provide it in the DSN path or as an option.');
+        if (isset($options['database']) && '' === $options['database']) {
+            throw new InvalidArgumentException('The "database" option must not be empty.');
         }
+        if (isset($options['collection']) && '' === $options['collection']) {
+            throw new InvalidArgumentException('The "collection" option must not be empty.');
+        }
+
+        $configuration = $options;
+        $database = rawurldecode(ltrim($path, '/'));
+        $configuration['database'] ??= '' !== $database ? $database : ($query['database'] ?? self::DEFAULT_OPTIONS['database']);
+        unset($query['database']);
+        $configuration += array_intersect_key($query, self::DEFAULT_OPTIONS) + self::DEFAULT_OPTIONS;
 
         if (!is_numeric($configuration['redeliver_timeout'])) {
             throw new InvalidArgumentException(\sprintf('The "redeliver_timeout" option must be an integer, "%s" given.', get_debug_type($configuration['redeliver_timeout'])));
         }
         $configuration['redeliver_timeout'] = (int) $configuration['redeliver_timeout'];
 
-        foreach (array_keys(self::DEFAULT_OPTIONS) as $option) {
-            $dsn = self::removeUriOption($dsn, $option);
-        }
-
-        return [$configuration, $dsn];
+        return [$configuration, $uri];
     }
 
     public function getUniqueId(): string
@@ -131,10 +127,22 @@ class Connection
     }
 
     /**
+     * Returns the next available message, claimed with an atomic lock.
+     *
+     * The queues are served in FIFO order (sorted by availableAt), with no priority between them.
+     *
+     * @param list<string>|null $queueNames Defaults to the configured queue
+     *
      * @throws TransportException
      */
-    public function get(): ?BSONDocument
+    public function get(?array $queueNames = null): ?BSONDocument
     {
+        $queueNames ??= [$this->queueName];
+
+        if (!$queueNames) {
+            throw new InvalidArgumentException('At least one queue name is required.');
+        }
+
         $options = $this->getWriteOptions();
         $options['returnDocument'] = FindOneAndUpdate::RETURN_DOCUMENT_AFTER;
         $options['sort'] = [
@@ -150,7 +158,7 @@ class Connection
         ];
 
         try {
-            $updatedDocument = $this->collection->findOneAndUpdate($this->createAvailableMessagesQuery(), $updateStatement, $options);
+            $updatedDocument = $this->collection->findOneAndUpdate($this->createAvailableMessagesQuery($queueNames), $updateStatement, $options);
         } catch (MongoDriverException $exception) {
             throw new TransportException($exception->getMessage(), 0, $exception);
         }
@@ -169,23 +177,16 @@ class Connection
 
     /**
      * @param array<string, string> $headers
-     * @param int                   $delay   The delay in milliseconds
+     * @param int                   $delay     The delay in milliseconds
+     * @param string|null           $queueName The queue to send to, defaults to the configured queue
      *
      * @return ObjectId The inserted id
      *
      * @throws TransportException
      */
-    public function send(string $body, array $headers = [], int $delay = 0, ?Session $session = null): ObjectId
+    public function send(string $body, array $headers = [], int $delay = 0, ?Session $session = null, ?string $queueName = null): ObjectId
     {
-        $now = $this->now();
-        $availableAt = $now->modify(\sprintf('+%d milliseconds', $delay));
-
-        $document = new BSONDocument();
-        $document['body'] = $body;
-        $document['headers'] = new BSONDocument($headers);
-        $document['queueName'] = $this->queueName;
-        $document['createdAt'] = new UTCDateTime($now);
-        $document['availableAt'] = new UTCDateTime($availableAt);
+        $document = $this->createDocument($this->now(), $body, $headers, $delay, $queueName);
 
         try {
             $insertResult = $this->collection->insertOne($document, $this->getWriteOptions($session));
@@ -194,6 +195,68 @@ class Connection
         }
 
         return $insertResult->getInsertedId();
+    }
+
+    /**
+     * Inserts messages with one request per run of consecutive messages that share the same session.
+     *
+     * The driver splits each request into as many commands as the size limits of the server require.
+     *
+     * @param non-empty-array<array{string, array<string, string>, int, ?Session, ?string}> $messages The arguments of send() for each message
+     *
+     * @return array{array<ObjectId>, array<TransportException>} The ids of the inserted messages and the exceptions that prevented inserting the others, by the key of the messages
+     */
+    public function sendBatch(array $messages): array
+    {
+        $now = $this->now();
+        $ids = $requests = $documents = [];
+        $session = null;
+
+        foreach ($messages as $key => [$body, $headers, $delay, $messageSession, $queueName]) {
+            if ($documents && $messageSession !== $session) {
+                $requests[] = [$session, $documents];
+                $documents = [];
+            }
+
+            $session = $messageSession;
+            $document = $this->createDocument($now, $body, $headers, $delay, $queueName);
+            // generated like the driver does, to know the ids of the documents inserted before a failure
+            $document['_id'] = $ids[$key] = new ObjectId();
+            $documents[$key] = $document;
+        }
+
+        $requests[] = [$session, $documents];
+        $exceptions = [];
+
+        foreach ($requests as $i => [$session, $documents]) {
+            try {
+                $this->collection->insertMany(array_values($documents), ['ordered' => false] + $this->getWriteOptions($session));
+            } catch (MongoDriverException $e) {
+                $keys = array_keys($documents);
+                // a write concern error fails all the documents, as it fails send()
+                $result = $e instanceof BulkWriteException && !$e->getWriteResult()->getWriteConcernError() ? $e->getWriteResult() : null;
+
+                foreach ($result?->getWriteErrors() ?? [] as $error) {
+                    $exceptions[$keys[$error->getIndex()]] = new TransportException($error->getMessage());
+                }
+
+                // unordered inserts go on after a rejected document; the driver sends the documents in order until an error stops it
+                $processed = $result ? $result->getInsertedCount() + \count($result->getWriteErrors()) : 0;
+
+                if ($processed < \count($keys)) {
+                    $exception = new TransportException($e->getMessage(), 0, $e);
+                    $exceptions += array_fill_keys(\array_slice($keys, $processed), $exception);
+
+                    foreach (\array_slice($requests, $i + 1) as [, $unsent]) {
+                        $exceptions += array_fill_keys(array_keys($unsent), $exception);
+                    }
+
+                    break;
+                }
+            }
+        }
+
+        return [array_diff_key($ids, $exceptions), $exceptions];
     }
 
     /**
@@ -304,10 +367,14 @@ class Connection
     }
 
     /**
+     * @param list<string>|null $queueNames Defaults to the configured queue
+     *
      * @return array<string, mixed>
      */
-    private function createAvailableMessagesQuery(): array
+    private function createAvailableMessagesQuery(?array $queueNames = null): array
     {
+        $queueNames ??= [$this->queueName];
+
         $now = $this->now();
         $redeliverLimit = $now->modify(\sprintf('-%d seconds', $this->redeliverTimeout));
 
@@ -319,7 +386,7 @@ class Connection
                 ]],
             ],
             'availableAt' => ['$lte' => new UTCDateTime($now)],
-            'queueName' => $this->queueName,
+            'queueName' => ['$in' => $queueNames],
         ];
     }
 
@@ -353,21 +420,70 @@ class Connection
         return $readOptions;
     }
 
-    private function now(): \DateTimeImmutable
+    /**
+     * @param array<string, string> $headers
+     */
+    private function createDocument(\DateTimeImmutable $now, string $body, array $headers, int $delay, ?string $queueName): BSONDocument
     {
-        return $this->clock?->now() ?? new \DateTimeImmutable();
+        $availableAt = $now->modify(\sprintf('+%d milliseconds', $delay));
+
+        $document = new BSONDocument();
+        $document['body'] = $body;
+        $document['headers'] = new BSONDocument($headers);
+        $document['queueName'] = $queueName ?? $this->queueName;
+        $document['createdAt'] = new UTCDateTime($now);
+        $document['availableAt'] = new UTCDateTime($availableAt);
+
+        return $document;
     }
 
-    private static function removeUriOption(string $uri, string $option): string
+    private function now(): \DateTimeImmutable
     {
-        if (preg_match('/^(.*[?&])'.$option.'=[^&#]*&?(([^#]*).*)$/', $uri, $matches)) {
-            $prefix = $matches[1];
-            if ('' === $matches[3]) {
-                $prefix = substr($prefix, 0, -1);
-            }
-            $uri = $prefix.$matches[2];
+        return $this->clock?->now() ?? \DateTimeImmutable::createFromTimestamp(microtime(true));
+    }
+
+    /**
+     * Removes the transport options from the DSN and returns the remaining URI, query options and path.
+     *
+     * URI options are kept in order, including repeated options such as "readPreferenceTags".
+     *
+     * @return array{0: string, 1: array<string, string>, 2: string}
+     */
+    private static function parseDsn(#[\SensitiveParameter] string $dsn): array
+    {
+        if (false === $params = parse_url($dsn)) {
+            throw new InvalidArgumentException('The given MongoDB DSN is invalid.'.(preg_match('{^[^:/?#]++://(?:[^/?#@]*+@)?[^/?#,]*+,}', $dsn) ? ' When it lists several hosts, add the port of the last one too.' : ''));
         }
 
-        return $uri;
+        if ('' === ($params['host'] ?? '')) {
+            throw new InvalidArgumentException('The given MongoDB DSN is invalid: no host specified.');
+        }
+
+        $query = $kept = [];
+        foreach (explode('&', $params['query'] ?? '') as $pair) {
+            if ('' === $pair) {
+                continue;
+            }
+
+            $eq = strpos($pair, '=');
+            $key = rawurldecode(false === $eq ? $pair : substr($pair, 0, $eq));
+            $value = false === $eq ? '' : rawurldecode(substr($pair, $eq + 1));
+
+            if (('database' === $key || 'collection' === $key) && '' === $value) {
+                throw new InvalidArgumentException(\sprintf('The "%s" DSN option must not be empty.', $key));
+            }
+
+            $query[$key] = $value;
+            if (!\array_key_exists($key, self::DEFAULT_OPTIONS)) {
+                $kept[] = $pair;
+            }
+        }
+
+        $uri = $dsn;
+        if (isset($params['query'])) {
+            $uri = str_replace('?'.$params['query'], $kept ? '?'.implode('&', $kept) : '', $uri);
+        }
+
+        return [$uri, $query, $params['path'] ?? ''];
     }
 }

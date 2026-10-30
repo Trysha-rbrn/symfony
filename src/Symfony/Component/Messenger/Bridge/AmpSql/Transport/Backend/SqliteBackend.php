@@ -28,6 +28,11 @@ final class SqliteBackend implements BackendInterface
         return '';
     }
 
+    public function getNeverDeliveredOrderBy(): string
+    {
+        return 'delivered_at ASC, id ASC';
+    }
+
     public function validateVersion(SqlConnection $connection): void
     {
         $version = $connection->query('SELECT sqlite_version() AS version')->fetchRow()['version'] ?? null;
@@ -61,5 +66,19 @@ final class SqliteBackend implements BackendInterface
         $transaction->execute(\sprintf('INSERT INTO %s (body, headers, queue_name, created_at, available_at) VALUES (?, ?, ?, %s, %s + ?)', $table, $now, $now), [$body, $headers, $queueName, $delay]);
 
         return $transaction->query('SELECT last_insert_rowid() AS id')->fetchRow()['id'] ?? null;
+    }
+
+    public function insertBatch(SqlTransaction $transaction, string $table, array $messages, string $queueName): array
+    {
+        $now = $this->getNowExpression();
+        $values = implode(', ', array_fill(0, \count($messages), \sprintf('(?, ?, ?, %s, %s + ?)', $now, $now)));
+        $params = [];
+        foreach ($messages as [$body, $headers, $delay]) {
+            array_push($params, $body, $headers, $queueName, $delay);
+        }
+        $transaction->execute(\sprintf('INSERT INTO %s (body, headers, queue_name, created_at, available_at) VALUES %s', $table, $values), $params);
+
+        // RETURNING yields the rows in an arbitrary order
+        return [];
     }
 }

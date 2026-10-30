@@ -801,7 +801,7 @@ class OptionsResolver implements Options
 
         foreach ((array) $optionNames as $option) {
             unset($this->defined[$option], $this->defaults[$option], $this->required[$option], $this->resolved[$option]);
-            unset($this->lazy[$option], $this->normalizers[$option], $this->allowedTypes[$option], $this->allowedValues[$option], $this->info[$option], $this->deprecated[$option]);
+            unset($this->lazy[$option], $this->nested[$option], $this->normalizers[$option], $this->allowedTypes[$option], $this->allowedValues[$option], $this->info[$option], $this->deprecated[$option]);
         }
 
         return $this;
@@ -898,9 +898,12 @@ class OptionsResolver implements Options
         $clone->locked = true;
 
         // Now process the individual options. Use offsetGet(), which resolves
-        // the option itself and any options that the option depends on
+        // the option itself and any options that the option depends on.
+        // Options without rules were resolved when their default was set.
         foreach ($clone->defaults as $option => $_) {
-            $clone->offsetGet($option);
+            if (isset($clone->deprecated[$option]) || !\array_key_exists($option, $clone->resolved)) {
+                $clone->offsetGet($option);
+            }
         }
 
         return $clone->resolved;
@@ -1137,6 +1140,20 @@ class OptionsResolver implements Options
 
     private function verifyTypes(string $type, mixed $value, ?array &$invalidTypes = null, int $level = 0): bool
     {
+        // Shortcut for a single type that the value matches
+        if (isset(self::VALIDATION_FUNCTIONS[$type]) ? self::VALIDATION_FUNCTIONS[$type]($value) : ('null' === $type ? null === $value : $value instanceof $type)) {
+            return true;
+        }
+
+        // Autoloading can make the second is_callable() check return a different result.
+        if ('callable' !== $type && ']' !== ($type[-1] ?? '') && (isset(self::VALIDATION_FUNCTIONS[$type]) || false === strpbrk($type, "|()[] \t\n\r\0\x0B"))) {
+            if (\is_array($invalidTypes) && (!$invalidTypes || $level > 0)) {
+                $invalidTypes[get_debug_type($value)] = true;
+            }
+
+            return false;
+        }
+
         $type = trim($type);
         $allowedTypes = $this->splitOutsideParenthesis($type);
         if (\count($allowedTypes) > 1) {
@@ -1187,6 +1204,10 @@ class OptionsResolver implements Options
      */
     private function splitOutsideParenthesis(string $type): array
     {
+        if (!str_contains($type, '|')) {
+            return [$type];
+        }
+
         return preg_split(<<<'EOF'
                     /
                     # Define a recursive subroutine for matching balanced parentheses

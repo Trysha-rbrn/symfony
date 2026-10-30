@@ -38,22 +38,8 @@ class SemaphoreBundle extends AbstractBundle
     public function configure(DefinitionConfigurator $definition): void
     {
         $definition->rootNode()
-            ->acceptAndWrap(['string'], 'resources')
+            ->acceptAndWrap(['string', 'array'], 'resources')
             ->canBeDisabled()
-            ->beforeNormalization()
-                ->ifArray()
-                ->then(static function ($v) {
-                    if (!isset($v['resources']) && !isset($v['resource'])) {
-                        $v = ['resources' => $v];
-                        if (\array_key_exists('enabled', $v['resources'])) {
-                            $v['enabled'] = $v['resources']['enabled'];
-                            unset($v['resources']['enabled']);
-                        }
-                    }
-
-                    return $v;
-                })
-            ->end()
             ->children()
                 ->arrayNode('resources', 'resource')
                     ->normalizeKeys(false)
@@ -106,6 +92,7 @@ class SemaphoreBundle extends AbstractBundle
                 !str_contains($resourceStore, '://') => new Reference($resourceStore),
                 default => $resourceStore,
             }]);
+            $storeDefinition->addTag('kernel.reset', ['method' => 'close', 'on_invalid' => 'ignore', 'on_shutdown' => 'only']);
 
             $container->setDefinition($storeDefinitionId = '.semaphore.'.$resourceName.'.store.'.$container->hash($storeDsn), $storeDefinition);
 

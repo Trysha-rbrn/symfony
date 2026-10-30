@@ -16,21 +16,36 @@ use PHPUnit\Framework\TestCase;
 use Symfony\Component\Config\Definition\Exception\InvalidConfigurationException;
 use Symfony\Component\Config\FileLocator;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
+use Symfony\Component\DependencyInjection\ContainerInterface;
 use Symfony\Component\DependencyInjection\Definition;
 use Symfony\Component\DependencyInjection\Loader\PhpFileLoader;
 use Symfony\Component\DependencyInjection\Reference;
 use Symfony\Component\EventDispatcher\DependencyInjection\AddEventAliasesPass;
+use Symfony\Component\ExpressionLanguage\Expression;
+use Symfony\Component\ExpressionLanguage\ExpressionLanguage;
+use Symfony\Component\Security\Core\Authentication\AuthenticationTrustResolverInterface;
+use Symfony\Component\Security\Core\Authentication\Token\Storage\TokenStorage;
+use Symfony\Component\Security\Core\Authorization\AuthorizationCheckerInterface;
+use Symfony\Component\Security\Core\Role\RoleHierarchy;
 use Symfony\Component\Workflow\Arc;
 use Symfony\Component\Workflow\Definition as WorkflowDefinition;
+use Symfony\Component\Workflow\DependencyInjection\WorkflowAttributePass;
 use Symfony\Component\Workflow\DependencyInjection\WorkflowDebugPass;
 use Symfony\Component\Workflow\DependencyInjection\WorkflowGuardListenerPass;
 use Symfony\Component\Workflow\DependencyInjection\WorkflowValidatorPass;
+use Symfony\Component\Workflow\Event\GuardEvent;
+use Symfony\Component\Workflow\EventListener\GuardListener;
 use Symfony\Component\Workflow\Exception\InvalidDefinitionException;
+use Symfony\Component\Workflow\Marking;
 use Symfony\Component\Workflow\Metadata\InMemoryMetadataStore;
+use Symfony\Component\Workflow\SupportStrategy\InstanceOfSupportStrategy;
 use Symfony\Component\Workflow\Tests\Fixtures\DefinitionValidator;
+use Symfony\Component\Workflow\Tests\Subject;
+use Symfony\Component\Workflow\Transition;
 use Symfony\Component\Workflow\Validator\DefinitionValidatorInterface;
 use Symfony\Component\Workflow\WorkflowBundle;
 use Symfony\Component\Workflow\WorkflowEvents;
+use Symfony\Component\Workflow\WorkflowInterface;
 
 class WorkflowBundleExtensionTest extends TestCase
 {
@@ -57,6 +72,11 @@ class WorkflowBundleExtensionTest extends TestCase
         $this->assertArrayHasKey('workflow.workflow', $tags);
         $this->assertSame([['name' => 'article']], $tags['workflow.workflow']);
         $this->assertSame('article', $tags['workflow'][0]['name'] ?? null);
+        $this->assertSame([self::class], $tags['workflow'][0]['supports']);
+        $this->assertArrayHasKey('support_strategy', $tags['workflow'][0]);
+        $this->assertNull($tags['workflow'][0]['support_strategy']);
+        $this->assertArrayHasKey('source_class', $tags['workflow'][0]);
+        $this->assertNull($tags['workflow'][0]['source_class']);
         $this->assertSame([
             'title' => 'article workflow',
             'description' => 'workflow for articles',
@@ -244,6 +264,25 @@ class WorkflowBundleExtensionTest extends TestCase
         $this->assertNull($argumentsB['index_1'], 'workflow_b marking_store argument is null');
     }
 
+    public function testSupportStrategyIsExposedOnTheTag()
+    {
+        $container = $this->createContainer();
+        $container->register('article_support', InstanceOfSupportStrategy::class)->setArguments([\stdClass::class]);
+        $container->loadFromExtension('workflow', [
+            'article' => [
+                'type' => 'workflow',
+                'support_strategy' => 'article_support',
+                'places' => ['draft', 'published'],
+                'transitions' => ['publish' => ['from' => 'draft', 'to' => 'published']],
+            ],
+        ]);
+        $container->compile();
+
+        $tag = $container->getDefinition('workflow.article')->getTag('workflow')[0];
+        $this->assertSame([], $tag['supports']);
+        $this->assertSame('article_support', $tag['support_strategy']);
+    }
+
     public function testWorkflowCannotHaveBothSupportsAndSupportStrategy()
     {
         $this->expectException(InvalidConfigurationException::class);
@@ -251,11 +290,12 @@ class WorkflowBundleExtensionTest extends TestCase
         $this->createContainerFromFile('workflow_with_support_and_support_strategy');
     }
 
-    public function testWorkflowShouldHaveOneOfSupportsAndSupportStrategy()
+    public function testWorkflowWithoutSupportsNorSupportStrategyIsNotAddedToTheRegistry()
     {
-        $this->expectException(InvalidConfigurationException::class);
-        $this->expectExceptionMessage('"supports" or "support_strategy" should be configured.');
-        $this->createContainerFromFile('workflow_without_support_and_support_strategy');
+        $container = $this->createContainerFromFile('workflow_without_support_and_support_strategy');
+
+        $this->assertTrue($container->hasDefinition('workflow.my_workflow'));
+        $this->assertSame([], $container->getDefinition('workflow.registry')->getMethodCalls());
     }
 
     public function testWorkflowWithSimplisticPlaceFollowedByComplexPlace()
@@ -345,6 +385,28 @@ class WorkflowBundleExtensionTest extends TestCase
         $this->assertSame('!!true', $transitionGuardExpressions[0]->getArgument(1));
         $this->assertSame('.workflow.article.transition.4', (string) $transitionGuardExpressions[1]->getArgument(0));
         $this->assertSame('!!false', $transitionGuardExpressions[1]->getArgument(1));
+
+        $expressionLanguage = $container->getDefinition('workflow.security.expression_language');
+        $this->assertEquals(new Reference('cache.workflow_expression_language', ContainerInterface::NULL_ON_INVALID_REFERENCE), $expressionLanguage->getArgument(0));
+        $tags = $expressionLanguage->getTag('expression_language.compiled');
+        $this->assertSame(['!!true', '!!false'], $tags[0]['expressions']);
+        $this->assertSame('the guards of the "article" workflow', $tags[0]['source']);
+
+        $spy = new class extends ExpressionLanguage {
+            public array $variables = [];
+
+            public function evaluate(Expression|string $expression, array $values = []): mixed
+            {
+                $this->variables = array_keys($values);
+
+                return true;
+            }
+        };
+        $subject = new Subject();
+        $guardListener = new GuardListener(['guard' => ['true']], $spy, new TokenStorage(), $this->createStub(AuthorizationCheckerInterface::class), $this->createStub(AuthenticationTrustResolverInterface::class), new RoleHierarchy([]));
+        $guardListener->onTransition(new GuardEvent($subject, new Marking([]), new Transition('t', 'a', 'b'), $this->createStub(WorkflowInterface::class)), 'guard');
+
+        $this->assertEqualsCanonicalizing($spy->variables, $tags[0]['variables']);
     }
 
     public function testWorkflowServicesCanBeEnabled()
@@ -353,6 +415,7 @@ class WorkflowBundleExtensionTest extends TestCase
 
         $this->assertTrue($container->hasDefinition('workflow.registry'));
         $this->assertTrue($container->hasDefinition('console.command.workflow_dump'));
+        $this->assertFalse($container->getDefinition('workflow.security.expression_language')->hasTag('expression_language.compiled'));
     }
 
     public function testWorkflowServicesAreEnabledByDefault()
@@ -393,6 +456,7 @@ class WorkflowBundleExtensionTest extends TestCase
         $passes = array_map(get_class(...), $container->getCompilerPassConfig()->getBeforeOptimizationPasses());
         $this->assertContains(AddEventAliasesPass::class, $passes);
         $this->assertContains(WorkflowGuardListenerPass::class, $passes);
+        $this->assertContains(WorkflowAttributePass::class, $passes);
         $this->assertContains(WorkflowValidatorPass::class, $passes);
         $this->assertNotContains(WorkflowDebugPass::class, $passes);
 

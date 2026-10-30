@@ -23,17 +23,63 @@ namespace Symfony\Component\KeyManagement;
  * itself is named by `$wrapped->keyId`. Both are needed because a migration runs with the old and
  * the new provider configured at the same time, so each row must say who can unwrap it.
  *
+ * `$binding` ties the key to its reference and scope, {@see bindingFor()}.
+ * Its HMAC key is derived from the data key and from a secret of the store.
+ * A database writer doesn't know that secret.
+ * A store checks it once the key is open.
+ *
  * @author Florent Morselli <florent.morselli@spomky-labs.com>
  *
  * @experimental
  */
 final class StoredDataKey
 {
+    /**
+     * Tells this derivation from any other use of the same data key, and leaves room for a second.
+     */
+    private const string BINDING_INFO = 'symfony/key-management/data-key-binding/v1';
+
+    /**
+     * Tells this context from anything else the same master key is asked to authenticate.
+     */
+    private const string WRAPPING_LABEL = 'symfony/key-management/data-key-wrapping/v1';
+
     public function __construct(
         public readonly string $reference,
         public readonly string $scope,
         public readonly Ciphertext $wrapped,
         public readonly string $client,
+        public readonly string $binding,
     ) {
+    }
+
+    /**
+     * Proof that a data key was minted for `$reference` and `$scope` by a store that knows `$secret`.
+     *
+     * The wrapping of a data key is bound to nothing but the master key.
+     * Without this proof, a row whose scope was edited would hand the key of one tenant, column or purpose to another one, and the row of a retired key copied under a fresh UUIDv7 would read as the current key of its scope.
+     * The length prefix keeps two different pairs from hashing the same input.
+     *
+     * The HMAC key is derived from the data key and the secret, instead of passing authenticated data to the KMS, which some backends cannot enforce.
+     * The secret stops a database writer from inserting a data key they know.
+     * They could wrap such a key under a public key, or under a master key of their own that the application is allowed to use.
+     * A rewrap keeps the data key, so the binding can be checked and computed again under the current secret of the store.
+     */
+    public static function bindingFor(string $reference, string $scope, #[\SensitiveParameter] string $plaintext, #[\SensitiveParameter] string $secret): string
+    {
+        return hash_hmac('sha256', pack('n', \strlen($reference)).$reference.$scope, hash_hkdf('sha256', $plaintext, 32, self::BINDING_INFO, $secret), true);
+    }
+
+    /**
+     * The context a store binds the wrapping of a data key to, where its backend can authenticate one.
+     *
+     * Passed as the `$aad` of {@see DataKeyGeneratorInterface::generateDataKey()} and of {@see DataKeyGeneratorInterface::unwrapDataKey()}, it has the KMS refuse a key presented under another reference or scope, which {@see bindingFor()} only refuses once the key is open.
+     * A key created for derivation requires one, HashiCorp Vault Transit `derived=true` for instance, and a backend refusing authenticated data cannot carry one at all.
+     * Only the KMS checks the context, so a client that ignores authenticated data instead of refusing it gets no protection from the context.
+     * {@see bindingFor()} is the check that applies whatever the backend.
+     */
+    public static function wrappingContextFor(string $reference, string $scope): string
+    {
+        return self::WRAPPING_LABEL.pack('n', \strlen($reference)).$reference.$scope;
     }
 }

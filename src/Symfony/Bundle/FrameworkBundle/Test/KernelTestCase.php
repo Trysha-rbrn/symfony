@@ -15,7 +15,6 @@ use PHPUnit\Framework\TestCase;
 use Symfony\Component\Config\Resource\SelfCheckingResourceChecker;
 use Symfony\Component\DependencyInjection\Container;
 use Symfony\Component\DependencyInjection\Exception\ServiceNotFoundException;
-use Symfony\Component\Filesystem\Filesystem;
 use Symfony\Component\HttpKernel\Kernel;
 use Symfony\Component\HttpKernel\KernelInterface;
 use Symfony\Contracts\Service\ResetInterface;
@@ -31,6 +30,7 @@ abstract class KernelTestCase extends TestCase
     use MailerAssertionsTrait;
     use MessengerAssertionsTrait;
     use NotificationAssertionsTrait;
+    use WebhookAssertionsTrait;
 
     protected static ?string $class = null;
     protected static ?KernelInterface $kernel = null;
@@ -64,7 +64,7 @@ abstract class KernelTestCase extends TestCase
             throw new \LogicException(\sprintf('You must set the KERNEL_CLASS environment variable to the fully-qualified class name of your Kernel in phpunit.xml / phpunit.xml.dist or override the "%1$s::createKernel()" or "%1$s::getKernelClass()" method.', static::class));
         }
 
-        if (!class_exists($class = $_ENV['KERNEL_CLASS'] ?? $_SERVER['KERNEL_CLASS'])) {
+        if (!class_exists($class = $_SERVER['KERNEL_CLASS'] ?? $_ENV['KERNEL_CLASS'])) {
             throw new \RuntimeException(\sprintf('Class "%s" doesn\'t exist or cannot be autoloaded. Check that the KERNEL_CLASS value in phpunit.xml matches the fully-qualified class name of your Kernel or override the "%s::createKernel()" method.', $class, static::class));
         }
 
@@ -132,8 +132,8 @@ abstract class KernelTestCase extends TestCase
     {
         static::$class ??= static::getKernelClass();
 
-        $env = $options['environment'] ?? $_ENV['APP_ENV'] ?? $_SERVER['APP_ENV'] ?? 'test';
-        $debug = $options['debug'] ?? $_ENV['APP_DEBUG'] ?? $_SERVER['APP_DEBUG'] ?? true;
+        $env = $options['environment'] ?? $_SERVER['APP_ENV'] ?? $_ENV['APP_ENV'] ?? 'test';
+        $debug = $options['debug'] ?? $_SERVER['APP_DEBUG'] ?? $_ENV['APP_DEBUG'] ?? true;
 
         return new static::$class($env, $debug);
     }
@@ -147,9 +147,13 @@ abstract class KernelTestCase extends TestCase
             static::$kernel->boot();
             $container = static::$kernel->getContainer();
 
-            $httpCacheDir = null;
-            if ($container->has('http_cache')) {
-                $httpCacheDir = static::$kernel->getShareDir().'/http_cache';
+            if ($container->has('test.service_container')) {
+                // resetting the container removes the kernel, but the state that services keep outside of the container still has to be reset
+                if (!$container->initialized('kernel')) {
+                    $container->set('kernel', static::$kernel);
+                }
+
+                $container->get('test.service_container')->resetState();
             }
 
             if ($container->has('services_resetter')) {
@@ -178,8 +182,9 @@ abstract class KernelTestCase extends TestCase
                 $container->reset();
             }
 
-            if (null !== $httpCacheDir && is_dir($httpCacheDir)) {
-                (new Filesystem())->remove($httpCacheDir);
+            if (($gc = gc_status())['roots'] >= $gc['threshold'] / 2) {
+                // Collect cycles between tests, before PHP does it in the middle of one
+                gc_collect_cycles();
             }
         }
     }

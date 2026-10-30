@@ -14,7 +14,6 @@ namespace Symfony\Component\Security\Http\Tests\Authentication;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\LoggerInterface;
-use Symfony\Component\HttpFoundation\RedirectResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Session\Session;
 use Symfony\Component\HttpFoundation\Session\SessionInterface;
@@ -137,6 +136,21 @@ class DefaultAuthenticationSuccessHandlerTest extends TestCase
                 ['use_referer' => true, 'login_path' => 'login_route'],
                 '/',
             ],
+            'target path should be different than the current URL' => [
+                Request::create('/login_check', 'POST', [], [], [], ['HTTP_REFERER' => 'http://localhost/login_check']),
+                ['use_referer' => true],
+                '/',
+            ],
+            'target path should be different than the current URL (query string does not matter)' => [
+                Request::create('/login_check?a=1', 'POST', [], [], [], ['HTTP_REFERER' => 'http://localhost/login_check?t=1&p=2']),
+                ['use_referer' => true],
+                '/',
+            ],
+            'target path should be different than the current URL (base URL is taken into account)' => [
+                Request::create('/app/login_check', 'POST', [], [], [], ['SCRIPT_FILENAME' => '/var/www/app/index.php', 'SCRIPT_NAME' => '/app/index.php', 'HTTP_REFERER' => 'http://localhost/app/login_check']),
+                ['use_referer' => true],
+                '/app/',
+            ],
         ];
     }
 
@@ -167,6 +181,6 @@ class DefaultAuthenticationSuccessHandlerTest extends TestCase
         $handler = new DefaultAuthenticationSuccessHandler(new HttpUtils($this->createStub(UrlGeneratorInterface::class)), $options);
         $response = $handler->onAuthenticationSuccess($request, new NullToken());
 
-        $this->assertEquals(new RedirectResponse('https://localhost/some-path'), $response);
+        $this->assertSame('https://localhost/some-path', $response->getTargetUrl());
     }
 }

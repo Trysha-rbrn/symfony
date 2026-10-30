@@ -20,17 +20,19 @@ use Symfony\Bundle\TwigBundle\Tests\TestCase;
 use Symfony\Component\Config\FileLocator;
 use Symfony\Component\DependencyInjection\Compiler\PassConfig;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
-use Symfony\Component\Filesystem\Filesystem;
+use Symfony\Component\DependencyInjection\ContainerInterface;
 use Symfony\Component\DependencyInjection\Loader\PhpFileLoader;
 use Symfony\Component\DependencyInjection\Loader\YamlFileLoader;
 use Symfony\Component\DependencyInjection\ParameterBag\ParameterBag;
 use Symfony\Component\DependencyInjection\Reference;
 use Symfony\Component\ErrorHandler\ErrorRenderer\HtmlErrorRenderer;
+use Symfony\Component\Filesystem\Filesystem;
 use Symfony\Component\Form\FormRenderer;
 use Symfony\Component\Mailer\Mailer;
 use Symfony\Component\Stopwatch\Stopwatch;
 use Symfony\Component\Validator\Validator\ValidatorInterface;
 use Twig\Environment;
+use Twig\Loader\FilesystemLoader;
 use Twig\Runtime\EscaperRuntime;
 
 class TwigExtensionTest extends TestCase
@@ -241,10 +243,10 @@ class TwigExtensionTest extends TestCase
             ['namespaced_path1', 'namespace1'],
             ['namespaced_path2', 'namespace2'],
             ['namespaced_path3', 'namespace3'],
-            [__DIR__.'/Fixtures/templates/bundles/AcmeBundle', 'Acme'],
-            [__DIR__.'/AcmeBundle/Resources/views', 'Acme'],
-            [__DIR__.'/AcmeBundle/Resources/views', '!Acme'],
-            [__DIR__.'/Fixtures/templates'],
+            [__DIR__.'/Fixtures/templates/bundles/AcmeBundle', 'Acme', false],
+            [__DIR__.'/AcmeBundle/Resources/views', 'Acme', false],
+            [__DIR__.'/AcmeBundle/Resources/views', '!Acme', false],
+            [__DIR__.'/Fixtures/templates', FilesystemLoader::MAIN_NAMESPACE, false],
         ], $paths);
     }
 
@@ -348,6 +350,26 @@ class TwigExtensionTest extends TestCase
         $this->assertEquals(new Reference('my_converter'), $bodyRenderer->getArgument('$converter'));
     }
 
+    public function testHttpFoundationExtensionReceivesTheUriSigner()
+    {
+        $container = $this->createContainer();
+        $container->registerExtension(new TwigExtension());
+        $container->loadFromExtension('twig');
+        $this->compileContainer($container);
+
+        $this->assertEquals(new Reference('uri_signer', ContainerInterface::NULL_ON_INVALID_REFERENCE), $container->getDefinition('twig.extension.httpfoundation')->getArgument(1));
+    }
+
+    public function testTranslationExtensionReceivesTheHtmlTranslator()
+    {
+        $container = $this->createContainer();
+        $container->registerExtension(new TwigExtension());
+        $container->loadFromExtension('twig');
+        $this->compileContainer($container);
+
+        $this->assertEquals(new Reference('translator.html', ContainerInterface::NULL_ON_INVALID_REFERENCE), $container->getDefinition('twig.extension.trans')->getArgument(2));
+    }
+
     public function testDefaultPathContainingAPercentSign()
     {
         // two percent signs are required: "%2Fother%" is what the parameter bag reads as a reference
@@ -362,7 +384,7 @@ class TwigExtensionTest extends TestCase
 
             $paths = [];
             foreach ($container->getDefinition('twig.loader.native_filesystem')->getMethodCalls() as $call) {
-                if ('addPath' === $call[0] && 1 === \count($call[1])) {
+                if ('addPath' === $call[0] && FilesystemLoader::MAIN_NAMESPACE === ($call[1][1] ?? FilesystemLoader::MAIN_NAMESPACE)) {
                     $paths[] = str_replace('%%', '%', $call[1][0]);
                 }
             }

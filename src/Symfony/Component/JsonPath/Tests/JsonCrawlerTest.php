@@ -12,6 +12,7 @@
 namespace Symfony\Component\JsonPath\Tests;
 
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\TestWith;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\JsonPath\Exception\InvalidArgumentException;
 use Symfony\Component\JsonPath\Exception\InvalidJsonStringInputException;
@@ -56,6 +57,18 @@ class JsonCrawlerTest extends TestCase
         $this->assertSame([
             ['title' => 'hello'],
         ], $crawler->find('$.items[?upper(@.title) == "HELLO"]'));
+    }
+
+    #[TestWith(['$.items[*].id', [0, null, false, 0]])]
+    #[TestWith(["$.items[*]['id','id']", [0, 0, null, null, false, false, 0, 0]])]
+    #[TestWith(['$..["id","id"]', [0, 0, null, null, false, false, 0, 0]])]
+    #[TestWith(['$.items[*].missing', []])]
+    public function testSelectorsPreserveOrderAndDuplicatesAcrossNodes(string $query, array $expected)
+    {
+        $crawler = new JsonCrawler('{"items":[{"id":0},{"name":"missing"},{"id":null},{"id":false},{"id":0}]}');
+
+        $this->assertSame($expected, $crawler->find($query));
+        $this->assertSame($expected, $crawler->find($query));
     }
 
     public function testAllAuthors()
@@ -232,6 +245,18 @@ class JsonCrawlerTest extends TestCase
         ], [$result[0]['title'], $result[1]['title']]);
     }
 
+    #[TestWith(['$..id'])]
+    #[TestWith(['$[*]..id'])]
+    #[TestWith(['$[*]..["id"]'])]
+    public function testRecursiveQueriesPreserveOrderAcrossNodesAndCalls(string $query)
+    {
+        $crawler = new JsonCrawler('[{"id":0,"children":[{"id":null}]},{"id":false,"children":[{"id":0}]}]');
+
+        $this->assertSame([0, null, false, 0], $crawler->find($query));
+        $this->assertSame([0, null, false, 0], $crawler->find($query));
+        $this->assertSame([], $crawler->find('$..missing'));
+    }
+
     public function testRecursiveWildcard()
     {
         $result = self::getBookstoreCrawler()->find('$..*');
@@ -266,6 +291,25 @@ class JsonCrawlerTest extends TestCase
 
         $result = $crawler->find('$.*');
         $this->assertSame([true, false, null], $result);
+    }
+
+    #[DataProvider('provideNullArrayElementSelectors')]
+    public function testNullArrayElementsAreSelected(string $path, array $expected)
+    {
+        $crawler = new JsonCrawler('["first", null, "third"]');
+
+        $this->assertSame($expected, $crawler->find($path));
+    }
+
+    public static function provideNullArrayElementSelectors(): iterable
+    {
+        yield 'index' => ['$[1]', [null]];
+        yield 'negative index' => ['$[-2]', [null]];
+        yield 'multiple indices' => ['$[0,1]', ['first', null]];
+        yield 'multiple indices with negative index' => ['$[-2,-1]', [null, 'third']];
+        yield 'slice' => ['$[0:3]', ['first', null, 'third']];
+        yield 'reverse slice' => ['$[::-1]', ['third', null, 'first']];
+        yield 'out of bounds index' => ['$[3]', []];
     }
 
     public function testFullArraySlice()
@@ -345,6 +389,34 @@ class JsonCrawlerTest extends TestCase
 
         $result = $crawler->find('$.a[-2:-5:-1]');
         $this->assertSame([4, 2, 1], $result);
+    }
+
+    public function testNegativeStepSliceStartingBeforeFirstElement()
+    {
+        $crawler = self::getSimpleCollectionCrawler();
+
+        $this->assertSame([], $crawler->find('$.a[-7::-1]'));
+        $this->assertSame([], $crawler->find('$.a[-10:-20:-2]'));
+        $this->assertSame([3], $crawler->find('$.a[-6::-1]'));
+    }
+
+    #[DataProvider('provideInvalidSliceSelectors')]
+    public function testInvalidSliceSelectorThrowsOnObject(string $path, string $message)
+    {
+        $crawler = new JsonCrawler('{"a": {"b": 1}}');
+
+        $this->expectException(JsonCrawlerException::class);
+        $this->expectExceptionMessage($message);
+
+        $crawler->find($path);
+    }
+
+    public static function provideInvalidSliceSelectors(): iterable
+    {
+        yield 'leading zero' => ['$.a[01:]', 'slice selector numbers cannot have leading zeros'];
+        yield 'negative zero' => ['$.a[-0:]', 'slice selector cannot contain negative zero'];
+        yield 'integer overflow' => ['$.a[0:9007199254740992]', 'slice selector integer overflow'];
+        yield 'root object' => ['$[1::01]', 'slice selector numbers cannot have leading zeros'];
     }
 
     public function testBoundaryConditions()
@@ -499,6 +571,28 @@ class JsonCrawlerTest extends TestCase
 
         $this->assertCount(1, $result);
         $this->assertSame('Sword of Honour', $result[0]['title']);
+    }
+
+    public function testMatchFunctionAnchorsWholeAlternation()
+    {
+        $crawler = new JsonCrawler(json_encode(['abc', 'xb', 'a', 'b']));
+
+        $this->assertSame(['a', 'b'], $crawler->find("$[?match(@, 'a|b')]"));
+    }
+
+    public function testMatchFunctionDoesNotMatchBeforeTrailingNewline()
+    {
+        $crawler = new JsonCrawler(json_encode(['a', "a\n"]));
+
+        $this->assertSame(['a'], $crawler->find("$[?match(@, 'a')]"));
+    }
+
+    public function testMatchAndSearchFunctionsWithSlash()
+    {
+        $crawler = new JsonCrawler(json_encode(['a/b', 'ab']));
+
+        $this->assertSame(['a/b'], $crawler->find("$[?match(@, 'a/b')]"));
+        $this->assertSame(['a/b'], $crawler->find("$[?search(@, '/')]"));
     }
 
     public function testValueFunction()

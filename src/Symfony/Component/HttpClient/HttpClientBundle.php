@@ -19,6 +19,7 @@ use Symfony\Component\DependencyInjection\ChildDefinition;
 use Symfony\Component\DependencyInjection\Compiler\PassConfig;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\ContainerInterface;
+use Symfony\Component\DependencyInjection\Exception\ExceptionInterface;
 use Symfony\Component\DependencyInjection\Exception\InvalidArgumentException;
 use Symfony\Component\DependencyInjection\Exception\LogicException;
 use Symfony\Component\DependencyInjection\Kernel\AbstractBundle;
@@ -38,6 +39,8 @@ use Symfony\Contracts\HttpClient\HttpClientInterface;
 #[RequiredBundle(ServicesBundle::class)]
 class HttpClientBundle extends AbstractBundle
 {
+    private bool $frameworkTest = false;
+
     public function getPath(): string
     {
         return $this->path ??= __DIR__;
@@ -91,6 +94,32 @@ class HttpClientBundle extends AbstractBundle
             ->children()
                 ->integerNode('max_host_connections')
                     ->info('The maximum number of connections to a single host.')
+                ->end()
+                ->arrayNode('recorder')
+                    ->info('Record HTTP exchanges into HAR files and replay them in tests (see RecorderHttpClient).')
+                    ->addDefaultsIfNotSet()
+                    ->treatFalseLike(['enabled' => false])
+                    ->treatTrueLike(['enabled' => true])
+                    ->treatNullLike(['enabled' => true])
+                    ->children()
+                        ->booleanNode('enabled')
+                            ->info('Defaults to true when "framework.test" is enabled, to false otherwise.')
+                            ->defaultNull()
+                            ->resolvesAtCompileTime()
+                        ->end()
+                        ->scalarNode('redactor')
+                            ->info('Service id of a RedactorInterface; when set, "redact" and "redact_except" are ignored.')
+                            ->defaultNull()
+                        ->end()
+                        ->arrayNode('redact')
+                            ->info('Header, query-string, form and JSON field names masked in recorded files, in addition to the built-in ones.')
+                            ->scalarPrototype()->end()
+                        ->end()
+                        ->arrayNode('redact_except')
+                            ->info('Names never masked, removed from the built-in lists.')
+                            ->scalarPrototype()->end()
+                        ->end()
+                    ->end()
                 ->end()
                 ->arrayNode('default_options')
                     ->children()
@@ -166,6 +195,27 @@ class HttpClientBundle extends AbstractBundle
                 ->end()
             ->end()
         ;
+    }
+
+    public function prependExtension(ContainerConfigurator $configurator, ContainerBuilder $container): void
+    {
+        $this->frameworkTest = false;
+        $test = false;
+
+        if ($container->hasExtension('framework')) {
+            foreach ($container->getExtensionConfig('framework') as $config) {
+                if (\array_key_exists('test', $config)) {
+                    // "test: ~" enables the option, like "test: true"
+                    $test = $config['test'] ?? true;
+                }
+            }
+        }
+
+        try {
+            $this->frameworkTest = true === $container->resolveEnvPlaceholders($test, true);
+        } catch (ExceptionInterface) {
+            // FrameworkBundle reports the error with the name of the option
+        }
     }
 
     public function loadExtension(array $config, ContainerConfigurator $configurator, ContainerBuilder $container): void
@@ -299,7 +349,7 @@ class HttpClientBundle extends AbstractBundle
 
             $scopingDefinition = $container->register($name.'.scoping', ScopingHttpClient::class)
                 ->setDecoratedService($name, null, 15)
-                ->addTag('kernel.reset', ['method' => 'reset', 'on_invalid' => 'ignore']);
+                ->addTag('kernel.reset', ['method' => 'reset', 'on_invalid' => 'ignore', 'on_shutdown' => 'flag']);
 
             if (null === $scope) {
                 $baseUri = $scopeConfig['base_uri'];
@@ -336,6 +386,7 @@ class HttpClientBundle extends AbstractBundle
             $container
                 ->register($name.'.uri_template', UriTemplateHttpClient::class)
                 ->setDecoratedService($name, null, 10)
+                ->addTag('container.decoration_order', ['around' => $name.'.scoping'])
                 ->setArguments([
                     new Reference('.inner'),
                     new Reference('http_client.uri_template_expander', ContainerInterface::NULL_ON_INVALID_REFERENCE),
@@ -356,6 +407,22 @@ class HttpClientBundle extends AbstractBundle
                     ->replaceArgument(0, new Reference($name));
 
                 $container->registerAliasForArgument('httplug.'.$name, HttpAsyncClient::class, $name);
+            }
+        }
+
+        $recorder = $config['recorder'];
+
+        if ($recorder['enabled'] ?? $this->frameworkTest) {
+            $configurator->import('Resources/config/http_client_recorder.php');
+
+            $container->getDefinition('http_client.recorder')
+                ->replaceArgument(3, $container->getDefinition('http_client.transport')->getArgument(0));
+
+            $container->getDefinition('http_client.recorder.redactor')
+                ->setArguments([$recorder['redact'], $recorder['redact_except']]);
+
+            if ($recorder['redactor']) {
+                $container->setAlias('http_client.recorder.redactor', $recorder['redactor']);
             }
         }
     }
@@ -635,6 +702,7 @@ class HttpClientBundle extends AbstractBundle
 
         if ($options['base_uris']) {
             $definition->addMethodCall('withOptions', [['base_uri' => $options['base_uris']]], true);
+            $definition->addTag('container.decoration_order', ['around' => $name.'.scoping']);
         }
     }
 }

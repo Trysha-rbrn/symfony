@@ -11,7 +11,7 @@
 
 namespace Symfony\Component\Tui\Ansi;
 
-use Symfony\Component\String\UnicodeString;
+use Symfony\Component\String\CodePointString;
 use Symfony\Component\Tui\Style\CursorShape;
 
 /**
@@ -52,13 +52,15 @@ final class AnsiUtils
      * slices text must agree on this value.
      */
     public const TAB_WIDTH = 3;
+    private const GRAPHEME_CHUNK_SIZE = 8192;
 
     /**
      * Characters that mb_strwidth() does not measure the way terminals draw them.
      *
      * It counts a tab as one column, a combining mark as its own column, a zero-width joiner or a Hangul vowel or final consonant jamo as one more and a skin tone modifier as two more.
+     * Characters unknown to PCRE use String's Unicode tables.
      */
-    private const MISMEASURED_BY_MB_STRWIDTH = '/[\t\p{M}\p{Cf}\x{1160}-\x{11FF}\x{D7B0}-\x{D7FF}\x{1F3FB}-\x{1F3FF}]/u';
+    private const MISMEASURED_BY_MB_STRWIDTH = '/[\t\p{M}\p{Cf}\p{Cn}\x{1160}-\x{11FF}\x{2028}-\x{2029}\x{D7B0}-\x{D7FF}\x{1F3FB}-\x{1F3FF}]/u';
 
     /**
      * Character set for CSI parameter bytes (0x30-0x3F).
@@ -69,6 +71,23 @@ final class AnsiUtils
      * Character set for CSI intermediate bytes (0x20-0x2F).
      */
     private const CSI_INTERMEDIATE_CHARS = " !\"#\$%&'()*+,-./";
+
+    /**
+     * The number of cached grapheme widths that triggers a cleanup.
+     */
+    private const GRAPHEME_WIDTHS_CLEANUP_THRESHOLD = 5000;
+
+    /**
+     * The number of cached grapheme widths kept by a cleanup.
+     */
+    private const GRAPHEME_WIDTHS_CLEANUP_SIZE = 4000;
+
+    /**
+     * Widths of the graphemes measured by graphemeWidth().
+     *
+     * @var array<string, int>
+     */
+    private static array $graphemeWidths = [];
 
     /**
      * Create a cursor marker embedding the given shape.
@@ -168,19 +187,15 @@ final class AnsiUtils
             return 0;
         }
 
+        // Replace each invalid sequence by a character, so that it counts a column as with mb_strwidth(), which slicing measures with
         if (false === preg_match('//u', $clean)) {
-            $clean = @iconv('UTF-8', 'UTF-8//IGNORE', $clean) ?: '';
+            $clean = mb_scrub($clean, 'UTF-8');
         }
 
-        if ('' === $clean) {
-            return 0;
-        }
-
-        // Only text that mb_strwidth() mismeasures needs the slower per grapheme walk, which is also the measure the wrapper breaks lines by:
-        // the two have to agree or a wrapped chunk comes back wider than the width it was wrapped to.
-        if (preg_match(self::MISMEASURED_BY_MB_STRWIDTH, $clean)) {
+        // Use the wrapper's grapheme widths when native mb_strwidth() cannot measure the text.
+        if (!\extension_loaded('mbstring') && preg_match('/[\x80-\xFF]/', $clean) || preg_match(self::MISMEASURED_BY_MB_STRWIDTH, $clean)) {
             $width = 0;
-            foreach (grapheme_str_split($clean) ?: [] as $grapheme) {
+            foreach (self::splitGraphemes($clean) as $grapheme) {
                 $width += self::graphemeWidth($grapheme);
             }
 
@@ -330,8 +345,8 @@ final class AnsiUtils
 
         $result = self::sliceByColumn($text, 0, $targetWidth);
 
-        // Add reset code before ellipsis to prevent styling leaking into it
-        $truncated = $result."\x1b[0m".$ellipsis;
+        // Close a hyperlink the cut left open and reset styling, so that neither leaks into the ellipsis
+        $truncated = $result.self::closeOpenHyperlink($result)."\x1b[0m".$ellipsis;
 
         if ($pad) {
             $truncatedWidth = self::visibleWidth($truncated);
@@ -465,7 +480,7 @@ final class AnsiUtils
                 $textPortion = substr($line, $i, $segLen);
 
                 // Take the whole segment when it fits, unless mb_strwidth() would mismeasure it
-                $segWidth = !preg_match(self::MISMEASURED_BY_MB_STRWIDTH, $textPortion) ? mb_strwidth($textPortion, 'UTF-8') : self::visibleWidth($textPortion);
+                $segWidth = \extension_loaded('mbstring') && !preg_match(self::MISMEASURED_BY_MB_STRWIDTH, $textPortion) ? mb_strwidth($textPortion, 'UTF-8') : self::visibleWidth($textPortion);
                 if ($currentCol >= $startCol && $currentCol + $segWidth <= $endCol) {
                     if ('' !== $pendingAnsi) {
                         $result .= $pendingAnsi;
@@ -658,38 +673,29 @@ final class AnsiUtils
     /**
      * Calculate the display width of a single grapheme in terminal columns.
      *
-     * Uses mb_strwidth() for single-codepoint graphemes (fast C-level call).
-     * An emoji ZWJ, modifier or tag sequence takes two columns, as terminals that support it draw one emoji.
-     * Other multi-codepoint graphemes are measured with UnicodeString::width(), which gives no width to combining marks.
-     *
-     * Malformed UTF-8 is measured on what is left once the invalid bytes are
-     * dropped, so it never throws.
+     * A single code point is measured with mb_strwidth(), a fast C-level call, except the ones it gives a column that terminals do not draw, like a lone combining mark or a bidi isolate: those, and graphemes of several code points, are measured with CodePointString::width(). Malformed UTF-8 is measured with each invalid sequence replaced by a character, the way visibleWidth() does, so it never throws. Widths are cached per grapheme.
+     * Without native mbstring, multibyte graphemes use CodePointString::width(), except C1 controls.
      */
     public static function graphemeWidth(string $grapheme): int
     {
-        if (1 === mb_strlen($grapheme, 'UTF-8')) {
-            return mb_strwidth($grapheme, 'UTF-8');
+        if (isset(self::$graphemeWidths[$grapheme])) {
+            return self::$graphemeWidths[$grapheme];
         }
 
-        if (!preg_match('//u', $grapheme)) {
-            // UnicodeString rejects malformed UTF-8. Drop the invalid bytes the
-            // way visibleWidth() does, so text that reaches a measure unscrubbed
-            // comes out as a wrong glyph instead of aborting the render.
-            $grapheme = @iconv('UTF-8', 'UTF-8//IGNORE', $grapheme) ?: '';
-
-            if (1 >= mb_strlen($grapheme, 'UTF-8')) {
-                return mb_strwidth($grapheme, 'UTF-8');
-            }
+        if (1 === mb_strlen($grapheme, 'UTF-8') && (!isset($grapheme[1]) || \extension_loaded('mbstring') || $grapheme < "\xC2\xA0")) {
+            $width = !isset($grapheme[1]) || !preg_match(self::MISMEASURED_BY_MB_STRWIDTH, $grapheme) ? mb_strwidth($grapheme, 'UTF-8') : new CodePointString($grapheme)->width(false);
+        } elseif (preg_match('//u', $grapheme)) {
+            $width = new CodePointString($grapheme)->width(false);
+        } else {
+            // CodePointString rejects malformed UTF-8. Replace the invalid sequences the way visibleWidth() does, so text that reaches a measure unscrubbed comes out as a wrong glyph instead of aborting the render.
+            $width = new CodePointString(mb_scrub($grapheme, 'UTF-8'))->width(false);
         }
 
-        // Older symfony/string versions add up the emoji of a ZWJ, modifier or tag sequence, and this skips building a UnicodeString.
-        // In one grapheme, such a sequence is a joiner followed by a symbol, or a symbol followed by a modifier or a tag.
-        // \p{So} stands in for \p{Extended_Pictographic}, which PCRE2 lacks before 10.40.
-        if (preg_match('/^\p{So}\x{FE0F}?[\x{1F3FB}-\x{1F3FF}\x{E0020}-\x{E007F}]|\x{200D}\p{So}/u', $grapheme)) {
-            return 2;
+        if (self::GRAPHEME_WIDTHS_CLEANUP_THRESHOLD <= \count(self::$graphemeWidths)) {
+            self::$graphemeWidths = \array_slice(self::$graphemeWidths, -self::GRAPHEME_WIDTHS_CLEANUP_SIZE, null, true);
         }
 
-        return new UnicodeString($grapheme)->width(false);
+        return self::$graphemeWidths[$grapheme] = $width;
     }
 
     /**
@@ -697,15 +703,17 @@ final class AnsiUtils
      */
     public static function isWhitespace(string $char): bool
     {
-        return preg_match('/\s/', $char);
+        return preg_match('/\s/u', $char);
     }
 
     /**
      * Check if a character is punctuation.
+     *
+     * Connector punctuation, such as "_", belongs to the word it joins.
      */
     public static function isPunctuation(string $char): bool
     {
-        return preg_match('/[(){}[\]<>.,;:\'"!?+\-=*\/\\\\|&%^$#@~`]/', $char);
+        return preg_match('/[(){}[\]<>.,;:\'"!?+\-=*\/\\\\|&%^$#@~`\p{Pd}\p{Ps}\p{Pe}\p{Pi}\p{Pf}\p{Po}]/u', $char);
     }
 
     /**
@@ -798,13 +806,13 @@ final class AnsiUtils
                 $currentCol += $take;
             } else {
                 // Unicode path
-                $segWidth = !preg_match(self::MISMEASURED_BY_MB_STRWIDTH, $segment) ? mb_strwidth($segment, 'UTF-8') : self::visibleWidth($segment);
+                $segWidth = \extension_loaded('mbstring') && !preg_match(self::MISMEASURED_BY_MB_STRWIDTH, $segment) ? mb_strwidth($segment, 'UTF-8') : self::visibleWidth($segment);
                 if ($currentCol + $segWidth <= $length) {
                     $result .= $segment;
                     $currentCol += $segWidth;
                 } else {
-                    $graphemes = grapheme_str_split($segment) ?: [];
-                    foreach ($graphemes as $grapheme) {
+                    // The segment can be a whole huge line: take its graphemes one at a time, only as far as needed
+                    foreach (self::splitGraphemes($segment) as $grapheme) {
                         $w = "\t" === $grapheme ? self::TAB_WIDTH : self::graphemeWidth($grapheme);
                         if ($currentCol + $w > $length) {
                             // Breaking would leave the outer scan running and let a later
@@ -875,5 +883,72 @@ final class AnsiUtils
         }
 
         return $state;
+    }
+
+    /**
+     * Split a string into graphemes, a chunk at a time when it does not fit in one.
+     *
+     * A string that fits in one chunk is split whole, as iterating over a generator would slow down measuring and truncating a line.
+     *
+     * @return iterable<string>
+     */
+    private static function splitGraphemes(string $text): iterable
+    {
+        return \strlen($text) > self::GRAPHEME_CHUNK_SIZE ? self::iterateGraphemes($text) : (grapheme_str_split($text) ?: []);
+    }
+
+    /**
+     * Iterate over the graphemes of a string without splitting all of it upfront.
+     *
+     * The string is split a chunk at a time. grapheme_extract() would walk it one grapheme at a time, but without the intl extension, its polyfill takes a time that grows with the offset.
+     *
+     * @return \Generator<int, string>
+     */
+    private static function iterateGraphemes(string $text): \Generator
+    {
+        $length = \strlen($text);
+        $offset = 0;
+        $size = self::GRAPHEME_CHUNK_SIZE;
+        while ($offset < $length) {
+            // End the chunk on a character boundary
+            $end = min($length, $offset + $size);
+            while ($end < $length && 0x80 === (\ord($text[$end]) & 0xC0)) {
+                ++$end;
+            }
+
+            if (false === $graphemes = grapheme_str_split(substr($text, $offset, $end - $offset))) {
+                return;
+            }
+
+            // The last grapheme of a chunk may go on in the next one.
+            // So may the one before: with PCRE older than 10.44, the polyfill leaves a zero-width joiner that ends the chunk out of the grapheme it extends.
+            if ($end < $length) {
+                if (\count($graphemes) < 3) {
+                    $size *= 2;
+                    continue;
+                }
+                array_splice($graphemes, -2);
+            }
+
+            foreach ($graphemes as $grapheme) {
+                yield $grapheme;
+                $offset += \strlen($grapheme);
+            }
+            $size = self::GRAPHEME_CHUNK_SIZE;
+        }
+    }
+
+    /**
+     * Return the sequence closing the OSC 8 hyperlink left open at the end of the text, if any.
+     */
+    private static function closeOpenHyperlink(string $text): string
+    {
+        if (!str_contains($text, "\x1b]8;") || !preg_match_all('/\x1b\]8;[^;\x07\x1b]*;([^\x07\x1b]*)(\x07|\x1b\\\\)/', $text, $matches, \PREG_SET_ORDER)) {
+            return '';
+        }
+
+        [, $uri, $terminator] = end($matches);
+
+        return '' === $uri ? '' : "\x1b]8;;".$terminator;
     }
 }

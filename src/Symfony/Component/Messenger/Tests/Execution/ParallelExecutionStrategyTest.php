@@ -15,10 +15,12 @@ use Amp\Cancellation;
 use Amp\DeferredFuture;
 use Amp\Parallel\Worker\ContextWorkerFactory;
 use Amp\Sync\Channel;
+use Amp\Sync\ChannelException;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Exception\HandlerFailedException;
+use Symfony\Component\Messenger\Exception\TransportException;
 use Symfony\Component\Messenger\Execution\Message\DeferredEnvelopeMessage;
 use Symfony\Component\Messenger\Execution\Message\DispatchEnvelopeMessage;
 use Symfony\Component\Messenger\Execution\Message\FlushBatchHandlersMessage;
@@ -30,10 +32,23 @@ use Symfony\Component\Messenger\Tests\Fixtures\SecondMessage;
 
 class ParallelExecutionStrategyTest extends TestCase
 {
+    private array $fakeChannels = [];
+
     protected function setUp(): void
     {
         if (!class_exists(ContextWorkerFactory::class)) {
             $this->markTestSkipped(ContextWorkerFactory::class.' is not available.');
+        }
+    }
+
+    protected function tearDown(): void
+    {
+        // A receive still pending when the test ends leaves its fiber suspended, and destroying a suspended fiber while an exception unwinds makes PHP skip the catch block that should handle that exception.
+        // Collect it now, instead of in whatever later test the garbage collector happens to run.
+        gc_collect_cycles();
+
+        foreach ($this->fakeChannels as $channel) {
+            $this->assertNull($channel->get());
         }
     }
 
@@ -92,6 +107,25 @@ class ParallelExecutionStrategyTest extends TestCase
         $this->assertCount(1, $calls);
         $this->assertSame([$envelope->getMessage(), 'async', null], [$calls[0][0]->getMessage(), $calls[0][1], $calls[0][2]]);
         $this->assertFalse($strategy->shouldPauseConsumption());
+    }
+
+    public function testWaitReturnsOnceItsTimeoutElapses()
+    {
+        $envelope = new Envelope(new DummyMessage('Hello'));
+        $channel = $this->createFakeChannel();
+        $strategy = $this->createStrategy($channel);
+        $calls = [];
+
+        $strategy->execute($envelope, 'async', $this->createOnHandled($calls));
+        $lateResponse = EventLoop::delay(2, static fn () => $channel->push(new HandledEnvelopeMessage(1, $envelope, null)));
+
+        try {
+            $this->assertFalse($strategy->wait($this->createOnHandled($calls), 0.2));
+        } finally {
+            EventLoop::cancel($lateResponse);
+        }
+
+        $this->assertSame([], $calls);
     }
 
     public function testDeferredResponseReleasesTheWorkerWhileKeepingTheRequestPending()
@@ -176,6 +210,71 @@ class ParallelExecutionStrategyTest extends TestCase
         $this->assertSame('The parallel worker stopped before returning a result.', $error->getMessage());
         $this->assertSame('worker crashed', $error->getPrevious()->getMessage());
         $this->assertFalse($strategy->shouldPauseConsumption());
+    }
+
+    public function testAFailureToSettleAnotherMessageIsNotChargedToTheDispatchedOne()
+    {
+        $busyChannel = $this->createFakeChannel();
+        $idleChannel = $this->createFakeChannel();
+        $strategy = $this->createStrategy([$busyChannel, $idleChannel], 2);
+        $this->setPrivateProperty($strategy, 'keyModes', ['message.bus||'.DummyMessage::class => 1]);
+        $calls = [];
+        $onHandled = static function (Envelope $envelope, string $transportName, bool &$acked, ?\Throwable $error = null) use (&$calls) {
+            $calls[] = [$envelope->getMessage()->getMessage(), $error?->getMessage()];
+
+            if ('A' === $envelope->getMessage()->getMessage() && null === $error) {
+                throw new TransportException('Could not acknowledge the message.');
+            }
+        };
+
+        $envelopeA = new Envelope(new DummyMessage('A'));
+        $strategy->execute($envelopeA, 'async', $onHandled);
+        $busyChannel->push(new HandledEnvelopeMessage(1, $envelopeA, null));
+
+        $envelopeB = new Envelope(new DummyMessage('B'));
+
+        try {
+            $strategy->execute($envelopeB, 'async', $onHandled);
+            $this->fail('The failure to settle A must propagate.');
+        } catch (TransportException $e) {
+            $this->assertSame('Could not acknowledge the message.', $e->getMessage());
+        }
+
+        $this->assertSame([['A', null]], $calls);
+        $this->assertSame($envelopeB, $idleChannel->sent[0]->envelope);
+
+        $idleChannel->push(new HandledEnvelopeMessage(2, $envelopeB, null));
+        $this->assertTrue($strategy->wait($onHandled));
+        $this->assertSame([['A', null], ['B', null]], $calls);
+    }
+
+    public function testAFailureToSettleTheRequestsOfADeadWorkerIsNotChargedToTheDispatchedOne()
+    {
+        $deadChannel = $this->createFakeChannel();
+        $busyChannel = $this->createFakeChannel();
+        $strategy = $this->createStrategy([$deadChannel, $busyChannel], 2);
+        $this->setPrivateProperty($strategy, 'keyModes', ['message.bus||'.DummyMessage::class => 1]);
+        $calls = [];
+        $onHandled = static function (Envelope $envelope, string $transportName, bool &$acked, ?\Throwable $error = null) use (&$calls) {
+            $calls[] = [$envelope->getMessage()->getMessage(), $error?->getMessage()];
+
+            if ('A' === $envelope->getMessage()->getMessage()) {
+                throw new TransportException('Could not reject the message.');
+            }
+        };
+
+        $strategy->execute(new Envelope(new DummyMessage('A')), 'async', $onHandled);
+        $strategy->execute(new Envelope(new DummyMessage('C')), 'async', $onHandled);
+        $deadChannel->sendFailure = new ChannelException('The worker died.');
+
+        try {
+            $strategy->execute(new Envelope(new DummyMessage('B')), 'async', $onHandled);
+            $this->fail('The failure to settle A must propagate.');
+        } catch (TransportException $e) {
+            $this->assertSame('Could not reject the message.', $e->getMessage());
+        }
+
+        $this->assertSame([['A', 'The parallel worker stopped before returning a result.']], $calls);
     }
 
     public function testHandledResponseReportsTheRequestsOwnTransport()
@@ -283,8 +382,9 @@ class ParallelExecutionStrategyTest extends TestCase
 
     private function createFakeChannel(array $responses = [], array $flushResponses = []): Channel
     {
-        return new class($responses, $flushResponses) implements Channel {
+        $channel = new class($responses, $flushResponses) implements Channel {
             public array $sent = [];
+            public ?\Throwable $sendFailure = null;
             private array $queue;
             private ?DeferredFuture $waiter = null;
             private int $receiveCalls = 0;
@@ -308,6 +408,10 @@ class ParallelExecutionStrategyTest extends TestCase
 
             public function send(mixed $data): void
             {
+                if ($this->sendFailure) {
+                    throw $this->sendFailure;
+                }
+
                 $this->sent[] = $data;
 
                 if ($data instanceof FlushBatchHandlersMessage) {
@@ -360,6 +464,9 @@ class ParallelExecutionStrategyTest extends TestCase
             {
             }
         };
+        $this->fakeChannels[] = \WeakReference::create($channel);
+
+        return $channel;
     }
 
     private function setPrivateProperty(object $object, string $property, mixed $value)

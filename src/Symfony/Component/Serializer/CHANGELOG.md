@@ -4,25 +4,31 @@ CHANGELOG
 8.2
 ---
 
+ * Honor `SerializedName` and `SerializedPath` on properties whose names match their accessors
  * Add `SerializerBundle`, which provides the `serializer` configuration and the services previously provided by `FrameworkBundle` under `framework.serializer`
+ * Register the `CollectionDenormalizer` of the Doctrine bridge when `symfony/doctrine-bridge` and `doctrine/collections` are installed
  * Add `CacheWarmer\SerializerCacheWarmer`, which `FrameworkBundle` used to provide
  * Add the `force_collection` context option to `XmlEncoder` to always decode the given tags as a collection
  * Add `AbstractNormalizer::SKIP_INVALID_ATTRIBUTES` to denormalize the attributes whose value cannot be used as if they were absent from the input
  * Add `AbstractNormalizer::IGNORED_GROUPS` to exclude the attributes belonging to the given groups
  * Allow passing an associative array to `CsvEncoder::HEADERS_KEY` to map and reorder columns when encoding
- * Use the discriminator property of an object to pick its type when several types map to the same class; the first declared type is used when the property is unset or unknown
+ * Use the discriminator property of an object to pick its type when several types map to the same class
  * Trigger a deprecation when denormalizing an array that is not a list into a `list`-typed property
- * Add the `XmlEncoder::BOOLEAN_REPR` context option to choose the strings representing booleans when encoding, e.g. `['true', 'false']`
+ * Add the `XmlEncoder::BOOLEAN_REPR` context option to choose the strings representing booleans when encoding
  * Add support for denormalizing arrays of union types, e.g. `array<Foo|Bar>`
  * Add support for configuring serialized names and paths per group, with repeatable `#[SerializedName]` and `#[SerializedPath]` attributes, a `serialized` key in YAML and a `<serialized>` element in XML
  * Enable using `#[WithAccessors]` from the PropertyInfo component with the serializer
- * Add `AbstractNormalizer::ENABLE_DEFAULT_GROUPS` context option to opt into implicit `Default` and class-short-name groups for attributes without explicit `#[Groups]`, mirroring Validator group conventions
+ * Add the `AbstractNormalizer::ENABLE_DEFAULT_GROUPS` context option to put the attributes without `#[Groups]` in the `Default` and class-short-name groups
  * Add `DiscriminatorMapType` to extend discriminator maps from mapped child classes
  * Make the `mapping` argument of `DiscriminatorMap` optional and validate it together with `defaultType` at metadata loading time
- * Add `LoaderChainAwareInterface` so that loaders in a `LoaderChain` can defer work until all loaders have run; `LoaderChain` then validates discriminator maps declared in any format
- * Resolve generic template types during denormalization, e.g. `T` in a `Box<Circle>`-typed property is denormalized as `Circle`
+ * Add `LoaderChainAwareInterface` so that loaders in a `LoaderChain` can defer work until all loaders have run
+ * Resolve generic template types during denormalization, e.g. `T` in a `Box<Circle>`-typed property
  * Add an optional `$mappedClasses` argument to `Mapping\Loader\LoaderChain::__construct()`, to declare which classes each loader maps
  * Trigger a deprecation when denormalizing a property from its PHP name while a name converter maps it to another key
+ * Build the collection class declared for a property, e.g. `ArrayCollection<int, User>`, from its denormalized elements when the property does not accept an array
+ * Add `Serializer::shutdown()` to break the reference cycles between a serializer and its normalizers, called when the kernel shuts down
+ * Add argument `$sharedCacheKey` to `Serializer::__construct()` to share which normalizers support which types between serializers
+ * Add argument `$sharedCacheKey` to `MetadataAwareNameConverter::__construct()` to share the resolved names between converters
 
 8.1
 ---

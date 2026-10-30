@@ -13,6 +13,7 @@ namespace Symfony\Bundle\SecurityBundle\Command;
 
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
+use Symfony\Component\Console\Helper\CommandInvocation;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
@@ -25,6 +26,8 @@ use Symfony\Component\Security\Core\Role\RoleHierarchyInterface;
  * Command to dump the role hierarchy as a Mermaid flowchart.
  *
  * @author Damien Fernandes <damien.fernandes24@gmail.com>
+ *
+ * @deprecated since Symfony 8.2, use the "debug:roles --format=mermaid" command instead
  */
 #[AsCommand(name: 'debug:security:role-hierarchy', description: 'Dump the role hierarchy as a Mermaid flowchart')]
 class SecurityRoleHierarchyDumpCommand extends Command
@@ -51,8 +54,8 @@ class SecurityRoleHierarchyDumpCommand extends Command
             ->setHelp(<<<'USAGE'
                 The <info>%command.name%</info> command dumps the role hierarchy in Mermaid format.
 
-                <info>Mermaid</info>: %command.full_name% > roles.mmd
-                <info>Mermaid with direction</info>: %command.full_name% --direction=BT > roles.mmd
+                <info>Mermaid</info>: %command.invocation% > roles.mmd
+                <info>Mermaid with direction</info>: %command.invocation% --direction=BT > roles.mmd
                 USAGE
             )
         ;
@@ -62,6 +65,9 @@ class SecurityRoleHierarchyDumpCommand extends Command
     {
         $io = new SymfonyStyle($input, $output);
         $direction = $input->getOption('direction');
+
+        trigger_deprecation('symfony/security-bundle', '8.2', 'The "debug:security:role-hierarchy" command is deprecated, use "debug:roles --format=mermaid" instead.');
+        $io->getErrorStyle()->warning(\sprintf('The "debug:security:role-hierarchy" command is deprecated, use "%s --format=mermaid" instead.', CommandInvocation::formatEscaped('debug:roles')));
 
         if (!$direction = MermaidDirection::tryFrom($direction)) {
             $io->getErrorStyle()->writeln(\sprintf('<error>Invalid direction, available options are "%s"</error>', implode('"', array_column(MermaidDirection::cases(), 'value'))));

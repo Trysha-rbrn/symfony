@@ -11,6 +11,7 @@
 
 namespace Symfony\Component\Routing\Matcher\Dumper;
 
+use Symfony\Component\ExpressionLanguage\ConstantFunctionProvider;
 use Symfony\Component\ExpressionLanguage\ExpressionFunctionProviderInterface;
 use Symfony\Component\ExpressionLanguage\ExpressionLanguage;
 use Symfony\Component\Routing\Route;
@@ -82,7 +83,7 @@ class CompiledUrlMatcherDumper extends MatcherDumper
 
         [$staticRoutes, $dynamicRoutes] = $this->groupStaticRoutes($routes);
 
-        $conditions = [null];
+        $conditions = ['' => null];
         $compiledRoutes[] = $this->compileStaticRoutes($staticRoutes, $conditions);
         $chunkLimit = \count($dynamicRoutes);
 
@@ -104,7 +105,7 @@ class CompiledUrlMatcherDumper extends MatcherDumper
         if ($forDump) {
             $compiledRoutes[2] = $compiledRoutes[4];
         }
-        unset($conditions[0]);
+        unset($conditions['']);
 
         if ($conditions) {
             foreach ($conditions as $expression => $condition) {
@@ -427,7 +428,7 @@ class CompiledUrlMatcherDumper extends MatcherDumper
             unset($defaults['_canonical_route']);
         }
 
-        if ($condition = $route->getCondition()) {
+        if ('' !== $condition = $route->getCondition()) {
             $condition = $this->getExpressionLanguage()->compile($condition, ['context', 'request', 'params']);
             $condition = $conditions[$condition] ??= (str_contains($condition, '$request') ? 1 : -1) * \count($conditions);
         } else {
@@ -451,7 +452,7 @@ class CompiledUrlMatcherDumper extends MatcherDumper
             if (!class_exists(ExpressionLanguage::class)) {
                 throw new \LogicException('Unable to use expressions as the Symfony ExpressionLanguage component is not installed. Try running "composer require symfony/expression-language".');
             }
-            $this->expressionLanguage = new ExpressionLanguage(null, $this->expressionLanguageProviders);
+            $this->expressionLanguage = new ExpressionLanguage(null, class_exists(ConstantFunctionProvider::class) ? [new ConstantFunctionProvider(['*', '*::*']), ...$this->expressionLanguageProviders] : $this->expressionLanguageProviders);
         }
 
         return $this->expressionLanguage;

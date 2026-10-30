@@ -50,73 +50,88 @@ class LintCommand extends Command
     private ?\Closure $isReadableProvider;
     private ?string $schema = null;
     private bool $checkSchema = false;
+    private bool $requireSchema = false;
     private SchemaResolverInterface $schemaResolver;
     private SchemaValidatorInterface $schemaValidator;
     private string $baseDir;
 
     /**
      * @param SchemaResolverInterface|null  $schemaResolver  Resolves the schema of the files that do not force one
-     * @param SchemaValidatorInterface|null $schemaValidator The validator used by the --check-schema option
+     * @param SchemaValidatorInterface|null $schemaValidator The validator that checks the content against its JSON Schema
      * @param string|null                   $baseDir         The directory schema paths are displayed relative to
      */
     public function __construct(?string $name = null, ?callable $directoryIteratorProvider = null, ?callable $isReadableProvider = null, ?SchemaResolverInterface $schemaResolver = null, ?SchemaValidatorInterface $schemaValidator = null, ?string $baseDir = null)
     {
-        parent::__construct($name);
-
         $this->directoryIteratorProvider = null === $directoryIteratorProvider ? null : $directoryIteratorProvider(...);
         $this->isReadableProvider = null === $isReadableProvider ? null : $isReadableProvider(...);
         $this->schemaResolver = $schemaResolver ?? new FileHeaderSchemaResolver();
         $this->schemaValidator = $schemaValidator ?? new SchemaValidator();
         $this->baseDir = $baseDir ?? (getcwd() ?: '');
+
+        // configure() reads the validator to set the default of the --check-schema option
+        parent::__construct($name);
     }
 
     protected function configure(): void
     {
+        $schemaHelp = $this->schemaValidator->isSupported()
+            ? <<<'EOF'
+                The content of each file is also validated against its JSON Schema, if it has
+                one and the schema is a local file. A schema can be declared inside the file
+                itself with a header, resolved relative to the file location:
+                EOF
+            : <<<'EOF'
+                Install the "opis/json-schema" package to also validate the content of each
+                file against its JSON Schema, if it has one and the schema is a local file. A
+                schema can be declared inside the file itself with a header, resolved relative
+                to the file location:
+                EOF;
+
         $this
             ->addArgument('filename', InputArgument::IS_ARRAY, 'A file, a directory or "-" for reading from STDIN')
             ->addOption('format', null, InputOption::VALUE_REQUIRED, \sprintf('The output format ("%s")', implode('", "', $this->getAvailableFormatOptions())))
             ->addOption('exclude', null, InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY, 'Path(s) to exclude')
             ->addOption('parse-tags', null, InputOption::VALUE_NEGATABLE, 'Parse custom tags', null)
-            ->addOption('check-schema', null, InputOption::VALUE_OPTIONAL, 'Validate the content against a JSON Schema, optionally given as a file', false)
+            ->addOption('check-schema', null, InputOption::VALUE_NEGATABLE, 'Validate the content against its JSON Schema', $this->schemaValidator->isSupported())
+            ->addOption('schema', null, InputOption::VALUE_REQUIRED, 'The JSON Schema file to validate all files against')
             ->setHelp(<<<EOF
                 The <info>%command.name%</info> command lints a YAML file and outputs to STDOUT
                 the first encountered syntax error.
 
                 You can validates YAML contents passed from STDIN:
 
-                  <info>cat filename | php %command.full_name% -</info>
+                  <info>cat filename | %command.invocation% -</info>
 
                 You can also validate the syntax of a file:
 
-                  <info>php %command.full_name% filename</info>
+                  <info>%command.invocation% filename</info>
 
                 Or of a whole directory:
 
-                  <info>php %command.full_name% dirname</info>
+                  <info>%command.invocation% dirname</info>
 
                 The <info>--format</info> option specifies the format of the command output:
 
-                  <info>php %command.full_name% dirname --format=json</info>
+                  <info>%command.invocation% dirname --format=json</info>
 
                 You can also exclude one or more specific files:
 
-                  <info>php %command.full_name% dirname --exclude="dirname/foo.yaml" --exclude="dirname/bar.yaml"</info>
+                  <info>%command.invocation% dirname --exclude="dirname/foo.yaml" --exclude="dirname/bar.yaml"</info>
 
-                The <info>--check-schema</info> option validates the content against a JSON Schema.
-                It accepts an optional schema file:
-
-                  <info>php %command.full_name% filename --check-schema=schema.json</info>
-
-                When used without a value, the schema is resolved from the file header or a
-                default schema:
-
-                  <info>php %command.full_name% dirname --check-schema</info>
-
-                A schema can be declared inside the file itself with a header, resolved
-                relative to the file location:
+                {$schemaHelp}
 
                   <info># yaml-language-server: \$schema=schema.json</info>
                   <info># \$schema=schema.json</info>
+
+                The <info>--check-schema</info> option makes this validation mandatory: it fails
+                when a schema cannot be loaded.
+                The <info>--no-check-schema</info> option only checks the syntax:
+
+                  <info>%command.invocation% dirname --no-check-schema</info>
+
+                The <info>--schema</info> option validates all files against the given schema file:
+
+                  <info>%command.invocation% filename --schema=schema.json</info>
 
                 EOF
             )
@@ -131,13 +146,17 @@ class LintCommand extends Command
         $this->format = $input->getOption('format');
         $flags = $input->getOption('parse-tags');
 
-        // false when absent, null when passed without a value, a string when a schema file is given
-        $checkSchema = $input->getOption('check-schema');
-        $this->checkSchema = false !== $checkSchema;
-        $this->schema = \is_string($checkSchema) ? $checkSchema : null;
+        $this->checkSchema = (bool) $input->getOption('check-schema');
+        $this->schema = $input->getOption('schema');
+        // Unlike the default, an explicit --check-schema or --schema fails when the validation cannot run
+        $this->requireSchema = null !== $this->schema || ($this->checkSchema && $input->hasParameterOption('--check-schema', true));
 
-        if ($this->checkSchema && !$this->schemaValidator->isSupported()) {
+        if ($this->requireSchema && !$this->schemaValidator->isSupported()) {
             throw new LogicException('Validating against a JSON Schema requires the "opis/json-schema" package. Try running "composer require opis/json-schema".');
+        }
+
+        if (null !== $this->schema && !$this->checkSchema) {
+            throw new InvalidArgumentException('The "--schema" option cannot be used with "--no-check-schema".');
         }
 
         if (null === $this->format) {
@@ -184,7 +203,8 @@ class LintCommand extends Command
         });
 
         try {
-            $data = $this->getParser()->parse($content, Yaml::PARSE_CONSTANT | $flags);
+            // Mappings are parsed as objects for the schema, so that an empty one is not mistaken for an empty sequence.
+            $data = $this->getParser()->parse($content, Yaml::PARSE_CONSTANT | $flags | ($this->checkSchema ? Yaml::PARSE_OBJECT_FOR_MAP : 0));
         } catch (ParseException $e) {
             return ['file' => $file, 'line' => $e->getParsedLine(), 'valid' => false, 'message' => $e->getMessage()];
         } finally {
@@ -196,12 +216,17 @@ class LintCommand extends Command
         }
 
         $schema = $this->schema ?? $this->schemaResolver->resolve($content, $file);
-        if (!$schema) {
+        // A document without content, such as a file with only comments, has nothing to validate.
+        if (!$schema || null === $data) {
             return ['file' => $file, 'valid' => true, 'schema' => null];
         }
 
+        // Unless the validation is required, a schema that is not a local file is skipped, for example a generated one that does not exist yet.
+        if (!$this->requireSchema && !is_file($schema)) {
+            return ['file' => $file, 'valid' => true, 'schema' => null, 'unavailableSchema' => $schema];
+        }
+
         try {
-            // The library availability is guarded in execute() when --check-schema is used.
             $errors = $this->schemaValidator->validate($data, $schema, $content);
         } catch (YamlRuntimeException $e) {
             // An unresolvable or invalid schema fails this file only, not the whole run.
@@ -227,9 +252,11 @@ class LintCommand extends Command
             return '';
         }
 
-        return $info['schema']
-            ? \sprintf(' (validated against %s)', $this->relativizeSchema($info['schema']))
-            : ' (no schema)';
+        return match (true) {
+            null !== $info['schema'] => \sprintf(' (validated against %s)', $this->relativizeSchema($info['schema'])),
+            isset($info['unavailableSchema']) => \sprintf(' (schema %s not available)', $this->relativizeSchema($info['unavailableSchema'])),
+            default => ' (no schema)',
+        };
     }
 
     /**
@@ -304,7 +331,7 @@ class LintCommand extends Command
         }
 
         if (0 === $erroredFiles) {
-            $io->success(\sprintf('All %d YAML files contain valid syntax%s.', $countFiles, $this->checkSchema ? ' and conform to the schema' : ''));
+            $io->success(\sprintf('All %d YAML files contain valid syntax%s.', $countFiles, array_filter(array_column($filesInfo, 'schema')) ? ' and conform to the schema' : ''));
         } else {
             $io->warning(\sprintf('%d YAML files have valid syntax and %d contain errors.%s', $countFiles - $erroredFiles, $erroredFiles, $suggestTagOption ? ' Use the --parse-tags option if you want parse custom tags.' : ''));
         }
@@ -318,6 +345,7 @@ class LintCommand extends Command
 
         array_walk($filesInfo, static function (&$v) use (&$errors) {
             $v['file'] = (string) $v['file'];
+            unset($v['unavailableSchema']);
             if (!$v['valid']) {
                 ++$errors;
             }
@@ -383,6 +411,8 @@ class LintCommand extends Command
     {
         if ($input->mustSuggestOptionValuesFor('format')) {
             $suggestions->suggestValues($this->getAvailableFormatOptions());
+        } elseif (($input->mustSuggestArgumentValuesFor('filename') || $input->mustSuggestOptionValuesFor('exclude') || $input->mustSuggestOptionValuesFor('schema')) && method_exists($suggestions, 'suggestPaths')) {
+            $suggestions->suggestPaths();
         }
     }
 

@@ -59,10 +59,44 @@ class StringUtilsTest extends TestCase
         yield 'empty' => [''];
     }
 
-    public function testSanitizeUtf8InvalidBytes()
+    #[DataProvider('sanitizeUtf8InvalidBytesProvider')]
+    public function testSanitizeUtf8InvalidBytes(string $input, string $expected)
     {
-        $result = StringUtils::sanitizeUtf8("hello\xFF\xFEworld");
-        $this->assertSame('helloworld', $result);
+        $result = StringUtils::sanitizeUtf8($input);
+        $this->assertSame($expected, $result);
         $this->assertTrue(mb_check_encoding($result, 'UTF-8'));
+    }
+
+    /**
+     * @return iterable<string, array{string, string}>
+     */
+    public static function sanitizeUtf8InvalidBytesProvider(): iterable
+    {
+        yield 'invalid bytes' => ["hello\xFF\xFEworld", 'helloworld'];
+        // "crème café" in ISO-8859-1
+        yield 'ending with an invalid byte' => ["cr\xE8me caf\xE9", 'crme caf'];
+        yield 'ending with a truncated sequence' => ["caf\xC3", 'caf'];
+        yield 'truncated sequence before a valid one' => ["\xF0\x9F\x98caf\xC3\xA9", 'café'];
+        yield 'surrogate' => ["a\xED\xA0\x80b", 'ab'];
+        yield 'overlong encoding' => ["a\xC0\xAFb", 'ab'];
+        yield 'beyond U+10FFFF' => ["a\xF4\x90\x80\x80b", 'ab'];
+    }
+
+    #[DataProvider('ctrlLetterKeysProvider')]
+    public function testDecodeCtrlLetterKeys(string $input, string $expected)
+    {
+        $this->assertSame($expected, StringUtils::decodeCtrlLetterKeys($input));
+    }
+
+    public static function ctrlLetterKeysProvider(): iterable
+    {
+        yield 'no escape sequence' => ['plain text', 'plain text'];
+        yield 'ctrl+j' => ["a\x1b[106;5ub", "a\nb"];
+        yield 'ctrl+J' => ["a\x1b[74;5ub", "a\nb"];
+        yield 'ctrl+i' => ["a\x1b[105;5ub", "a\tb"];
+        yield 'ctrl+digit is kept' => ["\x1b[49;5u", "\x1b[49;5u"];
+        yield 'other modifiers are kept' => ["\x1b[106;3u", "\x1b[106;3u"];
+        yield 'ctrl+j in the xterm format' => ["a\x1b[27;5;106~b", "a\nb"];
+        yield 'other modifiers in the xterm format are kept' => ["\x1b[27;6;106~", "\x1b[27;6;106~"];
     }
 }

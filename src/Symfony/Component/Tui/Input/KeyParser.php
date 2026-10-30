@@ -11,6 +11,8 @@
 
 namespace Symfony\Component\Tui\Input;
 
+use Symfony\Component\Tui\Exception\InvalidArgumentException;
+
 /**
  * Parses raw terminal input into key identifiers.
  *
@@ -25,7 +27,22 @@ final class KeyParser
     private const MOD_SHIFT = 1;
     private const MOD_ALT = 2;
     private const MOD_CTRL = 4;
+    private const MOD_SUPER = 8;
+    private const MOD_HYPER = 16;
+    private const MOD_META = 32;
+    // Super, hyper and meta only exist in the CSI encodings, never in a legacy byte
+    private const MOD_CSI_ONLY = self::MOD_SUPER | self::MOD_HYPER | self::MOD_META;
     private const LOCK_MASK = 192; // Caps Lock + Num Lock
+
+    // In the order key ids are written, e.g. "shift+ctrl+alt+super+a"
+    private const MODIFIER_NAMES = [
+        'shift' => self::MOD_SHIFT,
+        'ctrl' => self::MOD_CTRL,
+        'alt' => self::MOD_ALT,
+        'super' => self::MOD_SUPER,
+        'hyper' => self::MOD_HYPER,
+        'meta' => self::MOD_META,
+    ];
 
     private const EVENT_PRESS = 1;
     private const EVENT_REPEAT = 2;
@@ -54,6 +71,52 @@ final class KeyParser
         'page_down' => -13,
         'home' => -14,
         'end' => -15,
+    ];
+
+    private const FUNCTION_KEY_CODEPOINTS = [
+        'f1' => -20,
+        'f2' => -21,
+        'f3' => -22,
+        'f4' => -23,
+        'f5' => -24,
+        'f6' => -25,
+        'f7' => -26,
+        'f8' => -27,
+        'f9' => -28,
+        'f10' => -29,
+        'f11' => -30,
+        'f12' => -31,
+    ];
+
+    // The Kitty protocol reports keypad keys with codepoints of their own
+    private const KEYPAD_CODEPOINTS = [
+        57399 => 48, // 0
+        57400 => 49, // 1
+        57401 => 50, // 2
+        57402 => 51, // 3
+        57403 => 52, // 4
+        57404 => 53, // 5
+        57405 => 54, // 6
+        57406 => 55, // 7
+        57407 => 56, // 8
+        57408 => 57, // 9
+        57409 => 46, // .
+        57410 => 47, // /
+        57411 => 42, // *
+        57412 => 45, // -
+        57413 => 43, // +
+        57415 => 61, // =
+        57416 => 44, // ,
+        57417 => self::ARROW_CODEPOINTS['left'],
+        57418 => self::ARROW_CODEPOINTS['right'],
+        57419 => self::ARROW_CODEPOINTS['up'],
+        57420 => self::ARROW_CODEPOINTS['down'],
+        57421 => self::FUNCTIONAL_CODEPOINTS['page_up'],
+        57422 => self::FUNCTIONAL_CODEPOINTS['page_down'],
+        57423 => self::FUNCTIONAL_CODEPOINTS['home'],
+        57424 => self::FUNCTIONAL_CODEPOINTS['end'],
+        57425 => self::FUNCTIONAL_CODEPOINTS['insert'],
+        57426 => self::FUNCTIONAL_CODEPOINTS['delete'],
     ];
 
     private const LEGACY_KEY_SEQUENCES = [
@@ -193,6 +256,14 @@ final class KeyParser
         "\x1bn" => 'alt+down',
     ];
 
+    // The named keys matchesKey() handles, besides the single characters
+    private const KEY_NAMES = [
+        'escape', 'esc', 'enter', 'return', 'tab', 'space', 'backspace',
+        'insert', 'delete', 'clear', 'home', 'end', 'page_up', 'page_down',
+        'up', 'down', 'left', 'right',
+        'f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7', 'f8', 'f9', 'f10', 'f11', 'f12',
+    ];
+
     private const SYMBOL_KEYS = [
         '`', '-', '=', '[', ']', '\\', ';', "'", ',', '.', '/',
         '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+',
@@ -254,13 +325,64 @@ final class KeyParser
         return $this->matchesKey($data, $keyId);
     }
 
+    /**
+     * @internal
+     *
+     * @throws InvalidArgumentException When the key id has no key, names an unknown modifier or an unknown key
+     */
+    public function validateKeyId(string $keyId): void
+    {
+        if (null === $parsed = $this->parseKeyId($keyId)) {
+            throw new InvalidArgumentException(\sprintf('Invalid key id "%s": expected a key, optionally preceded by modifiers among "%s".', $keyId, implode('", "', array_keys(self::MODIFIER_NAMES))));
+        }
+
+        if (!$this->isKeyName($parsed['key'])) {
+            throw new InvalidArgumentException(\sprintf('Invalid key id "%s": "%s" is not a key name, expected one of "%s", a letter, a digit or a symbol.', $keyId, $parsed['key'], implode('", "', self::KEY_NAMES)));
+        }
+    }
+
+    /**
+     * Return the text a Kitty protocol key event types, if any.
+     *
+     * Some terminals report keys that type text as escape sequences, like the digits and operators of the keypad.
+     *
+     * @internal
+     */
+    public function decodePrintable(string $data): ?string
+    {
+        if (!preg_match('/^\x1b\[(\d+)(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+))?u$/', $data, $match)) {
+            return null;
+        }
+
+        $modifier = (isset($match[4]) && '' !== $match[4] ? (int) $match[4] : 1) - 1;
+        // Only plain or shifted keys type text
+        if (($modifier & ~self::LOCK_MASK & ~self::MOD_SHIFT) || self::EVENT_RELEASE === $this->parseEventType($match[5] ?? null)) {
+            return null;
+        }
+
+        $codepoint = (int) $match[1];
+        if (($modifier & self::MOD_SHIFT) && isset($match[2]) && '' !== $match[2]) {
+            $codepoint = (int) $match[2];
+        }
+        $codepoint = self::KEYPAD_CODEPOINTS[$codepoint] ?? $codepoint;
+
+        // Control characters and the private use area of functional keys type nothing
+        if ($codepoint < 32 || ($codepoint >= 127 && $codepoint < 160) || ($codepoint >= 57344 && $codepoint <= 63743) || $codepoint > 0x10FFFF) {
+            return null;
+        }
+
+        $char = mb_chr($codepoint, 'UTF-8');
+
+        return false === $char ? null : $char;
+    }
+
     public function isKeyRelease(string $data): bool
     {
         if (str_contains($data, "\x1b[200~")) {
             return false;
         }
 
-        return preg_match('/:3[u~ABCDHF]$/', $data);
+        return preg_match('/^\x1b\[[\d;:]*:3[u~ABCDHFPQRS]$/', $data);
     }
 
     public function isKeyRepeat(string $data): bool
@@ -269,7 +391,7 @@ final class KeyParser
             return false;
         }
 
-        return preg_match('/:2[u~ABCDHF]$/', $data);
+        return preg_match('/^\x1b\[[\d;:]*:2[u~ABCDHFPQRS]$/', $data);
     }
 
     /**
@@ -285,7 +407,7 @@ final class KeyParser
 
         if (
             $this->kittyProtocolActive
-            || (str_starts_with($data, "\x1b[") && (str_ends_with($data, 'u') || str_contains($data, ':')))
+            || (str_starts_with($data, "\x1b[") && (str_ends_with($data, 'u') || str_contains($data, ':') || str_contains($data, ';')))
         ) {
             $kitty = $this->parseKittySequence($data);
             if (null !== $kitty && null !== $keyName = $this->keyNameFromCodepoint($kitty['codepoint'])) {
@@ -359,8 +481,8 @@ final class KeyParser
                 if ($code >= 1 && $code <= 26) {
                     return $press('ctrl+alt+'.\chr($code + 96));
                 }
-                if (($code >= 48 && $code <= 57) || ($code >= 97 && $code <= 122)) {
-                    return $press('alt+'.\chr($code));
+                if (($code >= 48 && $code <= 57) || ($code >= 97 && $code <= 122) || \in_array($data[1], self::SYMBOL_KEYS, true)) {
+                    return $press('alt+'.$data[1]);
                 }
             }
         }
@@ -393,7 +515,7 @@ final class KeyParser
         // is intentionally ignored; keybindings must follow the logical layout
         // so that e.g. Ctrl+W means Ctrl+W on every keyboard layout.
         if (preg_match('/^\x1b\[(\d+)(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+))?u$/', $data, $match)) {
-            $codepoint = (int) $match[1];
+            $codepoint = self::KEYPAD_CODEPOINTS[(int) $match[1]] ?? (int) $match[1];
             $modifierValue = isset($match[4]) && '' !== $match[4] ? (int) $match[4] : 1;
             $eventType = $this->parseEventType($match[5] ?? null);
 
@@ -441,6 +563,22 @@ final class KeyParser
                     'event_type' => $eventType,
                 ];
             }
+
+            if (false !== $functionKey = array_search($keyNum, self::LEGACY_FUNCTION_KEY_CODES, true)) {
+                return [
+                    'codepoint' => self::FUNCTION_KEY_CODEPOINTS[$functionKey],
+                    'modifier' => $modifierValue - 1,
+                    'event_type' => $eventType,
+                ];
+            }
+        }
+
+        if (preg_match('/^\x1b\[1;(\d+)(?::(\d+))?([PQRS])$/', $data, $match) && false !== $functionKey = array_search($match[3], self::LEGACY_FUNCTION_KEY_LETTERS, true)) {
+            return [
+                'codepoint' => self::FUNCTION_KEY_CODEPOINTS[$functionKey],
+                'modifier' => (int) $match[1] - 1,
+                'event_type' => $this->parseEventType('' !== $match[2] ? $match[2] : null),
+            ];
         }
 
         if (!preg_match('/^\x1b\[1;(\d+)(?::(\d+))?([HF])$/', $data, $match)) {
@@ -488,7 +626,7 @@ final class KeyParser
             self::ARROW_CODEPOINTS['down'] => 'down',
             self::ARROW_CODEPOINTS['left'] => 'left',
             self::ARROW_CODEPOINTS['right'] => 'right',
-            default => $this->keyNameFromChar($codepoint),
+            default => array_search($codepoint, self::FUNCTION_KEY_CODEPOINTS, true) ?: $this->keyNameFromChar($codepoint),
         };
     }
 
@@ -514,17 +652,13 @@ final class KeyParser
     {
         $mods = [];
         $effective = $modifier & ~self::LOCK_MASK;
-        if ($effective & ~(self::MOD_SHIFT | self::MOD_ALT | self::MOD_CTRL)) {
+        if ($effective & ~(self::MOD_SHIFT | self::MOD_ALT | self::MOD_CTRL | self::MOD_CSI_ONLY)) {
             return null;
         }
-        if ($effective & self::MOD_SHIFT) {
-            $mods[] = 'shift';
-        }
-        if ($effective & self::MOD_CTRL) {
-            $mods[] = 'ctrl';
-        }
-        if ($effective & self::MOD_ALT) {
-            $mods[] = 'alt';
+        foreach (self::MODIFIER_NAMES as $name => $bit) {
+            if ($effective & $bit) {
+                $mods[] = $name;
+            }
         }
 
         return $mods;
@@ -538,26 +672,21 @@ final class KeyParser
         }
 
         $key = $parsed['key'];
-        $ctrl = $parsed['ctrl'];
-        $shift = $parsed['shift'];
-        $alt = $parsed['alt'];
+        $modifier = $parsed['modifier'];
+        $ctrl = 0 !== ($modifier & self::MOD_CTRL);
+        $shift = 0 !== ($modifier & self::MOD_SHIFT);
+        $alt = 0 !== ($modifier & self::MOD_ALT);
 
-        $modifier = 0;
-        if ($shift) {
-            $modifier |= self::MOD_SHIFT;
-        }
-        if ($alt) {
-            $modifier |= self::MOD_ALT;
-        }
-        if ($ctrl) {
-            $modifier |= self::MOD_CTRL;
+        if (0 !== ($modifier & self::MOD_CSI_ONLY)) {
+            return $this->matchesCsiOnlyKey($data, $key, $modifier);
         }
 
         switch ($key) {
             case 'escape':
             case 'esc':
                 if (0 !== $modifier) {
-                    return false;
+                    // No legacy byte carries a modified escape: "\x1b\x1b" is also two escape presses
+                    return $this->matchesKittySequence($data, self::CODEPOINTS['escape'], $modifier);
                 }
 
                 return "\x1b" === $data || $this->matchesKittySequence($data, self::CODEPOINTS['escape'], 0);
@@ -805,15 +934,16 @@ final class KeyParser
             case 'f10':
             case 'f11':
             case 'f12':
-                if (0 !== $modifier) {
-                    return $this->matchesLegacyFunctionKeyModifierSequence($data, $key, $modifier);
+                if (0 === $modifier) {
+                    return $this->matchesLegacySequence($data, self::LEGACY_KEY_SEQUENCES[$key])
+                        || $this->matchesKittySequence($data, self::FUNCTION_KEY_CODEPOINTS[$key], 0);
                 }
 
-                return $this->matchesLegacySequence($data, self::LEGACY_KEY_SEQUENCES[$key]);
+                return $this->matchesKittySequence($data, self::FUNCTION_KEY_CODEPOINTS[$key], $modifier);
         }
 
         $isDigit = 1 === \strlen($key) && $key >= '0' && $key <= '9';
-        if (1 === \strlen($key) && (($key >= 'a' && $key <= 'z') || $isDigit || \in_array($key, self::SYMBOL_KEYS, true))) {
+        if (1 === \strlen($key) && $this->isKeyName($key)) {
             $codepoint = \ord($key);
             $rawCtrl = $this->rawCtrlChar($key);
 
@@ -821,7 +951,7 @@ final class KeyParser
                 return true;
             }
 
-            if ($alt && !$ctrl && !$shift && !$this->kittyProtocolActive && (($key >= 'a' && $key <= 'z') || $isDigit)) {
+            if ($alt && !$ctrl && !$shift && !$this->kittyProtocolActive) {
                 if ("\x1b".$key === $data) {
                     return true;
                 }
@@ -876,27 +1006,6 @@ final class KeyParser
         };
     }
 
-    private function matchesLegacyFunctionKeyModifierSequence(string $data, string $key, int $modifier): bool
-    {
-        $modValue = $modifier + 1;
-
-        if (isset(self::LEGACY_FUNCTION_KEY_LETTERS[$key])) {
-            $letter = self::LEGACY_FUNCTION_KEY_LETTERS[$key];
-            if ("\x1b[1;{$modValue}{$letter}" === $data) {
-                return true;
-            }
-        }
-
-        if (isset(self::LEGACY_FUNCTION_KEY_CODES[$key])) {
-            $code = self::LEGACY_FUNCTION_KEY_CODES[$key];
-            if ("\x1b[{$code};{$modValue}~" === $data) {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
     private function matchesKittySequence(string $data, int $expectedCodepoint, int $expectedModifier): bool
     {
         $parsed = $this->parseKittySequence($data);
@@ -944,7 +1053,27 @@ final class KeyParser
     }
 
     /**
-     * @return array{key: string, ctrl: bool, shift: bool, alt: bool}|null
+     * A key behind super, hyper or meta, which no legacy encoding can carry.
+     */
+    private function matchesCsiOnlyKey(string $data, string $key, int $modifier): bool
+    {
+        $key = match ($key) {
+            'esc' => 'escape',
+            'return' => 'enter',
+            default => $key,
+        };
+        $codepoint = self::CODEPOINTS[$key] ?? self::FUNCTIONAL_CODEPOINTS[$key] ?? self::ARROW_CODEPOINTS[$key] ?? self::FUNCTION_KEY_CODEPOINTS[$key] ?? (1 === \strlen($key) ? \ord($key) : null);
+        // Only a key that parse() can name, so that "super+kp_enter" matches nothing, as "kp_enter" does
+        if (null === $codepoint || $key !== $this->keyNameFromCodepoint($codepoint)) {
+            return false;
+        }
+
+        return $this->matchesKittySequence($data, $codepoint, $modifier)
+            || (self::CODEPOINTS['enter'] === $codepoint && $this->matchesKittySequence($data, self::CODEPOINTS['kp_enter'], $modifier));
+    }
+
+    /**
+     * @return array{key: string, modifier: int}|null Null when the key id names an unknown modifier
      */
     private function parseKeyId(string $keyId): ?array
     {
@@ -960,11 +1089,28 @@ final class KeyParser
             }
         }
 
-        return [
-            'key' => $key,
-            'ctrl' => \in_array('ctrl', $parts, true),
-            'shift' => \in_array('shift', $parts, true),
-            'alt' => \in_array('alt', $parts, true),
-        ];
+        if ('+' !== $key) {
+            array_pop($parts);
+        }
+
+        $modifier = 0;
+        foreach ($parts as $part) {
+            if (null === $bit = self::MODIFIER_NAMES[$part] ?? null) {
+                // An unknown modifier must not match the bare key
+                return null;
+            }
+            $modifier |= $bit;
+        }
+
+        return ['key' => $key, 'modifier' => $modifier];
+    }
+
+    private function isKeyName(string $key): bool
+    {
+        if (1 === \strlen($key)) {
+            return ($key >= 'a' && $key <= 'z') || ($key >= '0' && $key <= '9') || \in_array($key, self::SYMBOL_KEYS, true);
+        }
+
+        return \in_array($key, self::KEY_NAMES, true);
     }
 }

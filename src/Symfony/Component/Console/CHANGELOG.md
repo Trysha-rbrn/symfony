@@ -4,15 +4,16 @@ CHANGELOG
 8.2
 ---
 
+ * Add `CommandInvocation` and the `%command.invocation%` help placeholder to include the PHP executable or Symfony CLI launcher
+ * Add `CompletionSuggestions::suggestPaths()`, `suggestDirectories()` and `getPathSuggestion()` to let the shell complete file system paths, as `InputFile` arguments and options now do
+ * Pass the `CompletionSuggestions` to the `suggestedValues` closures of arguments and options
+ * List the accepted values of `#[Argument]` and `#[Option]` inputs mapped to backed enums in their description, e.g. `[possible values: pending, paid]`
+ * Map `#[Argument]` and `#[Option]` arrays to backed enums when their PHPDoc narrows them, e.g. `@param list<Suit> $suits` or `@var Suit[]`
  * Add `LockableTrait::setLockFactory()`, autowired with the lock factory of the resource named `console` when the app declares one
  * Allow `#[AsCommand]` to list `InputOption`s to add after the ones the parameters of the command declare
  * Register a class-level `#[AsCommand]` without `__invoke()` as the command grouping its method-level ones
- * Resolve spaced sub-command invocations through the tree derived from registered command names, with per-level options and `--` binding the remaining tokens to the current command
- * List the sub-commands of a command invoked bare when it has no code of its own, on the error output and with exit code 1 like a bare namespace
- * Walk namespaces without a registered root command the same way: `cache clear` runs `cache:clear`
- * Show the help of the deepest resolved command when `--help` is used on a spaced sub-command invocation
- * Add `CommandChain` to read the resolved commands and each level's bound input, injectable into invokable commands and exposed by `Application::getCommandChain()`
- * Complete sub-command segments, per-level options and the node's own argument values when the completion cursor sits inside a command tree
+ * Add docker-style sub-commands, resolved as command trees from the registered names: `cache clear` runs `cache:clear`, with per-level options, help and completion
+ * Add `CommandChain` and `Application::getCommandChain()` to read the resolved commands and the input bound at each level
  * Collapse the commands below a registered command to that command's line in the application listing, and list a command's sub-commands in its help
  * Add `InputDefinition::setIgnoreExtraArguments()`, `ArgvInput::getUnparsedTokens()` and `ArrayInput::getUnparsedTokens()` to stop parsing on the first extra argument and retrieve the remaining tokens
  * Add `UnexpectedArgumentException`, thrown when an input has more arguments than its definition expects
@@ -23,6 +24,8 @@ CHANGELOG
  * Add `GitlabCiReporter` to emit reports in the GitLab Code Quality format
  * Wrap the descriptions in `TextDescriptor` output to the terminal width; pass the `terminal_width` describe option to control it
  * Allow union and intersection type-hints when autowiring arguments of invokable commands
+ * Add the `$ttl` parameter to `LockableTrait::lock()`
+ * Exit with 128 + the signal number (e.g. `130` for a Ctrl+C) instead of `0` when a signal stops the application; `ConsoleSignalEvent::getExitCode()` and the `$previousExitCode` argument of `SignalableCommandInterface::handleSignal()` start with this code
 
 8.1
 ---

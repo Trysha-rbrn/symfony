@@ -18,6 +18,7 @@ use Symfony\Bundle\FrameworkBundle\DependencyInjection\Compiler\ExtensionConfigT
 use Symfony\Bundle\FrameworkBundle\DependencyInjection\Compiler\JsonSchemaConfigDumpPass;
 use Symfony\Bundle\FrameworkBundle\FrameworkBundle;
 use Symfony\Component\AssetMapper\AssetMapperBundle;
+use Symfony\Component\Cache\CacheBundle;
 use Symfony\Component\Config\Definition\Builder\TreeBuilder;
 use Symfony\Component\Config\Definition\ConfigurationInterface;
 use Symfony\Component\Config\Definition\Dumper\JsonSchemaDumper;
@@ -27,7 +28,12 @@ use Symfony\Component\DependencyInjection\Extension\Extension;
 use Symfony\Component\DependencyInjection\Extension\ExtensionInterface;
 use Symfony\Component\Filesystem\Filesystem;
 use Symfony\Component\HttpKernel\Bundle\Bundle;
+use Symfony\Component\Lock\LockBundle;
+use Symfony\Component\Messenger\MessengerBundle;
+use Symfony\Component\RateLimiter\RateLimiterBundle;
+use Symfony\Component\Semaphore\SemaphoreBundle;
 use Symfony\Component\Serializer\SerializerBundle;
+use Symfony\Component\Workflow\WorkflowBundle;
 use Symfony\Component\Yaml\Schema\SchemaValidator;
 use Symfony\Component\Yaml\Yaml;
 
@@ -189,6 +195,235 @@ class JsonSchemaConfigDumpPassTest extends TestCase
         $this->assertNotSame([], (new SchemaValidator())->validate($config, $schemaFile));
     }
 
+    #[RequiresMethod(Validator::class, 'validate')]
+    #[RequiresMethod(SchemaValidator::class, 'validate')]
+    public function testGeneratedSchemaAcceptsTheConfigOfTheRecipes()
+    {
+        $schemaFile = $this->tempDir.'/recipes_schema.json';
+        $container = new ContainerBuilder();
+        $container->setParameter('kernel.debug', true);
+
+        (new JsonSchemaConfigDumpPass($schemaFile, new ExtensionConfigTrees([FrameworkBundle::class => ['all' => true], CacheBundle::class => ['all' => true], MessengerBundle::class => ['all' => true]])))->process($container);
+
+        $config = Yaml::parse(<<<YAML
+            messenger:
+                buses:
+                    messenger.bus.default: []
+            when@prod:
+                cache:
+                    pools:
+                        doctrine.result_cache_pool:
+                            adapter: cache.app
+            YAML);
+
+        $this->assertSame([], (new SchemaValidator())->validate($config, $schemaFile));
+    }
+
+    #[RequiresMethod(Validator::class, 'validate')]
+    #[RequiresMethod(SchemaValidator::class, 'validate')]
+    public function testGeneratedSchemaAcceptsWhatNormalizationOrAnotherFileCompletes()
+    {
+        $schemaFile = $this->tempDir.'/completed_schema.json';
+        $container = new ContainerBuilder();
+
+        (new JsonSchemaConfigDumpPass($schemaFile, new ExtensionConfigTrees([JsonSchemaShortcutBundle::class => ['all' => true]])))->process($container);
+
+        $config = Yaml::parse(<<<YAML
+            json_schema_shortcut:
+                name: app
+                dbal:
+                    url: 'sqlite:///:memory:'
+            when@test:
+                json_schema_shortcut:
+                    dbal:
+                        url: 'sqlite:///:memory:'
+            YAML);
+
+        $this->assertSame([], (new SchemaValidator())->validate($config, $schemaFile));
+    }
+
+    #[RequiresMethod(Validator::class, 'validate')]
+    #[RequiresMethod(SchemaValidator::class, 'validate')]
+    public function testGeneratedSchemaAcceptsImportsParametersAndServicesInTheBlockOfAnEnvironment()
+    {
+        $schemaFile = $this->tempDir.'/when_schema.json';
+        $container = new ContainerBuilder();
+
+        (new JsonSchemaConfigDumpPass($schemaFile, new ExtensionConfigTrees([JsonSchemaTestBundle::class => ['all' => true], JsonSchemaDevBundle::class => ['dev' => true]])))->process($container);
+
+        $config = Yaml::parse(<<<YAML
+            when@dev:
+                imports:
+                    - { resource: services_dev.yaml }
+                parameters:
+                    app.debug: true
+                services:
+                    App\Debug\Collector: ~
+                json_schema_dev:
+                    toolbar: true
+            YAML);
+
+        $this->assertSame([], (new SchemaValidator())->validate($config, $schemaFile));
+
+        $config = Yaml::parse(<<<YAML
+            when@dev:
+                unknown_extension: ~
+            YAML);
+
+        $this->assertNotSame([], (new SchemaValidator())->validate($config, $schemaFile));
+    }
+
+    #[RequiresMethod(Validator::class, 'validate')]
+    #[RequiresMethod(SchemaValidator::class, 'validate')]
+    public function testGeneratedSchemaAcceptsTheDocumentedPlacesAndTransitionsOfWorkflows()
+    {
+        $schemaFile = $this->tempDir.'/workflow_schema.json';
+        $container = new ContainerBuilder();
+
+        (new JsonSchemaConfigDumpPass($schemaFile, new ExtensionConfigTrees([WorkflowBundle::class => ['all' => true]])))->process($container);
+
+        $config = Yaml::parse(<<<YAML
+            workflow:
+                workflows:
+                    blog_publishing:
+                        type: workflow
+                        initial_marking: draft
+                        places: [draft, reviewed, published]
+                        transitions:
+                            to_review:
+                                from: draft
+                                to: reviewed
+                            publish:
+                                from: [draft, reviewed]
+                                to: published
+                    pull_request:
+                        places:
+                            start: ~
+                            review:
+                                metadata:
+                                    description: Human review
+                        transitions:
+                            - name: submit
+                              from: start
+                              to: [review, { place: start, weight: 2 }]
+            YAML);
+
+        $this->assertSame([], (new SchemaValidator())->validate($config, $schemaFile));
+    }
+
+    #[RequiresMethod(Validator::class, 'validate')]
+    #[RequiresMethod(SchemaValidator::class, 'validate')]
+    public function testGeneratedSchemaRejectsUnknownKeysInPlacesAndTransitionsGivenAsMaps()
+    {
+        $schemaFile = $this->tempDir.'/workflow_schema.json';
+        $container = new ContainerBuilder();
+
+        (new JsonSchemaConfigDumpPass($schemaFile, new ExtensionConfigTrees([WorkflowBundle::class => ['all' => true]])))->process($container);
+
+        $config = Yaml::parse(<<<YAML
+            workflow:
+                workflows:
+                    blog_publishing:
+                        places:
+                            draft:
+                                metdata: { description: Draft }
+            YAML);
+
+        $this->assertNotSame([], (new SchemaValidator())->validate($config, $schemaFile));
+
+        $config = Yaml::parse(<<<YAML
+            workflow:
+                workflows:
+                    blog_publishing:
+                        transitions:
+                            publish:
+                                form: draft
+                                to: published
+            YAML);
+
+        $this->assertNotSame([], (new SchemaValidator())->validate($config, $schemaFile));
+    }
+
+    #[RequiresMethod(Validator::class, 'validate')]
+    #[RequiresMethod(SchemaValidator::class, 'validate')]
+    public function testGeneratedSchemaAcceptsTheCollectionOfASectionGivenDirectlyUnderItsRoot()
+    {
+        $schemaFile = $this->tempDir.'/shorthand_schema.json';
+        $container = new ContainerBuilder();
+
+        (new JsonSchemaConfigDumpPass($schemaFile, new ExtensionConfigTrees([RateLimiterBundle::class => ['all' => true], LockBundle::class => ['all' => true], SemaphoreBundle::class => ['all' => true], WorkflowBundle::class => ['all' => true]])))->process($container);
+
+        $config = Yaml::parse(<<<YAML
+            rate_limiter:
+                builder:
+                    cache_pool: cache.app
+                mailer:
+                    policy: sliding_window
+                    limit: 60
+                    interval: '1 minute'
+            lock:
+                service_id: doctrine.dbal.default_connection
+                advisory: true
+            semaphore:
+                enabled: true
+                invoice: 'redis://r2.docker'
+            workflow:
+                blog_publishing:
+                    type: workflow
+                    marking_store:
+                        type: method
+                        property: currentPlace
+                    initial_marking: draft
+            when@test:
+                lock:
+                    invoice: ['semaphore', 'redis://r2.docker']
+                    report: semaphore
+            YAML);
+
+        $this->assertSame([], (new SchemaValidator())->validate($config, $schemaFile));
+    }
+
+    #[RequiresMethod(Validator::class, 'validate')]
+    #[RequiresMethod(SchemaValidator::class, 'validate')]
+    public function testGeneratedSchemaRejectsUnknownKeysNextToTheCollectionOfASection()
+    {
+        $schemaFile = $this->tempDir.'/shorthand_schema.json';
+        $container = new ContainerBuilder();
+
+        (new JsonSchemaConfigDumpPass($schemaFile, new ExtensionConfigTrees([RateLimiterBundle::class => ['all' => true], LockBundle::class => ['all' => true], WorkflowBundle::class => ['all' => true]])))->process($container);
+
+        $config = Yaml::parse(<<<YAML
+            rate_limiter:
+                limiters:
+                    mailer:
+                        policy: no_limit
+                unknown:
+                    cache_pool: cache.app
+            YAML);
+
+        $this->assertNotSame([], (new SchemaValidator())->validate($config, $schemaFile));
+
+        $config = Yaml::parse(<<<YAML
+            lock:
+                resources:
+                    invoice: semaphore
+                report: semaphore
+            YAML);
+
+        $this->assertNotSame([], (new SchemaValidator())->validate($config, $schemaFile));
+
+        $config = Yaml::parse(<<<YAML
+            workflow:
+                workflows:
+                    blog_publishing:
+                        initial_marking: draft
+                unknown:
+                    initial_marking: draft
+            YAML);
+
+        $this->assertNotSame([], (new SchemaValidator())->validate($config, $schemaFile));
+    }
+
     public function testProcessIgnoresFileWriteErrors()
     {
         $container = new ContainerBuilder();
@@ -277,6 +512,61 @@ class JsonSchemaDevConfiguration implements ConfigurationInterface
         $treeBuilder->getRootNode()
             ->children()
                 ->booleanNode('toolbar')->defaultTrue()->end()
+            ->end();
+
+        return $treeBuilder;
+    }
+}
+
+class JsonSchemaShortcutBundle extends Bundle
+{
+    public function getContainerExtension(): ?ExtensionInterface
+    {
+        return new JsonSchemaShortcutExtension();
+    }
+}
+
+class JsonSchemaShortcutExtension extends Extension
+{
+    public function load(array $configs, ContainerBuilder $container): void
+    {
+    }
+
+    public function getAlias(): string
+    {
+        return 'json_schema_shortcut';
+    }
+
+    public function getConfiguration(array $config, ContainerBuilder $container): ConfigurationInterface
+    {
+        return new JsonSchemaShortcutConfiguration();
+    }
+}
+
+class JsonSchemaShortcutConfiguration implements ConfigurationInterface
+{
+    public function getConfigTreeBuilder(): TreeBuilder
+    {
+        $treeBuilder = new TreeBuilder('json_schema_shortcut');
+        $treeBuilder->getRootNode()
+            ->children()
+                ->scalarNode('name')->isRequired()->end()
+                ->arrayNode('dbal')
+                    ->beforeNormalization()
+                        ->ifTrue(static fn ($v) => \is_array($v) && !isset($v['connections']))
+                        ->then(static fn ($v) => ['connections' => ['default' => $v]])
+                    ->end()
+                    ->children()
+                        ->arrayNode('connections')
+                            ->useAttributeAsKey('name')
+                            ->arrayPrototype()
+                                ->children()
+                                    ->scalarNode('url')->end()
+                                ->end()
+                            ->end()
+                        ->end()
+                    ->end()
+                ->end()
             ->end();
 
         return $treeBuilder;

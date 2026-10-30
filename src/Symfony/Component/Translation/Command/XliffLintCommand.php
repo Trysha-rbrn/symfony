@@ -63,19 +63,19 @@ class XliffLintCommand extends Command
 
                 You can validates XLIFF contents passed from STDIN:
 
-                  <info>cat filename | php %command.full_name% -</info>
+                  <info>cat filename | %command.invocation% -</info>
 
                 You can also validate the syntax of a file:
 
-                  <info>php %command.full_name% filename</info>
+                  <info>%command.invocation% filename</info>
 
                 Or of a whole directory:
 
-                  <info>php %command.full_name% dirname</info>
+                  <info>%command.invocation% dirname</info>
 
                 The <info>--format</info> option specifies the format of the command output:
 
-                  <info>php %command.full_name% dirname --format=json</info>
+                  <info>%command.invocation% dirname --format=json</info>
 
                 EOF
             )
@@ -133,11 +133,11 @@ class XliffLintCommand extends Command
             // http://docs.oasis-open.org/xliff/v1.2/os/xliff-core.html#target-language
             $expectedFilenamePattern = $this->requireStrictFileNames ? \sprintf('/^.*\.(?i:%s)\.(?:xlf|xliff)/', $normalizedLocalePattern) : \sprintf('/^(?:.*\.(?i:%s)|(?i:%s)\..*)\.(?:xlf|xliff)/', $normalizedLocalePattern, $normalizedLocalePattern);
 
-            if (0 === preg_match($expectedFilenamePattern, basename($file))) {
+            if (null !== $file && 0 === preg_match($expectedFilenamePattern, basename($file))) {
                 $errors[] = [
                     'line' => -1,
                     'column' => -1,
-                    'message' => \sprintf('There is a mismatch between the language included in the file name ("%s") and the "%s" value used in the "target-language" attribute of the file.', basename($file), $targetLanguage),
+                    'message' => \sprintf('There is a mismatch between the language included in the file name ("%s") and the "%s" value used in the "%s" attribute of the file.', basename($file), $targetLanguage, str_starts_with($document->documentElement->getAttribute('version'), '2.') ? 'trgLang' : 'target-language'),
                 ];
             }
         }
@@ -264,19 +264,22 @@ class XliffLintCommand extends Command
 
     private function getTargetLanguageFromFile(\DOMDocument $xliffContents): ?string
     {
-        foreach ($xliffContents->getElementsByTagName('file')[0]->attributes ?? [] as $attribute) {
-            if ('target-language' === $attribute->nodeName) {
-                return $attribute->nodeValue;
-            }
+        $xliff = $xliffContents->documentElement;
+        if ('xliff' === $xliff?->localName && str_starts_with($xliff->getAttribute('version'), '2.')) {
+            return $xliff->getAttribute('trgLang') ?: null;
         }
 
-        return null;
+        $file = $xliffContents->getElementsByTagName('file')->item(0);
+
+        return $file instanceof \DOMElement ? ($file->getAttribute('target-language') ?: null) : null;
     }
 
     public function complete(CompletionInput $input, CompletionSuggestions $suggestions): void
     {
         if ($input->mustSuggestOptionValuesFor('format')) {
             $suggestions->suggestValues($this->getAvailableFormatOptions());
+        } elseif ($input->mustSuggestArgumentValuesFor('filename') && method_exists($suggestions, 'suggestPaths')) {
+            $suggestions->suggestPaths();
         }
     }
 

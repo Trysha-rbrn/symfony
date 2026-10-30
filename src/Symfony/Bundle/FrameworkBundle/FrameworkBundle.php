@@ -27,6 +27,7 @@ use Symfony\Bundle\FrameworkBundle\DependencyInjection\Compiler\RemoveUnusedSess
 use Symfony\Bundle\FrameworkBundle\DependencyInjection\Compiler\ReportMissingDependenciesPass;
 use Symfony\Bundle\FrameworkBundle\DependencyInjection\Compiler\TestServiceContainerRealRefPass;
 use Symfony\Bundle\FrameworkBundle\DependencyInjection\Compiler\TestServiceContainerWeakRefPass;
+use Symfony\Bundle\FrameworkBundle\DependencyInjection\Compiler\TestStatePass;
 use Symfony\Bundle\FrameworkBundle\DependencyInjection\Compiler\UnusedTagsPass;
 use Symfony\Bundle\FrameworkBundle\DependencyInjection\VirtualRequestStackPass;
 use Symfony\Component\Asset\AssetBundle;
@@ -60,11 +61,13 @@ use Symfony\Component\HttpKernel\DependencyInjection\ControllerArgumentValueReso
 use Symfony\Component\HttpKernel\DependencyInjection\ControllerAttributesListenerPass;
 use Symfony\Component\HttpKernel\DependencyInjection\FragmentRendererPass;
 use Symfony\Component\HttpKernel\DependencyInjection\LoggerPass;
+use Symfony\Component\HttpKernel\DependencyInjection\RegisterCompiledExpressionLanguagesPass;
 use Symfony\Component\HttpKernel\DependencyInjection\RegisterControllerArgumentLocatorsPass;
 use Symfony\Component\HttpKernel\DependencyInjection\RegisterLocaleAwareServicesPass;
 use Symfony\Component\HttpKernel\DependencyInjection\RemoveEmptyControllerArgumentLocatorsPass;
 use Symfony\Component\HttpKernel\KernelEvents;
 use Symfony\Component\JsonPath\JsonPathBundle;
+use Symfony\Component\JsonSchema\JsonSchemaBundle;
 use Symfony\Component\JsonStreamer\JsonStreamerBundle;
 use Symfony\Component\KeyManagement\KeyManagementBundle;
 use Symfony\Component\Lock\LockBundle;
@@ -144,6 +147,7 @@ class_exists(Registry::class);
 #[RequiredBundle(MimeBundle::class, ignoreOnInvalid: true)]
 #[RequiredBundle(ObjectMapperBundle::class, ignoreOnInvalid: true)]
 #[RequiredBundle(KeyManagementBundle::class, ignoreOnInvalid: true)]
+#[RequiredBundle(JsonSchemaBundle::class, ignoreOnInvalid: true)]
 class FrameworkBundle extends Bundle
 {
     public function boot(): void
@@ -224,6 +228,7 @@ class FrameworkBundle extends Bundle
         $container->addCompilerPass(new FindCommandBundlesPass());
         $container->addCompilerPass(new LoggerPass(), PassConfig::TYPE_BEFORE_OPTIMIZATION, -32);
         $container->addCompilerPass(new RegisterControllerArgumentLocatorsPass());
+        $container->addCompilerPass(new RegisterCompiledExpressionLanguagesPass());
         $container->addCompilerPass(new RemoveEmptyControllerArgumentLocatorsPass(), PassConfig::TYPE_BEFORE_REMOVING);
         $container->addCompilerPass(new RoutingResolverPass());
         $this->addCompilerPassIfExists($container, RoutingControllerPass::class);
@@ -239,6 +244,7 @@ class FrameworkBundle extends Bundle
         $container->addCompilerPass(new RegisterLocaleAwareServicesPass());
         $container->addCompilerPass(new TestServiceContainerWeakRefPass(), PassConfig::TYPE_BEFORE_REMOVING, -32);
         $container->addCompilerPass(new TestServiceContainerRealRefPass(), PassConfig::TYPE_AFTER_REMOVING);
+        $container->addCompilerPass(new TestStatePass(), PassConfig::TYPE_BEFORE_REMOVING);
         // must run before CachePoolPass, which wires the pools this pass can still remove
         $container->addCompilerPass(new RegisterReverseContainerPass(true));
         $container->addCompilerPass(new RegisterReverseContainerPass(false), PassConfig::TYPE_AFTER_REMOVING);

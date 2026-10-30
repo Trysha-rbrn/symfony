@@ -17,7 +17,12 @@ use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Messenger\RunCommandMessage;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Definition;
+use Symfony\Component\DependencyInjection\Exception\InvalidArgumentException;
 use Symfony\Component\DependencyInjection\Exception\LogicException;
+use Symfony\Component\DependencyInjection\Reference;
+use Symfony\Component\Messenger\Envelope;
+use Symfony\Component\Messenger\Message\RedispatchMessage;
+use Symfony\Component\Messenger\Stamp\StampInterface;
 use Symfony\Component\Scheduler\DependencyInjection\AddScheduleMessengerPass;
 use Symfony\Component\Scheduler\Messenger\ServiceCallMessage;
 
@@ -296,6 +301,45 @@ class AddScheduleMessengerPassTest extends TestCase
         $this->assertTrue($container->hasDefinition('cache.scheduler'));
     }
 
+    public function testStatefulScheduleIsNotLockedWithoutALockFactory()
+    {
+        $container = new ContainerBuilder();
+        $container->register('scheduler.messenger_transport_factory');
+        $container->register('messenger.transport_factory');
+        $container->register('cache.app');
+        $container->register('cache.scheduler');
+        $container->register('app.task', SchedulableCommand::class)
+            ->addTag('scheduler.task', ['trigger' => 'every', 'frequency' => '1 hour']);
+        $container->setParameter('.scheduler.schedules', [
+            'default' => ['stateful' => true, 'cache_pool' => null, 'lock_factory' => null, 'process_only_last_missed_run' => false],
+        ]);
+
+        (new AddScheduleMessengerPass())->process($container);
+
+        $calls = $container->getDefinition('scheduler.provider.default')->getMethodCalls();
+
+        $this->assertSame(['add', 'stateful'], array_column($calls, 0));
+        $this->assertEquals([new Reference('cache.scheduler')], $calls[1][1]);
+    }
+
+    public function testConfiguringAnUnknownScheduleIsReported()
+    {
+        $container = new ContainerBuilder();
+        $container->register('scheduler.messenger_transport_factory');
+        $container->register('messenger.transport_factory');
+        $container->register('app.task', SchedulableCommand::class)
+            ->addTag('scheduler.task', ['trigger' => 'every', 'frequency' => '1 hour']);
+        $container->setParameter('.scheduler.schedules', [
+            'unknown' => ['stateful' => true, 'cache_pool' => null, 'lock_factory' => null, 'process_only_last_missed_run' => false],
+        ]);
+
+        (new AddScheduleMessengerPass())->process($container);
+
+        $this->assertStringContainsString('Schedule "unknown" is configured but no task or schedule provider uses it; check for a typo (known schedules: "default").', implode("\n", $container->getCompiler()->getLog()));
+        $this->assertFalse($container->hasDefinition('scheduler.provider.unknown'));
+        $this->assertFalse($container->hasDefinition('messenger.transport.scheduler_unknown'));
+    }
+
     public function testMissingMessengerIsReportedWhenATaskIsDeclared()
     {
         $container = new ContainerBuilder();
@@ -323,6 +367,135 @@ class AddScheduleMessengerPassTest extends TestCase
         yield 'array arguments and options' => [['trigger' => 'every', 'frequency' => '1 hour', 'arguments' => ['arg1' => 'first_one', 'arg2' => 'second_one', '--option1' => 'first', '--option2' => true, '--option3' => false]], 'schedulable first_one second_one --option1=first --option2=1 --option3'];
         yield 'alias, no arguments' => [['trigger' => 'every', 'frequency' => '1 hour'], 'schedulable-with-alias', SchedulableCommandWithAlias::class];
         yield 'alias, with argument' => [['trigger' => 'every', 'frequency' => '1 hour', 'arguments' => 'test'], 'schedulable-with-alias test', SchedulableCommandWithAlias::class];
+    }
+
+    public function testStampsWrapTheMessageInAnEnvelope()
+    {
+        $message = self::messageOfTaskWithTags(['stamps' => [SomeStamp::class]]);
+
+        $this->assertSame(Envelope::class, $message->getClass());
+        $this->assertSame(RunCommandMessage::class, $message->getArgument(0)->getClass());
+        $this->assertSame([SomeStamp::class], array_map(static fn (Definition $stamp) => $stamp->getClass(), $message->getArgument(1)));
+    }
+
+    public function testStampsWrapAServiceCallMessageToo()
+    {
+        $message = self::messageOfTaskWithTags(['stamps' => [SomeStamp::class]], []);
+
+        $this->assertSame(Envelope::class, $message->getClass());
+        $this->assertSame(ServiceCallMessage::class, $message->getArgument(0)->getClass());
+    }
+
+    public function testStampsCanBeGivenAsASingleClassName()
+    {
+        $stamps = self::messageOfTaskWithTags(['stamps' => SomeStamp::class])->getArgument(1);
+
+        $this->assertCount(1, $stamps);
+        $this->assertSame(SomeStamp::class, $stamps[0]->getClass());
+    }
+
+    public function testStampCanCarryConstructorArguments()
+    {
+        $stamps = self::messageOfTaskWithTags(['stamps' => [SomeStamp::class, StampWithArguments::class => ['batch', 5]]])->getArgument(1);
+
+        $this->assertSame([], $stamps[0]->getArguments());
+        $this->assertSame(StampWithArguments::class, $stamps[1]->getClass());
+        $this->assertSame(['batch', 5], $stamps[1]->getArguments());
+    }
+
+    public function testStampsRideInsideTheRedispatchMessageWhenTransportsAreSet()
+    {
+        $message = self::messageOfTaskWithTags(['stamps' => [SomeStamp::class], 'transports' => 'async']);
+
+        $this->assertSame(RedispatchMessage::class, $message->getClass());
+        $this->assertSame(Envelope::class, $message->getArgument(0)->getClass());
+        $this->assertSame('async', $message->getArgument(1));
+    }
+
+    public function testTaskWithoutStampsKeepsItsMessageUnwrapped()
+    {
+        $this->assertSame(RunCommandMessage::class, self::messageOfTaskWithTags(['stamps' => []])->getClass());
+    }
+
+    public function testStampInstanceIsRejected()
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage(\sprintf('must list stamp classes, not instances: pass "%s::class" instead', SomeStamp::class));
+
+        self::messageOfTaskWithTags(['stamps' => [new SomeStamp()]]);
+    }
+
+    public function testClassThatDoesNotImplementStampInterfaceIsRejected()
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage(\sprintf('must list instantiable classes implementing "%s", got "%s".', StampInterface::class, NotAStamp::class));
+
+        self::messageOfTaskWithTags(['stamps' => [NotAStamp::class]]);
+    }
+
+    public function testStampThatCannotBeInstantiatedIsRejected()
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage(\sprintf('must list instantiable classes implementing "%s", got "%s".', StampInterface::class, AbstractStamp::class));
+
+        self::messageOfTaskWithTags(['stamps' => [AbstractStamp::class]]);
+    }
+
+    public function testTaskOnAClassWithoutInvokeIsRejected()
+    {
+        $container = new ContainerBuilder();
+        $container->register('some.task', NotATask::class)->addTag('scheduler.task', ['trigger' => 'every', 'frequency' => '1 hour']);
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage(\sprintf('Invalid task service "some.task": class "%s" has no "__invoke()" method, and the task sets no "method" option. To dispatch a message on a schedule, return a "RecurringMessage" from a schedule provider instead.', NotATask::class));
+
+        (new AddScheduleMessengerPass())->process($container);
+    }
+
+    public function testTaskMethodThatDoesNotExistIsRejected()
+    {
+        $container = new ContainerBuilder();
+        $container->register('some.task', SchedulableCommand::class)->addTag('scheduler.task', ['trigger' => 'every', 'frequency' => '1 hour', 'method' => 'missing']);
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage(\sprintf('Invalid task service "some.task": method "%s::missing()" does not exist.', SchedulableCommand::class));
+
+        (new AddScheduleMessengerPass())->process($container);
+    }
+
+    public function testTaskMethodCanBeHandledByMagicCall()
+    {
+        $container = new ContainerBuilder();
+        $container->register('some.task', MagicCallTask::class)->addTag('scheduler.task', ['trigger' => 'every', 'frequency' => '1 hour', 'method' => 'anything']);
+
+        (new AddScheduleMessengerPass())->process($container);
+
+        $message = $container->getDefinition('scheduler.provider.default')->getMethodCalls()[0][1][0]->getArgument('$message');
+
+        $this->assertSame(ServiceCallMessage::class, $message->getClass());
+        $this->assertSame('anything', $message->getArgument(1));
+    }
+
+    /**
+     * @param array<string, mixed> $taskAttributes
+     * @param string[]             $tags
+     */
+    private static function messageOfTaskWithTags(array $taskAttributes, array $tags = ['console.command']): Definition
+    {
+        $container = new ContainerBuilder();
+
+        $definition = new Definition(SchedulableCommand::class);
+
+        foreach ($tags as $tag) {
+            $definition->addTag($tag);
+        }
+
+        $definition->addTag('scheduler.task', ['trigger' => 'every', 'frequency' => '1 hour'] + $taskAttributes);
+        $container->setDefinition('some.task', $definition);
+
+        (new AddScheduleMessengerPass())->process($container);
+
+        return $container->getDefinition('scheduler.provider.default')->getMethodCalls()[0][1][0]->getArgument('$message');
     }
 }
 
@@ -360,6 +533,38 @@ class MixedCommandAndPlainSchedulableCommand
     }
 
     public function plainTask(): void
+    {
+    }
+}
+
+class SomeStamp implements StampInterface
+{
+}
+
+class StampWithArguments implements StampInterface
+{
+    public function __construct(
+        public readonly string $group,
+        public readonly int $size,
+    ) {
+    }
+}
+
+class NotAStamp
+{
+}
+
+abstract class AbstractStamp implements StampInterface
+{
+}
+
+class NotATask
+{
+}
+
+class MagicCallTask
+{
+    public function __call(string $name, array $arguments): void
     {
     }
 }

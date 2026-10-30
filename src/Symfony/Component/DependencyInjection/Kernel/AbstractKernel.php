@@ -11,8 +11,11 @@
 
 namespace Symfony\Component\DependencyInjection\Kernel;
 
+use Symfony\Component\DependencyInjection\Container;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\ContainerInterface;
+use Symfony\Contracts\Service\ResetInterface;
+use Symfony\Contracts\Service\ShutdownInterface;
 
 /**
  * Base class for DI-powered applications.
@@ -109,7 +112,15 @@ abstract class AbstractKernel implements KernelInterface
             $bundle->setContainer(null);
         }
 
-        $this->container = null;
+        try {
+            if ($this->container instanceof Container || $this->container instanceof ShutdownInterface) {
+                $this->container->reset(true);
+            } elseif ($this->container instanceof ResetInterface) {
+                $this->container->reset();
+            }
+        } finally {
+            $this->container = null;
+        }
     }
 
     /**

@@ -15,12 +15,16 @@ use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Exception\MessageDecodingFailedException;
 
 /**
+ * Encodes envelopes for transports and decodes them back.
+ *
  * @author Samuel Roze <samuel.roze@gmail.com>
  */
 interface SerializerInterface
 {
     /**
      * Decodes an envelope and its message from an encoded-form.
+     *
+     * Stamps that implement NonSendableStampInterface should not be decoded.
      *
      * The `$encodedEnvelope` parameter is a key-value array that
      * describes the envelope and its content, that will be used by the different transports.

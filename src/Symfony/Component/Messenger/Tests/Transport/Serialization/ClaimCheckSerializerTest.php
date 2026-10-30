@@ -11,6 +11,8 @@
 
 namespace Symfony\Component\Messenger\Tests\Transport\Serialization;
 
+use PHPUnit\Framework\Attributes\Group;
+use PHPUnit\Framework\Attributes\IgnoreDeprecations;
 use PHPUnit\Framework\TestCase;
 use Psr\Cache\CacheItemInterface;
 use Psr\Cache\CacheItemPoolInterface;
@@ -18,10 +20,14 @@ use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Exception\ClaimCheckNotFoundException;
 use Symfony\Component\Messenger\Exception\ClaimCheckStorageException;
 use Symfony\Component\Messenger\Exception\MessageDecodingFailedException;
+use Symfony\Component\Messenger\Stamp\BusNameStamp;
+use Symfony\Component\Messenger\Stamp\RedeliveryStamp;
+use Symfony\Component\Messenger\Stamp\TrustStamp;
 use Symfony\Component\Messenger\Tests\Fixtures\DummyMessage;
 use Symfony\Component\Messenger\Transport\Serialization\ClaimCheckSerializer;
 use Symfony\Component\Messenger\Transport\Serialization\MessageTypeAwareSerializerInterface;
 use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
+use Symfony\Component\Messenger\Transport\Serialization\Serializer;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
 use Symfony\Component\Messenger\Transport\Serialization\SigningSerializer;
 
@@ -84,6 +90,33 @@ class ClaimCheckSerializerTest extends TestCase
         $this->assertInstanceOf(ClaimCheckNotFoundException::class, $decoded->getMessage()->getPrevious());
     }
 
+    public function testFailureToRetrieveAClaimKeepsTheBusOfItsEnvelope()
+    {
+        $values = [];
+        $serializer = new ClaimCheckSerializer(new PhpSerializer(), $this->createCachePool($values), 512);
+        $encoded = $serializer->encode(new Envelope(new DummyMessage(str_repeat('a', 1000)), [new BusNameStamp('command.bus')]));
+        $values = [];
+
+        $decoded = $serializer->decode($encoded);
+
+        $this->assertInstanceOf(MessageDecodingFailedException::class, $decoded->getMessage());
+        $this->assertEquals([BusNameStamp::class => [new BusNameStamp('command.bus')]], $decoded->all());
+    }
+
+    public function testReferenceNamingAnotherBusThanItsClaimProducesDecodingFailure()
+    {
+        $values = [];
+        $serializer = new ClaimCheckSerializer(new PhpSerializer(), $this->createCachePool($values), 512);
+        $encoded = $serializer->encode(new Envelope(new DummyMessage(str_repeat('a', 1000)), [new BusNameStamp('command.bus')]));
+        $encoded['headers']['X-Symfony-Messenger-Claim-Check-Bus'] = 'event.bus';
+
+        $decoded = $serializer->decode($encoded);
+
+        $this->assertInstanceOf(MessageDecodingFailedException::class, $decoded->getMessage());
+        $this->assertStringContainsString('integrity', $decoded->getMessage()->getMessage());
+        $this->assertSame([], $decoded->all());
+    }
+
     public function testChangedClaimProducesDecodingFailure()
     {
         $values = [];
@@ -98,6 +131,31 @@ class ClaimCheckSerializerTest extends TestCase
         $this->assertStringContainsString('integrity', $decoded->getMessage()->getMessage());
     }
 
+    public function testFailureToRetrieveAClaimIsSentAgainWithItsReference()
+    {
+        $values = [];
+        $serializer = new ClaimCheckSerializer(new Serializer(), $this->createCachePool($values), 300);
+        $encoded = $serializer->encode(new Envelope(new DummyMessage(str_repeat('a', 1000))));
+        $claim = json_decode($encoded['body'], true, flags: \JSON_THROW_ON_ERROR);
+        $data = $values[$claim['id']];
+        unset($values[$claim['id']]);
+
+        $failure = $serializer->decode($encoded);
+        $values[$claim['id']] = $data;
+        $encodedFailure = $serializer->encode($failure->with(new RedeliveryStamp(1)));
+
+        $this->assertCount(1, $values);
+        $this->assertSame($encoded['body'], $encodedFailure['body']);
+
+        $failure = $serializer->decode($encodedFailure);
+
+        $this->assertInstanceOf(MessageDecodingFailedException::class, $failure->getMessage());
+        $this->assertSame(1, RedeliveryStamp::getRetryCountFromEnvelope($failure));
+        $this->assertEquals(new DummyMessage(str_repeat('a', 1000)), $serializer->decode($failure->getMessage()->encodedEnvelope)->getMessage());
+    }
+
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
     public function testMessageTypeDoesNotRetrieveClaim()
     {
         $values = [];
@@ -110,8 +168,12 @@ class ClaimCheckSerializerTest extends TestCase
         $this->assertSame(DummyMessage::class, $serializer->getMessageType($encoded));
     }
 
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
     public function testMessageTypeIsDelegatedForRegularEnvelope()
     {
+        $this->expectUserDeprecationMessage(\sprintf('Since symfony/messenger 8.2: The "%s::getMessageType()" method is deprecated, "%s" does not need it when it signs every message.', ClaimCheckSerializer::class, SigningSerializer::class));
+
         $serializer = new ClaimCheckSerializer(new PhpSerializer(), $this->createStub(CacheItemPoolInterface::class), 10000);
         $encoded = $serializer->encode(new Envelope(new DummyMessage('hello')));
 
@@ -122,7 +184,7 @@ class ClaimCheckSerializerTest extends TestCase
     {
         $values = [];
         $serializer = new ClaimCheckSerializer(
-            new SigningSerializer(new PhpSerializer(), 'secret', [DummyMessage::class]),
+            new SigningSerializer(new PhpSerializer(), 'secret'),
             $this->createCachePool($values),
             512,
         );
@@ -133,7 +195,11 @@ class ClaimCheckSerializerTest extends TestCase
 
         $this->assertArrayNotHasKey('Body-Sign', $encoded['headers']);
         $this->assertStringContainsString('Body-Sign', $values[$claim['id']]);
-        $this->assertEquals($envelope, $serializer->decode($encoded));
+
+        $decoded = $serializer->decode($encoded);
+
+        $this->assertEquals($envelope->getMessage(), $decoded->getMessage());
+        $this->assertTrue($decoded->last(TrustStamp::class)?->isTrusted());
     }
 
     public function testReferenceThatExceedsMaximumSizeIsRemoved()

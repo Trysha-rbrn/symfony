@@ -105,6 +105,40 @@ class SerializerTest extends TestCase
         new Serializer([], [new \stdClass()]);
     }
 
+    public function testShutdownKeepsTheSerializerUsable()
+    {
+        $serializer = new Serializer([new DateTimeNormalizer(), new ObjectNormalizer()], [new JsonEncoder()]);
+        $serializer->shutdown();
+
+        $object = new DummyEntityWithStringAndDateTime('foo', new \DateTimeImmutable('2026-10-21T00:00:00+00:00'));
+        $json = '{"bar":"foo","date":"2026-10-21T00:00:00+00:00"}';
+
+        $this->assertSame($json, $serializer->serialize($object, 'json'));
+        $this->assertEquals($object, $serializer->deserialize($json, DummyEntityWithStringAndDateTime::class, 'json'));
+    }
+
+    public function testShutdownLetsPhpFreeTheSerializerWithoutTheGarbageCollector()
+    {
+        $serializer = new Serializer([new ObjectNormalizer()], [new XmlEncoder()]);
+        $serializer->serialize(new DummyNullableInt(), 'xml');
+        $serializer->shutdown();
+
+        $serializer = \WeakReference::create($serializer);
+
+        $this->assertNull($serializer->get());
+    }
+
+    public function testTheNormalizersOfAFreedSerializerThrow()
+    {
+        $normalizer = new ObjectNormalizer();
+        new Serializer([$normalizer])->shutdown();
+
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage('The serializer was released when the kernel shut down.');
+
+        $normalizer->normalize(new DummyEntityWithStringAndDateTime('foo', new \DateTimeImmutable()));
+    }
+
     public function testNormalizeNoMatch()
     {
         $serializer = new Serializer([$this->createStub(NormalizerInterface::class)]);
@@ -1972,6 +2006,85 @@ class SerializerTest extends TestCase
 
         $serializer->denormalize('foo', Model::class, 'json');
         $serializer->denormalize('foo', Model::class, 'json');
+    }
+
+    public function testSerializersCreatedWithTheSameSharedCacheKeyShareWhichNormalizersSupportWhichTypes()
+    {
+        $normalizer = $this->createSupportingNormalizer(1);
+
+        $serializer = new Serializer([$normalizer], [], [], __METHOD__);
+        $serializer->normalize(new Model());
+        $serializer->denormalize('foo', Model::class);
+
+        $serializer = new Serializer([$normalizer], [], [], __METHOD__);
+
+        $this->assertSame(['foo' => 'bar'], $serializer->normalize(new Model()));
+        $this->assertInstanceOf(Model::class, $serializer->denormalize('foo', Model::class));
+    }
+
+    public function testSerializersCreatedWithDifferentSharedCacheKeysDoNotShare()
+    {
+        $normalizer = $this->createSupportingNormalizer(2);
+
+        foreach ([__METHOD__.'1', __METHOD__.'2'] as $key) {
+            $serializer = new Serializer([$normalizer], [], [], $key);
+            $serializer->normalize(new Model());
+            $serializer->denormalize('foo', Model::class);
+        }
+    }
+
+    public function testSerializersCreatedWithTheSameSharedCacheKeyButOtherNormalizersDoNotShare()
+    {
+        $serializer = new Serializer([new DateTimeNormalizer()], [], [], __METHOD__);
+        $serializer->normalize(new \DateTimeImmutable());
+        $serializer->denormalize('2026-10-25T00:00:00+00:00', \DateTimeImmutable::class);
+
+        $serializer = new Serializer([new DateTimeZoneNormalizer(), new DateTimeNormalizer([DateTimeNormalizer::FORMAT_KEY => 'Y'])], [], [], __METHOD__);
+
+        $this->assertSame('2026', $serializer->normalize(new \DateTimeImmutable('2026-10-25')));
+        $this->assertEquals(new \DateTimeImmutable('2026-01-01'), $serializer->denormalize('2026', \DateTimeImmutable::class, null, [DateTimeNormalizer::FORMAT_KEY => '!Y']));
+    }
+
+    public function testSerializersCreatedWithoutSharedCacheKeyDoNotShare()
+    {
+        $normalizer = $this->createSupportingNormalizer(2);
+
+        for ($i = 0; $i < 2; ++$i) {
+            $serializer = new Serializer([$normalizer]);
+            $serializer->normalize(new Model());
+            $serializer->denormalize('foo', Model::class);
+        }
+    }
+
+    public function testCloningASerializerCreatedWithASharedCacheKey()
+    {
+        $serializer = new Serializer([new ObjectNormalizer()], [], [], __METHOD__);
+        $clone = clone $serializer;
+
+        $this->assertSame(['foo' => 'bar'], $clone->normalize((object) ['foo' => 'bar']));
+        $this->assertSame(['foo' => 'bar'], $serializer->normalize((object) ['foo' => 'bar']));
+        $this->assertSame(['foo' => 'bar'], (clone $serializer)->normalize((object) ['foo' => 'bar']));
+    }
+
+    private function createSupportingNormalizer(int $instances): DummyNormalizer
+    {
+        $normalizer = $this->createMock(DummyNormalizer::class);
+        $normalizer
+            ->expects($this->exactly(2 * $instances))
+            ->method('getSupportedTypes')
+            ->willReturn([Model::class => true]);
+        $normalizer
+            ->expects($this->exactly($instances))
+            ->method('supportsNormalization')
+            ->willReturn(true);
+        $normalizer
+            ->expects($this->exactly($instances))
+            ->method('supportsDenormalization')
+            ->willReturn(true);
+        $normalizer->method('normalize')->willReturn(['foo' => 'bar']);
+        $normalizer->method('denormalize')->willReturn(new Model());
+
+        return $normalizer;
     }
 
     public function testPartialDenormalizationWithMissingConstructorTypes()

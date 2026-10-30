@@ -11,10 +11,12 @@
 
 namespace Symfony\Component\Mailer\Transport;
 
+use Psr\Clock\ClockInterface;
 use Psr\EventDispatcher\EventDispatcherInterface;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 use Symfony\Bridge\Twig\Mime\TemplatedEmail;
+use Symfony\Component\Clock\Clock;
 use Symfony\Component\Mailer\Envelope;
 use Symfony\Component\Mailer\Event\FailedMessageEvent;
 use Symfony\Component\Mailer\Event\MessageEvent;
@@ -159,11 +161,27 @@ abstract class AbstractTransport implements TransportInterface
             return;
         }
 
-        $sleep = (1 / $this->rate) - (microtime(true) - $this->lastSent);
+        $clock = class_exists(Clock::class) ? Clock::get() : null;
+        $sleep = (1 / $this->rate) - (self::now($clock) - $this->lastSent);
         if (0 < $sleep) {
             $this->logger->debug(\sprintf('Email transport "%s" sleeps for %.2f seconds', __CLASS__, $sleep));
-            usleep((int) ($sleep * 1000000));
+            if ($clock) {
+                $clock->sleep($sleep);
+            } else {
+                usleep((int) ($sleep * 1000000));
+            }
         }
-        $this->lastSent = microtime(true);
+        $this->lastSent = self::now($clock);
+    }
+
+    private static function now(?ClockInterface $clock): float
+    {
+        if (null === $clock) {
+            return microtime(true);
+        }
+
+        $now = $clock->now();
+
+        return \PHP_INT_SIZE >= 8 ? $now->getTimestamp() + $now->getMicrosecond() / 1e6 : (float) $now->format('U.u');
     }
 }

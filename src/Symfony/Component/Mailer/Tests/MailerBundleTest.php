@@ -12,6 +12,8 @@
 namespace Symfony\Component\Mailer\Tests;
 
 use PHPUnit\Framework\TestCase;
+use Symfony\Component\DependencyInjection\Attribute\Target;
+use Symfony\Component\DependencyInjection\Compiler\AutowirePass;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\ContainerInterface;
 use Symfony\Component\DependencyInjection\Kernel\AbstractKernel;
@@ -20,13 +22,20 @@ use Symfony\Component\DependencyInjection\Loader\Configurator\ContainerConfigura
 use Symfony\Component\DependencyInjection\ParameterBag\ParameterBag;
 use Symfony\Component\DependencyInjection\Reference;
 use Symfony\Component\Filesystem\Filesystem;
+use Symfony\Component\Mailer\Bridge\Mailgun\Webhook\MailgunRequestParser;
 use Symfony\Component\Mailer\Event\MessageEvent;
 use Symfony\Component\Mailer\EventListener\InMemoryPgpPublicKeyRepository;
 use Symfony\Component\Mailer\EventListener\InMemorySmimeCertificateRepository;
 use Symfony\Component\Mailer\Header\TrackingHeader;
 use Symfony\Component\Mailer\MailerBundle;
+use Symfony\Component\Mailer\Tests\Transport\Smtp\DummyStream;
+use Symfony\Component\Mailer\Transport\Dsn;
+use Symfony\Component\Mailer\Transport\Smtp\SmtpTransport;
+use Symfony\Component\Mailer\Transport\TransportFactoryInterface;
+use Symfony\Component\Mailer\Transport\TransportInterface;
 use Symfony\Component\Mime\Address;
 use Symfony\Component\Mime\Email;
+use Symfony\Component\Webhook\Client\RequestParserInterface;
 
 class MailerBundleTest extends TestCase
 {
@@ -59,6 +68,25 @@ class MailerBundleTest extends TestCase
         $this->assertSame(['redirected@example.org'], array_map(static fn (Address $address) => $address->getAddress(), $envelope->getRecipients()));
     }
 
+    public function testTheSmtpTransportsAreStoppedWhenTheKernelShutsDown()
+    {
+        $kernel = new TestShutdownMailerKernel('test', true, $this->varDir);
+        $kernel->boot();
+        $container = $kernel->getContainer();
+        $stream = $container->get('test.dummy_smtp_transport_factory')->stream;
+        // the transports outlive the kernel, as they would in a reference cycle
+        $transports = $container->get('test.mailer.transports');
+
+        $container->get('test.mailer')->send(new Email()->from('from@example.org')->to('to@example.org')->subject('Hello')->text('World'));
+        $this->assertFalse($stream->isClosed());
+
+        $container->get('services_resetter')->reset();
+        $this->assertFalse($stream->isClosed());
+
+        $kernel->shutdown();
+        $this->assertTrue($stream->isClosed());
+    }
+
     public function testTheTransportsAreRegisteredFromTheDsn()
     {
         $container = $this->load(['dsn' => 'smtp://example.com']);
@@ -66,6 +94,7 @@ class MailerBundleTest extends TestCase
         $this->assertTrue($container->hasAlias('mailer'));
         $this->assertTrue($container->hasAlias('mailer.default_transport'));
         $this->assertSame(['main' => 'smtp://example.com'], $container->getDefinition('mailer.transports')->getArgument(0));
+        $this->assertSame([['method' => 'close', 'on_shutdown' => 'only']], $container->getDefinition('mailer.transports')->getTag('kernel.reset'));
     }
 
     public function testTheTransportsAreRegisteredFromTheTransportsOption()
@@ -256,6 +285,42 @@ class MailerBundleTest extends TestCase
         $this->assertTrue($container->hasDefinition('mailer.webhook.request_parser.mailgun'));
     }
 
+    public function testTheWebhookRequestParsersAreAutowiredByTarget()
+    {
+        $container = $this->load([]);
+        $container->register('test.consumer', MailerWebhookConsumer::class)->setAutowired(true);
+
+        new AutowirePass()->process($container);
+
+        $this->assertSame(MailgunRequestParser::class, $container->findDefinition((string) $container->getDefinition('test.consumer')->getArgument(0))->getClass());
+        $this->assertTrue($container->getAlias(MailgunRequestParser::class)->isDeprecated());
+    }
+
+    public function testTheWebhookRequestParsersAreGivenTheClock()
+    {
+        $container = $this->load([]);
+        $clock = new Reference('clock', ContainerInterface::NULL_ON_INVALID_REFERENCE);
+
+        foreach (['ahasend' => 1, 'mailgun' => 1, 'mailomat' => 2, 'resend' => 1, 'scaleway' => '$clock', 'sendgrid' => 1, 'sweego' => 1] as $provider => $argument) {
+            $this->assertEquals($clock, $container->getDefinition('mailer.webhook.request_parser.'.$provider)->getArgument($argument), $provider);
+        }
+    }
+
+    public function testTheScalewayRequestParserCachesTheCertificatesInTheWebhookPool()
+    {
+        $container = $this->load([]);
+
+        $this->assertEquals(new Reference('cache.mailer.webhook', ContainerInterface::NULL_ON_INVALID_REFERENCE), $container->getDefinition('mailer.webhook.request_parser.scaleway')->getArgument(2));
+
+        $pool = $container->getDefinition('cache.mailer.webhook');
+        $this->assertSame('cache.app', $pool->getParent());
+        $this->assertSame([
+            'cache.pool' => [[]],
+            'kernel.test_state' => [['method' => 'clear']],
+            'container.remove_if_missing' => [['service' => 'cache.app']],
+        ], $pool->getTags());
+    }
+
     public function testTheDataCollectorIsRegisteredInDebugModeOnly()
     {
         $this->assertFalse($this->load([])->hasDefinition('mailer.data_collector'));
@@ -315,5 +380,68 @@ class TestMailerKernel extends AbstractKernel
             ->alias('test.mailer', 'mailer')->public()
             ->alias('test.message_logger', 'mailer.message_logger_listener')->public()
         ;
+    }
+}
+
+class TestShutdownMailerKernel extends AbstractKernel
+{
+    use KernelTrait;
+
+    public function __construct(string $env, bool $debug, private string $dir)
+    {
+        parent::__construct($env, $debug);
+    }
+
+    public function getProjectDir(): string
+    {
+        return $this->dir;
+    }
+
+    public function registerBundles(): iterable
+    {
+        yield new MailerBundle();
+    }
+
+    private function configureContainer(ContainerConfigurator $container): void
+    {
+        $container->extension('mailer', [
+            'dsn' => 'failover(dummy-smtp://default null://null)',
+        ]);
+
+        $container->services()
+            ->set('test.dummy_smtp_transport_factory', DummySmtpTransportFactory::class)
+                ->tag('mailer.transport_factory')
+                ->public()
+            ->alias('test.mailer', 'mailer')->public()
+            ->alias('test.mailer.transports', 'mailer.transports')->public()
+        ;
+    }
+}
+
+class DummySmtpTransportFactory implements TransportFactoryInterface
+{
+    public DummyStream $stream;
+
+    public function __construct()
+    {
+        $this->stream = new DummyStream();
+    }
+
+    public function create(Dsn $dsn): TransportInterface
+    {
+        return new SmtpTransport($this->stream);
+    }
+
+    public function supports(Dsn $dsn): bool
+    {
+        return 'dummy-smtp' === $dsn->getScheme();
+    }
+}
+
+class MailerWebhookConsumer
+{
+    public function __construct(
+        #[Target('mailer.mailgun')] public RequestParserInterface $parser,
+    ) {
     }
 }

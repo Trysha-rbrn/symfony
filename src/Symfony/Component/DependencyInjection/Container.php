@@ -11,6 +11,7 @@
 
 namespace Symfony\Component\DependencyInjection;
 
+use ProxyManager\Proxy\LazyLoadingInterface;
 use Symfony\Component\DependencyInjection\Argument\RewindableGenerator;
 use Symfony\Component\DependencyInjection\Argument\ServiceLocator as ArgumentServiceLocator;
 use Symfony\Component\DependencyInjection\Exception\EnvNotFoundException;
@@ -24,7 +25,9 @@ use Symfony\Component\DependencyInjection\ParameterBag\EnvPlaceholderParameterBa
 use Symfony\Component\DependencyInjection\ParameterBag\FrozenParameterBag;
 use Symfony\Component\DependencyInjection\ParameterBag\ParameterBag;
 use Symfony\Component\DependencyInjection\ParameterBag\ParameterBagInterface;
+use Symfony\Component\VarExporter\LazyObjectInterface;
 use Symfony\Contracts\Service\ResetInterface;
+use Symfony\Contracts\Service\ShutdownInterface;
 
 // Help opcache.preload discover always-needed symbols
 class_exists(RewindableGenerator::class);
@@ -275,25 +278,43 @@ class Container implements ContainerInterface, ResetInterface
         return isset($this->services[$id]);
     }
 
-    public function reset(): void
+    /**
+     * @param bool $shutdown Whether the container is being shut down
+     */
+    public function reset(/* bool $shutdown = false */): void
     {
-        $services = $this->services + $this->privates;
+        $shutdown = \func_num_args() && func_get_arg(0);
+        $throwable = null;
 
-        foreach ($services as $service) {
-            try {
-                if ($service instanceof ResetInterface) {
-                    $service->reset();
+        try {
+            $services = ($resetter = $this->get('services_resetter', self::NULL_ON_INVALID_REFERENCE)) ? [$resetter] : $this->services + $this->privates;
+            foreach ($services as $service) {
+                try {
+                    if ($service === $this || !$service instanceof ResetInterface || ($service !== $resetter && self::isUninitializedLazyObject($service))) {
+                        continue;
+                    }
+
+                    if ($shutdown && ($service instanceof self || $service instanceof ShutdownInterface)) {
+                        $service->reset(true);
+                    } else {
+                        $service->reset();
+                    }
+                } catch (\Throwable $e) {
+                    $throwable ??= $e;
                 }
-            } catch (\Throwable) {
-                continue;
             }
+        } catch (\Throwable $e) {
+            $throwable = $e;
+        } finally {
+            $this->envCache = $this->services = $this->factories = $this->privates = [];
+            $this->resetMap = null;
+            // the closures that reference the container itself are created again when needed
+            unset($this->getEnv, $this->getService);
         }
 
-        $this->envCache = $this->services = $this->factories = $this->privates = [];
-        // Non-shared tracked instances are not reset here because Container::reset()
-        // tears down the entire container. ServicesResetter::reset() handles calling
-        // reset methods on tracked instances during the request lifecycle.
-        $this->resetMap = null;
+        if ($shutdown && null !== $throwable) {
+            throw $throwable;
+        }
     }
 
     /**
@@ -413,7 +434,7 @@ class Container implements ContainerInterface, ResetInterface
     /**
      * Registers an instance of a non-shared service for reset tracking.
      *
-     * @param list<string> $resetMethods
+     * @param list<string|array{string, bool, 'flag'|'only'|null}> $resetMethods
      *
      * @internal
      */
@@ -433,6 +454,19 @@ class Container implements ContainerInterface, ResetInterface
     final protected function getResetMap(): \WeakMap
     {
         return $this->resetMap ??= new \WeakMap();
+    }
+
+    private static function isUninitializedLazyObject(object $service): bool
+    {
+        if ($service instanceof LazyObjectInterface && !$service->isLazyObjectInitialized(true)) {
+            return true;
+        }
+
+        if ($service instanceof LazyLoadingInterface && !$service->isProxyInitialized()) {
+            return true;
+        }
+
+        return (new \ReflectionClass($service))->isUninitializedLazyObject($service);
     }
 
     private function __clone()

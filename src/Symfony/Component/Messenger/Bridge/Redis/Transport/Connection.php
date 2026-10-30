@@ -30,6 +30,11 @@ use Symfony\Component\Messenger\Exception\TransportException;
  */
 class Connection
 {
+    // bounds what a pipeline buffers and what a connection broken during its round trip leaves unknown
+    private const MAX_PIPELINE_COMMANDS = 1000;
+    private const MAX_PIPELINE_SIZE = 1048576;
+    private const LISTING_BATCH_SIZE = 100;
+
     private const DEFAULT_OPTIONS = [
         'host' => '127.0.0.1',
         'port' => 6379,
@@ -55,6 +60,14 @@ class Connection
         'cluster' => false, // force use of cluster
     ];
 
+    private const CLAIM_DELAYED_MESSAGE_SCRIPT = <<<'LUA'
+        local message = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'WITHSCORES', 'LIMIT', 0, 1)
+        if message[1] then
+            redis.call('ZADD', KEYS[1], 'XX', ARGV[2], message[1])
+        end
+        return message
+        LUA;
+
     private \Redis|Relay|\RedisCluster|null $redis = null;
     private \Closure $redisInitializer;
     private string $stream;
@@ -62,6 +75,7 @@ class Connection
     private string $group;
     private string $consumer;
     private bool $autoSetup;
+    private bool $recreateMissingGroup;
     private int $maxEntries;
     private int $redeliverTimeout;
     private float $nextClaim = 0.0;
@@ -74,6 +88,10 @@ class Connection
 
     public function __construct(array $options, \Redis|Relay|\RedisCluster|null $redis = null)
     {
+        if (!\extension_loaded('redis') && !\extension_loaded('relay')) {
+            throw new LogicException('Cannot find the "redis" extension nor the "relay" extension.');
+        }
+
         $options += self::DEFAULT_OPTIONS;
         $host = $options['host'];
         $port = $options['port'];
@@ -158,7 +176,7 @@ class Connection
         }
 
         if (!$options['lazy']) {
-            $this->getRedis();
+            $this->redis = ($this->redisInitializer)();
         }
 
         foreach (['stream', 'group', 'consumer'] as $key) {
@@ -171,7 +189,7 @@ class Connection
         $this->group = $options['group'];
         $this->consumer = $options['consumer'];
         $this->queue = $this->stream.'__queue';
-        $this->autoSetup = $options['auto_setup'];
+        $this->autoSetup = $this->recreateMissingGroup = $options['auto_setup'];
         $this->maxEntries = $options['stream_max_entries'];
         $this->deleteAfterAck = $options['delete_after_ack'];
         $this->deleteAfterReject = $options['delete_after_reject'];
@@ -391,7 +409,9 @@ class Connection
 
         try {
             $pendingMessages = $redis->xpending($this->stream, $this->group, '-', '+', 1) ?: [];
-        } catch (\RedisException|\Relay\Exception $e) {
+        } catch (\RedisException|\RedisClusterException|\Relay\Exception $e) {
+            $this->redis = null;
+
             throw new TransportException($e->getMessage(), 0, $e);
         }
 
@@ -426,7 +446,9 @@ class Connection
             );
 
             $this->lastPendingMessageId = '0';
-        } catch (\RedisException|\Relay\Exception $e) {
+        } catch (\RedisException|\RedisClusterException|\Relay\Exception $e) {
+            $this->redis = null;
+
             throw new TransportException($e->getMessage(), 0, $e);
         }
     }
@@ -442,7 +464,10 @@ class Connection
             $this->setup();
         }
 
-        $this->handleDelayedMessages();
+        try {
+            $this->handleDelayedMessages();
+        } catch (TransportException $delayedMessagesFailure) {
+        }
 
         $messages = [];
 
@@ -462,36 +487,40 @@ class Connection
             $messages = [...$messages, ...$this->getNewMessages($fetchSize - \count($messages))];
         }
 
-        return $messages ?: null;
+        return $messages ?: (isset($delayedMessagesFailure) ? throw $delayedMessagesFailure : null);
     }
 
     private function handleDelayedMessages(): void
     {
         $now = microtime();
-        $now = substr($now, 11).substr($now, 2, 3);
+        $milliseconds = substr($now, 2, 3);
+        $seconds = (int) substr($now, 11);
+        $now = $seconds.$milliseconds;
+        $claimExpiry = ($seconds + intdiv(max($this->redeliverTimeout, 1000), 1000)).$milliseconds;
 
         $queuedMessageCount = $this->rawCommand('ZCOUNT', 0, $now) ?? 0;
 
         while ($queuedMessageCount--) {
-            if (!$message = $this->rawCommand('ZPOPMIN', 1)) {
+            if (!$message = $this->rawCommand('EVAL', self::CLAIM_DELAYED_MESSAGE_SCRIPT, $now, $claimExpiry)) {
                 break;
             }
 
             [$queuedMessage, $expiry] = $message;
 
-            if (\strlen($expiry) === \strlen($now) ? $expiry > $now : \strlen($expiry) < \strlen($now)) {
-                // if a future-placed message is popped because of a race condition with
-                // another running consumer, the message is re-added to the queue
+            $decodedQueuedMessage = json_decode($queuedMessage, true);
 
-                if (!$this->rawCommand('ZADD', 'NX', $expiry, $queuedMessage)) {
-                    throw new TransportException('Could not add a message to the redis stream.');
+            try {
+                $this->add(\is_array($decodedQueuedMessage) && \array_key_exists('body', $decodedQueuedMessage) ? $decodedQueuedMessage['body'] : $queuedMessage, $decodedQueuedMessage['headers'] ?? [], 0);
+            } catch (\Throwable $e) {
+                try {
+                    $this->rawCommand('ZADD', 'XX', $expiry, $queuedMessage);
+                } catch (TransportException) {
                 }
 
-                break;
+                throw $e;
             }
 
-            $decodedQueuedMessage = json_decode($queuedMessage, true);
-            $this->add(\array_key_exists('body', $decodedQueuedMessage) ? $decodedQueuedMessage['body'] : $queuedMessage, $decodedQueuedMessage['headers'] ?? [], 0);
+            $this->rawCommand('ZREM', $queuedMessage);
         }
     }
 
@@ -546,7 +575,7 @@ class Connection
         return $result;
     }
 
-    private function xReadGroup(string $messageId, int $count = 1): array
+    private function xReadGroup(string $messageId, int $count = 1, bool $retry = true): array
     {
         $redis = $this->getRedis();
 
@@ -558,13 +587,22 @@ class Connection
                 $count,
                 1
             );
-        } catch (\RedisException|\Relay\Exception $e) {
+        } catch (\RedisException|\RedisClusterException|\Relay\Exception $e) {
+            $this->redis = null;
+
             throw new TransportException($e->getMessage(), 0, $e);
         }
 
         if (!\is_array($messages)) {
             if ($error = $redis->getLastError() ?: null) {
                 $redis->clearLastError();
+            }
+
+            // the stream or its group is gone, like after a restart of Redis without persistence
+            if ($retry && $this->recreateMissingGroup && str_starts_with($error ?? '', 'NOGROUP')) {
+                $this->setup();
+
+                return $this->xReadGroup($messageId, $count, false);
             }
 
             throw new TransportException($error ?? 'Could not read messages from the redis stream.');
@@ -583,8 +621,13 @@ class Connection
             // the ack decides the outcome: the entry may already be gone from the stream (e.g. trimmed), deleting it is best effort
             if ($acknowledged && $this->deleteAfterAck && false === $redis->xdel($this->stream, [$id])) {
                 $redis->clearLastError();
+            } elseif (!$acknowledged && $this->deleteAfterAck) {
+                // entries listed with find() or findAll() were never delivered to the group, deleting them is the only way to ack them
+                $acknowledged = $redis->xdel($this->stream, [$id]);
             }
-        } catch (\RedisException|\Relay\Exception $e) {
+        } catch (\RedisException|\RedisClusterException|\Relay\Exception $e) {
+            $this->redis = null;
+
             throw new TransportException($e->getMessage(), 0, $e);
         }
 
@@ -608,8 +651,12 @@ class Connection
             // same as in ack(): the entry may already be gone from the stream, deleting it is best effort
             if ($rejected && $this->deleteAfterReject && false === $redis->xdel($this->stream, [$id])) {
                 $redis->clearLastError();
+            } elseif (!$rejected && $this->deleteAfterReject) {
+                $rejected = $redis->xdel($this->stream, [$id]);
             }
-        } catch (\RedisException|\Relay\Exception $e) {
+        } catch (\RedisException|\RedisClusterException|\Relay\Exception $e) {
+            $this->redis = null;
+
             throw new TransportException($e->getMessage(), 0, $e);
         }
 
@@ -629,43 +676,12 @@ class Connection
             $this->setup();
         }
         $redis = $this->getRedis();
+        [$id, $message, $score] = $this->encodeMessage($body, $headers, $delayInMs);
 
         try {
-            if ($delayInMs > 0) { // the delay is <= 0 for queued messages
-                $id = base64_encode(random_bytes(9));
-                $message = json_encode([
-                    'body' => $body,
-                    'headers' => $headers,
-                    // Entry need to be unique in the sorted set else it would only be added once to the delayed messages queue
-                    'uniqid' => $id,
-                ]);
-
-                if (false === $message) {
-                    throw new TransportException(json_last_error_msg());
-                }
-
-                $now = explode(' ', microtime(), 2);
-                $now[0] = str_pad($delayInMs + substr($now[0], 2, 3), 3, '0', \STR_PAD_LEFT);
-                if (3 < \strlen($now[0])) {
-                    $now[1] += substr($now[0], 0, -3);
-                    $now[0] = substr($now[0], -3);
-
-                    if (\is_float($now[1])) {
-                        throw new TransportException("Message delay is too big: {$delayInMs}ms.");
-                    }
-                }
-
-                $added = $this->rawCommand('ZADD', 'NX', $now[1].$now[0], $message);
+            if (null !== $id) {
+                $added = $this->rawCommand('ZADD', 'NX', $score, $message);
             } else {
-                $message = json_encode([
-                    'body' => $body,
-                    'headers' => $headers,
-                ]);
-
-                if (false === $message) {
-                    throw new TransportException(json_last_error_msg());
-                }
-
                 if ($this->maxEntries) {
                     $added = $redis->xadd($this->stream, '*', ['message' => $message], $this->maxEntries, true);
                 } else {
@@ -674,7 +690,9 @@ class Connection
 
                 $id = $added;
             }
-        } catch (\RedisException|\Relay\Exception $e) {
+        } catch (\RedisException|\RedisClusterException|\Relay\Exception $e) {
+            $this->redis = null;
+
             if ($error = $redis->getLastError() ?: null) {
                 $redis->clearLastError();
             }
@@ -691,13 +709,92 @@ class Connection
         return $id;
     }
 
+    /**
+     * Adds messages with one round trip per pipeline of commands, or per message on Redis Cluster.
+     *
+     * @param non-empty-array<array{string, array, int}> $messages The arguments of add() for each message
+     *
+     * @return array{array<string>, array<TransportException>} The ids of the added messages, and the exceptions that prevented adding the others, by the key of the messages
+     */
+    public function addBatch(array $messages): array
+    {
+        if ($this->autoSetup) {
+            $this->setup();
+        }
+        $redis = $this->getRedis();
+        // phpredis cannot pipeline commands sent to a cluster
+        $maxCommands = $redis instanceof \RedisCluster ? 1 : self::MAX_PIPELINE_COMMANDS;
+        $ids = $exceptions = $pipelines = $pipeline = [];
+        $pipelineSize = 0;
+
+        foreach ($messages as $key => [$body, $headers, $delayInMs]) {
+            try {
+                $entry = $this->encodeMessage($body, $headers, $delayInMs);
+            } catch (TransportException $e) {
+                $exceptions[$key] = $e;
+
+                continue;
+            }
+
+            $size = \strlen($entry[1]);
+
+            if ($pipeline && ($maxCommands === \count($pipeline) || self::MAX_PIPELINE_SIZE < $pipelineSize + $size)) {
+                $pipelines[] = $pipeline;
+                $pipeline = [];
+                $pipelineSize = 0;
+            }
+
+            $pipeline[$key] = $entry;
+            $pipelineSize += $size;
+        }
+
+        if ($pipeline) {
+            $pipelines[] = $pipeline;
+        }
+
+        foreach ($pipelines as $i => $pipeline) {
+            try {
+                $results = $this->execAddPipeline($redis, $pipeline);
+            } catch (TransportException $e) {
+                // the next pipelines are likely to fail the same way, like when Redis cannot be reached
+                foreach (\array_slice($pipelines, $i) as $unsent) {
+                    $exceptions += array_fill_keys(array_keys($unsent), $e);
+                }
+
+                break;
+            }
+
+            $error = null;
+
+            foreach ($results as $key => $result) {
+                if ($result instanceof \Throwable) {
+                    $exceptions[$key] = new TransportException($result->getMessage(), 0, $result);
+                } elseif ($result) {
+                    $ids[$key] = $pipeline[$key][0] ?? $result;
+                } else {
+                    if (null === $error) {
+                        // phpredis keeps the error of the last failed command only
+                        $error = $redis->getLastError() ?: 'Could not add a message to the redis stream.';
+                        $redis->clearLastError();
+                    }
+
+                    $exceptions[$key] = new TransportException($error);
+                }
+            }
+        }
+
+        return [$ids, $exceptions];
+    }
+
     public function setup(): void
     {
         $redis = $this->getRedis();
 
         try {
             $redis->xgroup('CREATE', $this->stream, $this->group, 0, true);
-        } catch (\RedisException|\Relay\Exception $e) {
+        } catch (\RedisException|\RedisClusterException|\Relay\Exception $e) {
+            $this->redis = null;
+
             throw new TransportException($e->getMessage(), 0, $e);
         }
 
@@ -739,7 +836,9 @@ class Connection
                 [$id],
                 ['JUSTID']
             );
-        } catch (\RedisException|\Relay\Exception $e) {
+        } catch (\RedisException|\RedisClusterException|\Relay\Exception $e) {
+            $this->redis = null;
+
             throw new TransportException($e->getMessage(), 0, $e);
         }
     }
@@ -811,14 +910,17 @@ class Connection
     private function rawCommand(string $command, ...$arguments): mixed
     {
         $redis = $this->getRedis();
+        $arguments = 'EVAL' === $command ? [array_shift($arguments), 1, $this->queue, ...$arguments] : [$this->queue, ...$arguments];
 
         try {
             if ($redis instanceof \RedisCluster) {
-                $result = $redis->rawCommand($this->queue, $command, $this->queue, ...$arguments);
+                $result = $redis->rawCommand($this->queue, $command, ...$arguments);
             } else {
-                $result = $redis->rawCommand($command, $this->queue, ...$arguments);
+                $result = $redis->rawCommand($command, ...$arguments);
             }
-        } catch (\RedisException|\Relay\Exception $e) {
+        } catch (\RedisException|\RedisClusterException|\Relay\Exception $e) {
+            $this->redis = null;
+
             throw new TransportException($e->getMessage(), 0, $e);
         }
 
@@ -835,7 +937,11 @@ class Connection
     private function getRedis(): \Redis|Relay|\RedisCluster
     {
         if (!$this->redis) {
-            $this->redis = ($this->redisInitializer)();
+            try {
+                $this->redis = ($this->redisInitializer)();
+            } catch (\RedisException|\RedisClusterException|\Relay\Exception|InvalidArgumentException $e) {
+                throw new TransportException($e->getMessage(), 0, $e);
+            }
         }
 
         return $this->redis;
@@ -843,35 +949,37 @@ class Connection
 
     public function findAll(?int $limit = null): array
     {
-        $redis = $this->getRedis();
+        return $this->findRange('-', '+', $limit);
+    }
 
-        try {
-            if (null === $limit) {
-                $range = $redis->xRange($this->stream, '-', '+');
-            } else {
-                $range = $redis->xRange($this->stream, '-', '+', $limit);
+    /**
+     * Reads the stream in batches, so that it is not loaded in memory at once.
+     *
+     * The entries added after the listing started are not listed.
+     *
+     * @return \Generator<int, array{id: string, data: mixed}>
+     */
+    public function findAllInBatches(): \Generator
+    {
+        if (!$last = $this->findRange('+', '-', 1, true)) {
+            return;
+        }
+
+        $start = '-';
+
+        do {
+            $messages = $this->findRange($start, $last[0]['id'], self::LISTING_BATCH_SIZE);
+
+            foreach ($messages as $message) {
+                yield $message;
             }
-        } catch (\RedisException|\Relay\Exception $e) {
-            throw new TransportException($e->getMessage(), 0, $e);
-        }
 
-        if (!$range) {
-            if ($error = $redis->getLastError() ?: null) {
-                $redis->clearLastError();
+            if ($messages) {
+                // XRANGE includes its start, so the next batch starts at the id that follows the last one
+                [$time, $sequence] = explode('-', end($messages)['id']);
+                $start = $time.'-'.((int) $sequence + 1);
             }
-
-            return [];
-        }
-
-        $messages = [];
-        foreach ($range as $id => $data) {
-            $messages[] = [
-                'id' => $id,
-                'data' => $data,
-            ];
-        }
-
-        return $messages;
+        } while (self::LISTING_BATCH_SIZE === \count($messages));
     }
 
     public function find(mixed $id): ?array
@@ -884,7 +992,9 @@ class Connection
 
         try {
             $range = $redis->xRange($this->stream, $id, $id, 1);
-        } catch (\RedisException|\Relay\Exception $e) {
+        } catch (\RedisException|\RedisClusterException|\Relay\Exception $e) {
+            $this->redis = null;
+
             throw new TransportException($e->getMessage(), 0, $e);
         }
 
@@ -908,5 +1018,145 @@ class Connection
     public function close(): void
     {
         $this->redis = null;
+    }
+
+    /**
+     * @return array{?string, string, ?string} The id of a delayed message, the message, and the score of a delayed message
+     */
+    private function encodeMessage(string $body, array $headers, int $delayInMs): array
+    {
+        if ($delayInMs > 0) { // the delay is <= 0 for queued messages
+            $id = base64_encode(random_bytes(9));
+            $message = json_encode([
+                'body' => $body,
+                'headers' => $headers,
+                // Entry need to be unique in the sorted set else it would only be added once to the delayed messages queue
+                'uniqid' => $id,
+            ]);
+
+            if (false === $message) {
+                throw new TransportException(json_last_error_msg());
+            }
+
+            $now = explode(' ', microtime(), 2);
+            $now[0] = str_pad($delayInMs + substr($now[0], 2, 3), 3, '0', \STR_PAD_LEFT);
+            if (3 < \strlen($now[0])) {
+                $now[1] += substr($now[0], 0, -3);
+                $now[0] = substr($now[0], -3);
+
+                if (\is_float($now[1])) {
+                    throw new TransportException("Message delay is too big: {$delayInMs}ms.");
+                }
+            }
+
+            return [$id, $message, $now[1].$now[0]];
+        }
+
+        $message = json_encode([
+            'body' => $body,
+            'headers' => $headers,
+        ]);
+
+        if (false === $message) {
+            throw new TransportException(json_last_error_msg());
+        }
+
+        return [null, $message, null];
+    }
+
+    /**
+     * @param non-empty-array<array{?string, string, ?string}> $pipeline The encoded messages
+     *
+     * @return array<mixed> The result of the command of each message, by the key of the messages
+     *
+     * @throws TransportException When the results of the commands are unknown
+     */
+    private function execAddPipeline(\Redis|Relay|\RedisCluster $redis, array $pipeline): array
+    {
+        try {
+            if ($redis instanceof \RedisCluster) {
+                return array_map(fn (array $entry) => $this->sendAddCommand($redis, $entry[1], $entry[2]), $pipeline);
+            }
+
+            $redis->pipeline();
+
+            foreach ($pipeline as [, $message, $score]) {
+                $this->sendAddCommand($redis, $message, $score);
+            }
+
+            $results = $redis->exec();
+        } catch (\RedisException|\RedisClusterException|\Relay\Exception $e) {
+            $this->redis = null;
+
+            if (!$redis instanceof \RedisCluster && $redis::ATOMIC !== $redis->getMode()) {
+                $redis->discard();
+            }
+
+            if ($error = $redis->getLastError() ?: null) {
+                $redis->clearLastError();
+            }
+
+            throw new TransportException($error ?? $e->getMessage(), 0, $e);
+        }
+
+        if (!\is_array($results)) {
+            if ($error = $redis->getLastError() ?: null) {
+                $redis->clearLastError();
+            }
+
+            throw new TransportException($error ?? 'Could not add messages to the redis stream.');
+        }
+
+        return array_combine(array_keys($pipeline), $results);
+    }
+
+    private function sendAddCommand(\Redis|Relay|\RedisCluster $redis, string $message, ?string $score): mixed
+    {
+        if (null !== $score) {
+            return $redis instanceof \RedisCluster ? $redis->rawCommand($this->queue, 'ZADD', $this->queue, 'NX', $score, $message) : $redis->rawCommand('ZADD', $this->queue, 'NX', $score, $message);
+        }
+
+        if ($this->maxEntries) {
+            return $redis->xadd($this->stream, '*', ['message' => $message], $this->maxEntries, true);
+        }
+
+        return $redis->xadd($this->stream, '*', ['message' => $message]);
+    }
+
+    private function findRange(string $start, string $end, ?int $count, bool $reverse = false): array
+    {
+        $redis = $this->getRedis();
+
+        try {
+            if (null === $count) {
+                $range = $redis->xRange($this->stream, $start, $end);
+            } elseif ($reverse) {
+                $range = $redis->xRevRange($this->stream, $start, $end, $count);
+            } else {
+                $range = $redis->xRange($this->stream, $start, $end, $count);
+            }
+        } catch (\RedisException|\RedisClusterException|\Relay\Exception $e) {
+            $this->redis = null;
+
+            throw new TransportException($e->getMessage(), 0, $e);
+        }
+
+        if (!$range) {
+            if ($error = $redis->getLastError() ?: null) {
+                $redis->clearLastError();
+            }
+
+            return [];
+        }
+
+        $messages = [];
+        foreach ($range as $id => $data) {
+            $messages[] = [
+                'id' => $id,
+                'data' => $data,
+            ];
+        }
+
+        return $messages;
     }
 }

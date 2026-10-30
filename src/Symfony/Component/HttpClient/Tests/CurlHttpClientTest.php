@@ -13,10 +13,13 @@ namespace Symfony\Component\HttpClient\Tests;
 
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\RequiresPhpExtension;
+use PHPUnit\Framework\Attributes\TestWith;
 use Symfony\Component\HttpClient\CurlHttpClient;
+use Symfony\Component\HttpClient\Exception\ClientException;
 use Symfony\Component\HttpClient\Exception\InvalidArgumentException;
 use Symfony\Component\HttpClient\Exception\TransportException;
 use Symfony\Component\HttpClient\Internal\CurlClientState;
+use Symfony\Component\Process\Process;
 
 #[RequiresPhpExtension('curl')]
 #[Group('dns-sensitive')]
@@ -47,6 +50,14 @@ class CurlHttpClientTest extends HttpClientTestCase
         parent::testTimeoutIsNotAFatalError();
     }
 
+    public function testCancelFromOnProgressInStreamWritesNothingToStdout()
+    {
+        $process = new Process([\PHP_BINARY, __DIR__.'/Fixtures/cancel_from_on_progress_in_stream.php']);
+        $process->mustRun();
+
+        self::assertSame('Response has been canceled.', $process->getOutput());
+    }
+
     public function testHandleIsReinitOnReset()
     {
         $httpClient = $this->getHttpClient(__FUNCTION__);
@@ -56,6 +67,35 @@ class CurlHttpClientTest extends HttpClientTestCase
         $initialShareId = $clientState->share;
         $httpClient->reset();
         self::assertNotSame($initialShareId, $clientState->share);
+    }
+
+    public function testShutdownResetClosesTheMultiHandle()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+        $state = (new \ReflectionProperty($client, 'multi'))->getValue($client);
+        $client->request('GET', 'http://127.0.0.1:8057/json')->getContent();
+        $handle = \WeakReference::create($state->handle);
+
+        $client->reset();
+        $this->assertNotNull($handle->get());
+
+        $client->reset(true);
+        $this->assertNull($handle->get());
+
+        $this->assertSame(200, $client->request('GET', 'http://127.0.0.1:8057/json')->getStatusCode());
+    }
+
+    public function testShutdownResetKeepsTheMultiHandleOfOpenResponses()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+        $state = (new \ReflectionProperty($client, 'multi'))->getValue($client);
+        $response = $client->request('GET', 'http://127.0.0.1:8057/json');
+        $handle = \WeakReference::create($state->handle);
+
+        $client->reset(true);
+
+        $this->assertNotNull($handle->get());
+        $this->assertSame(200, $response->getStatusCode());
     }
 
     public function testCurlClientStateIsSharedBetweenClones()
@@ -260,6 +300,37 @@ class CurlHttpClientTest extends HttpClientTestCase
         });
     }
 
+    #[TestWith([null, 'https://127.0.0.1:8057/', [], false])]
+    #[TestWith(['3.0', 'https://127.0.0.1:8057/', [], true])]
+    #[TestWith([null, 'http://127.0.0.1:8057/', [], false])]
+    #[TestWith(['3.0', 'http://127.0.0.1:8057/', [], false])]
+    #[TestWith(['2.0', 'https://127.0.0.1:8057/', [], false])]
+    #[TestWith(['1.1', 'https://127.0.0.1:8057/', [], false])]
+    #[TestWith([null, 'https://127.0.0.1:8057/', ['proxy' => 'http://127.0.0.1:8057'], false])]
+    #[TestWith(['3.0', 'https://127.0.0.1:8057/', ['proxy' => 'http://127.0.0.1:8057'], false])]
+    public function testHttp3IsRequestedWhenItCanBeUsed(?string $httpVersion, string $url, array $options, bool $http3)
+    {
+        if (!\defined('CURL_HTTP_VERSION_3ONLY') || \CURL_VERSION_HTTP3 & curl_version()['features']) {
+            $this->markTestSkipped('This test needs curl 7.88 or higher without HTTP/3 support.');
+        }
+
+        $client = $this->getHttpClient(__FUNCTION__);
+
+        $this->withProxyEnvironment([], [], true, function () use ($client, $httpVersion, $url, $options, $http3) {
+            // The installed curl rejects HTTP/3, so requesting it fails before any connection is made
+            CurlClientState::$curlVersion['features'] |= \CURL_VERSION_HTTP3;
+
+            if ($http3) {
+                $this->expectException(TransportException::class);
+                $this->expectExceptionMessage('Curl option "CURLOPT_HTTP_VERSION" is not supported.');
+            }
+
+            $client->request('GET', $url, ['http_version' => $httpVersion] + $options)->cancel();
+
+            $this->addToAssertionCount(1);
+        });
+    }
+
     public function testKeepAuthorizationHeaderOnRedirectToSameHostWithConfiguredHostToIpAddressMapping()
     {
         $httpClient = $this->getHttpClient(__FUNCTION__);
@@ -368,6 +439,83 @@ class CurlHttpClientTest extends HttpClientTestCase
         ]);
 
         self::assertSame(401, $response->getStatusCode());
+    }
+
+    public function testHandleIsReleasedAfterGettingTheContentOfAHeadResponse()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+        $response = $client->request('HEAD', 'http://127.0.0.1:8057/head');
+        $handle = \WeakReference::create((new \ReflectionProperty($response, 'handle'))->getValue($response));
+
+        self::assertSame(200, $response->getStatusCode());
+        self::assertSame('', $response->getContent());
+        unset($response);
+
+        self::assertNull($handle->get());
+    }
+
+    public function testHandleIsReleasedWhenTheResponseIsDestructedByACallback()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+        $response = $client->request('GET', 'http://127.0.0.1:8057/');
+        $handle = \WeakReference::create((new \ReflectionProperty($response, 'handle'))->getValue($response));
+
+        self::assertSame(200, $response->getStatusCode());
+
+        $client->request('GET', 'http://127.0.0.1:8057/', ['on_progress' => static function () use (&$response) {
+            $response = null;
+        }])->getContent();
+
+        self::assertNull($response);
+        self::assertNull($handle->get());
+    }
+
+    public function testResponseDebugBufferClosesOnDestruct()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+        $response = $client->request('HEAD', 'http://127.0.0.1:8057/head');
+
+        $r = new \ReflectionProperty($response, 'debugBuffer');
+        $debugBuffer = (int) $r->getValue($response);
+
+        self::assertSame(200, $response->getStatusCode());
+        $response->getContent();
+        unset($response);
+
+        self::assertArrayNotHasKey($debugBuffer, get_resources('stream'));
+    }
+
+    public function testDebugInfoOnDestructWhileTheBodyIsInFlight()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+
+        $traceInfo = [];
+        $client->request('GET', 'http://localhost:8057/timeout-body', ['on_progress' => static function (int $dlNow, int $dlSize, array $info) use (&$traceInfo) {
+            $traceInfo = $info;
+        }]);
+
+        self::assertNotEmpty($traceInfo['debug']);
+    }
+
+    public function testDebugInfoAfterDestructThrew()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+
+        try {
+            $client->request('GET', 'http://localhost:8057/404');
+            $this->fail(ClientException::class.' expected');
+        } catch (ClientException $e) {
+            self::assertNotEmpty($e->getResponse()->getInfo('debug'));
+        }
+    }
+
+    public function testCancelFromOnProgressWritesNothingToStderr()
+    {
+        $process = new Process([\PHP_BINARY, __DIR__.'/Fixtures/cancel_from_on_progress.php']);
+        $process->mustRun();
+
+        self::assertSame('Response has been canceled.', $process->getOutput());
+        self::assertSame('', $process->getErrorOutput());
     }
 
     #[Group('integration')]

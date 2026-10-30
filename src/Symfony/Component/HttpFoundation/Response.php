@@ -107,7 +107,9 @@ class Response
 
     public ResponseHeaderBag $headers {
         set {
-            trigger_deprecation('symfony/http-foundation', '8.1', 'Directly setting property "headers" of "%s" is deprecated; pass the header bag as a constructor argument instead.', static::class);
+            if (!self::$writingHeaders) {
+                trigger_deprecation('symfony/http-foundation', '8.1', 'Directly setting property "headers" of "%s" is deprecated; pass the header bag as a constructor argument instead.', static::class);
+            }
 
             $this->headers = $value;
         }
@@ -200,6 +202,8 @@ class Response
      */
     private array $sentHeaders;
 
+    private static bool $writingHeaders = false;
+
     /**
      * @param int $status The HTTP status code (200 "OK" by default)
      *
@@ -207,7 +211,10 @@ class Response
      */
     public function __construct(?string $content = '', int $status = 200, array|ResponseHeaderBag $headers = [])
     {
-        self::setHeaders($this, $headers instanceof ResponseHeaderBag ? $headers : new ResponseHeaderBag($headers));
+        $headers = $headers instanceof ResponseHeaderBag ? $headers : new ResponseHeaderBag($headers);
+        self::$writingHeaders = true;
+        $this->headers = $headers;
+        self::$writingHeaders = false;
         $this->setContent($content);
         $this->setStatusCode($status);
         $this->setProtocolVersion('1.0');
@@ -235,7 +242,10 @@ class Response
      */
     public function __clone()
     {
-        self::setHeaders($this, clone $this->headers);
+        $headers = clone $this->headers;
+        self::$writingHeaders = true;
+        $this->headers = $headers;
+        self::$writingHeaders = false;
     }
 
     /**
@@ -544,7 +554,7 @@ class Response
      */
     public function isCacheable(): bool
     {
-        if (!\in_array($this->statusCode, [200, 203, 300, 301, 302, 404, 410], true)) {
+        if (!\in_array($this->statusCode, [200, 203, 300, 301, 302, 308, 404, 410], true)) {
             return false;
         }
 
@@ -717,7 +727,9 @@ class Response
             return (int) $age;
         }
 
-        return max(time() - (int) $this->getDate()->format('U'), 0);
+        $date = $this->getDate();
+
+        return max(time() - (\PHP_INT_SIZE >= 8 ? $date->getTimestamp() : (int) $date->format('U')), 0);
     }
 
     /**
@@ -746,7 +758,7 @@ class Response
             return $this->headers->getDate('Expires');
         } catch (\RuntimeException) {
             // according to RFC 2616 invalid date formats (e.g. "0" and "-1") must be treated as in the past
-            return \DateTimeImmutable::createFromFormat('U', time() - 172800);
+            return \DateTimeImmutable::createFromTimestamp(time() - 172800);
         }
     }
 
@@ -794,7 +806,8 @@ class Response
         }
 
         if (null !== $expires = $this->getExpires()) {
-            $maxAge = (int) $expires->format('U') - (int) $this->getDate()->format('U');
+            $date = $this->getDate();
+            $maxAge = \PHP_INT_SIZE >= 8 ? $expires->getTimestamp() - $date->getTimestamp() : (int) $expires->format('U') - (int) $date->format('U');
 
             return max($maxAge, 0);
         }
@@ -1339,14 +1352,5 @@ class Response
                 $this->headers->remove('Cache-Control');
             }
         }
-    }
-
-    private static function setHeaders(self $response, ResponseHeaderBag $headers): void
-    {
-        static $r;
-
-        $r ??= new \ReflectionProperty(self::class, 'headers');
-
-        $r->setRawValue($response, $headers);
     }
 }

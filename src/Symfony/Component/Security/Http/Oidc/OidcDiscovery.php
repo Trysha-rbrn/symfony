@@ -49,6 +49,7 @@ final class OidcDiscovery implements ResetInterface
      * @param list<string> $checkedEndpoints       Endpoints that must be announced and must not downgrade to plain
      *                                             HTTP the transport that carried the discovery document, checked
      *                                             before the document is cached
+     * @param list<string> $checkedMtlsAliases     Endpoints whose "mtls_endpoint_aliases" entry is checked the same way, when the provider announces one
      */
     public function __construct(
         private readonly HttpClientInterface $httpClient,
@@ -58,12 +59,16 @@ final class OidcDiscovery implements ResetInterface
         private readonly ?int $cacheTtl = 3600,
         private readonly ?string $cacheKey = null,
         private readonly array $checkedEndpoints = [],
+        private readonly array $checkedMtlsAliases = [],
     ) {
         // The trailing slash is trimmed here, and the configuration URL built from the
         // issuer, because an issuer coming from an environment variable is an unresolved
         // placeholder while the container compiles: trimming it there leaves the resolved
         // value untouched, and the discovery URL ends up carrying a double slash.
         $this->issuer = null !== $issuer ? rtrim($issuer, '/') : null;
+        if ('' === $openIdConfigurationUrl) {
+            $openIdConfigurationUrl = '.well-known/openid-configuration';
+        }
         // OIDC Discovery 1.0, Section 4.1: the well-known path is appended to the issuer
         $this->openIdConfigurationUrl = null !== $this->issuer && !preg_match('#^https?://#i', $openIdConfigurationUrl)
             ? $this->issuer.'/'.ltrim($openIdConfigurationUrl, '/')
@@ -83,6 +88,8 @@ final class OidcDiscovery implements ResetInterface
         if (null !== $this->issuer && !self::isSecureUrl($this->issuer)) {
             throw new AuthenticationException(\sprintf('The OIDC issuer "%s" must use HTTPS: the authorization code, the PKCE verifier and the tokens it is exchanged for are only confidential over TLS.', $this->issuer));
         }
+
+        $this->checkDiscoveryUrl();
 
         // the decoded document is memoized for the lifetime of the instance (one per
         // request on classic runtimes, reset between requests in worker mode), so
@@ -111,17 +118,7 @@ final class OidcDiscovery implements ResetInterface
                 throw $this->cannotFetch($e);
             }
 
-            // OpenID Connect Discovery 1.0, Section 4.3: the "issuer" returned MUST be
-            // identical to the issuer used to build the discovery URL. Validating it
-            // prevents a tampered discovery document from redefining the expected issuer.
-            // A trailing slash is ignored on both sides: providers do announce issuers
-            // ending with one (Authentik does), and it carries no security meaning since
-            // the origin and the path are otherwise identical.
-            if (null !== $this->issuer
-                && rtrim((string) ($configuration['issuer'] ?? ''), '/') !== $this->issuer
-            ) {
-                throw new AuthenticationException(\sprintf('The OIDC provider announced the issuer "%s", which does not match the configured issuer "%s".', $configuration['issuer'] ?? '', $this->issuer));
-            }
+            $this->checkIssuer($configuration);
 
             // checked before the document is stored, so that a document sending its
             // clients to plain HTTP is never cached, and a cached configuration does
@@ -130,6 +127,14 @@ final class OidcDiscovery implements ResetInterface
             $url = \is_string($url) ? $url : '';
             foreach ($this->checkedEndpoints as $endpoint) {
                 self::checkEndpointScheme($configuration[$endpoint] ?? null, $endpoint, $url);
+            }
+
+            // an alias is optional: without one, the endpoint checked above is used
+            $aliases = \is_array($configuration['mtls_endpoint_aliases'] ?? null) ? $configuration['mtls_endpoint_aliases'] : [];
+            foreach ($this->checkedMtlsAliases as $endpoint) {
+                if (\array_key_exists($endpoint, $aliases)) {
+                    self::checkEndpointScheme($aliases[$endpoint], 'mtls_endpoint_aliases.'.$endpoint, $url);
+                }
             }
             $save = '' !== $url;
 
@@ -142,7 +147,10 @@ final class OidcDiscovery implements ResetInterface
         // in between, instead of being consumed the next time the document is read
         $this->response = null;
 
-        return $this->configuration = $this->decode($value['payload'] ?? '');
+        $configuration = $this->decode($value['payload'] ?? '');
+        $this->checkIssuer($configuration);
+
+        return $this->configuration = $configuration;
     }
 
     /**
@@ -202,6 +210,34 @@ final class OidcDiscovery implements ResetInterface
     }
 
     /**
+     * Returns the issuer identifier the provider announces, the one a client assertion may
+     * name as its audience.
+     *
+     * It is the value the document itself carries, rather than the configured one, because
+     * the two are compared ignoring a trailing slash: what a provider verifies an audience
+     * against is what it announces, down to that slash.
+     *
+     * An expected issuer is required, as RFC 8414, Section 3.3 requires the client to validate the announced one: otherwise a document could name another provider as the audience of an assertion sent to a token endpoint the document controls.
+     *
+     * @throws \LogicException         If no expected issuer was given to the constructor
+     * @throws AuthenticationException If the discovery document cannot be fetched, or announces no issuer
+     */
+    public function getIssuer(): string
+    {
+        if (null === $this->issuer) {
+            throw new \LogicException(\sprintf('The issuer announced at "%s" cannot be trusted since no expected issuer was given to check it against: pass one to the constructor of "%s".', $this->openIdConfigurationUrl, self::class));
+        }
+
+        $issuer = $this->getConfiguration()['issuer'] ?? null;
+
+        if (!\is_string($issuer) || '' === $issuer) {
+            throw new AuthenticationException('The OIDC provider does not announce any "issuer".');
+        }
+
+        return $issuer;
+    }
+
+    /**
      * Tells whether the given URL provides the transport security the OIDC flow relies on.
      *
      * The authorization code, the PKCE verifier and the tokens it is exchanged for are only
@@ -226,8 +262,26 @@ final class OidcDiscovery implements ResetInterface
         return str_ends_with($host, '.localhost');
     }
 
+    private function checkIssuer(array $configuration): void
+    {
+        $issuer = \is_string($configuration['issuer'] ?? null) ? $configuration['issuer'] : '';
+
+        if (null !== $this->issuer && rtrim($issuer, '/') !== $this->issuer) {
+            throw new AuthenticationException(\sprintf('The OIDC provider announced the issuer "%s", which does not match the configured issuer "%s".', $issuer, $this->issuer));
+        }
+    }
+
+    private function checkDiscoveryUrl(): void
+    {
+        if (null !== $this->issuer && !self::isSecureUrl($this->openIdConfigurationUrl)) {
+            throw new AuthenticationException(\sprintf('The OIDC discovery URL "%s" must use HTTPS, or a loopback host for local development.', $this->openIdConfigurationUrl));
+        }
+    }
+
     private function request(): ResponseInterface
     {
+        $this->checkDiscoveryUrl();
+
         try {
             // redirects are not followed: the endpoints announced by the document are
             // checked against the URL it was requested from, which a redirect would change

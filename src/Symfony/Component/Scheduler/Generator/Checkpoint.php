@@ -43,10 +43,14 @@ final class Checkpoint implements CheckpointInterface
         }
 
         if ($this->cache) {
-            [$this->time, $this->index, $this->from] = $this->cache->get($this->name, static function (CacheItemInterface $item) use ($now) {
+            // When the cache lost the state, restore the local one, unless another Worker held the Lock in the meantime.
+            $state = !$this->reset && isset($this->time) ? [$this->time, $this->index, $this->from] : [$now, -1, $now];
+            $this->reset = false;
+
+            [$this->time, $this->index, $this->from] = $this->cache->get($this->name, static function (CacheItemInterface $item) use ($state) {
                 $item->expiresAfter(self::CACHE_EXPIRY);
 
-                return [$now, -1, $now];
+                return $state;
             }) + [2 => $now];
             $this->save($this->time, $this->index);
         } elseif ($this->reset) {
@@ -114,9 +118,14 @@ final class Checkpoint implements CheckpointInterface
             $this->lock->release();
         } elseif ($remaining = $this->lock->getRemainingLifetime()) {
             // the lock might have expired during a long run; stores reject negative TTLs and some reject TTLs below one second
-            if (1 <= $ttl = (float) $nextTime->format('U.u') - (float) $now->format('U.u') + $remaining) {
+            if (1 <= $ttl = self::toTimestamp($nextTime) - self::toTimestamp($now) + $remaining) {
                 $this->lock->refresh($ttl);
             }
         }
+    }
+
+    private static function toTimestamp(\DateTimeInterface $date): float
+    {
+        return \PHP_INT_SIZE >= 8 ? $date->getTimestamp() + $date->getMicrosecond() / 1e6 : (float) $date->format('U.u');
     }
 }

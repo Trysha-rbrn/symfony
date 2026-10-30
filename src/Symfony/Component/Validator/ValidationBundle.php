@@ -15,10 +15,12 @@ use Symfony\Component\Config\Definition\Configurator\DefinitionConfigurator;
 use Symfony\Component\Config\Resource\DirectoryResource;
 use Symfony\Component\DependencyInjection\ChildDefinition;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
+use Symfony\Component\DependencyInjection\Exception\ExceptionInterface;
 use Symfony\Component\DependencyInjection\Kernel\AbstractBundle;
 use Symfony\Component\DependencyInjection\Kernel\RequiredBundle;
 use Symfony\Component\DependencyInjection\Kernel\ServicesBundle;
 use Symfony\Component\DependencyInjection\Loader\Configurator\ContainerConfigurator;
+use Symfony\Component\DependencyInjection\Parameter;
 use Symfony\Component\DependencyInjection\Reference;
 use Symfony\Component\ExpressionLanguage\ExpressionLanguage;
 use Symfony\Component\Finder\Finder;
@@ -42,6 +44,8 @@ use Symfony\Component\Validator\Mapping\Loader\YamlFileLoader;
 class ValidationBundle extends AbstractBundle
 {
     private const MAPPING_FILE_PATTERN = '/\.(xml|ya?ml)$/';
+
+    private bool $frameworkTest = false;
 
     public function getPath(): string
     {
@@ -81,8 +85,16 @@ class ValidationBundle extends AbstractBundle
                     ->end()
                 ->end()
                 ->arrayNode('not_compromised_password')
-                    ->canBeDisabled('When disabled, compromised passwords will be accepted as valid.')
+                    ->addDefaultsIfNotSet()
+                    ->treatFalseLike(['enabled' => false])
+                    ->treatTrueLike(['enabled' => true])
+                    ->treatNullLike(['enabled' => true])
                     ->children()
+                        ->booleanNode('enabled')
+                            ->info('When disabled, compromised passwords will be accepted as valid. Defaults to false when "framework.test" is enabled, to true otherwise.')
+                            ->defaultNull()
+                            ->resolvesAtCompileTime()
+                        ->end()
                         ->scalarNode('endpoint')
                             ->defaultNull()
                             ->info('API endpoint for the NotCompromisedPassword Validator.')
@@ -141,6 +153,27 @@ class ValidationBundle extends AbstractBundle
                 ->end()
             ->end()
         ;
+    }
+
+    public function prependExtension(ContainerConfigurator $configurator, ContainerBuilder $container): void
+    {
+        $this->frameworkTest = false;
+        $test = false;
+
+        if ($container->hasExtension('framework')) {
+            foreach ($container->getExtensionConfig('framework') as $config) {
+                if (\array_key_exists('test', $config)) {
+                    // "test: ~" enables the option, like "test: true"
+                    $test = $config['test'] ?? true;
+                }
+            }
+        }
+
+        try {
+            $this->frameworkTest = true === $container->resolveEnvPlaceholders($test, true);
+        } catch (ExceptionInterface) {
+            // FrameworkBundle reports the error with the name of the option
+        }
     }
 
     public function loadExtension(array $config, ContainerConfigurator $configurator, ContainerBuilder $container): void
@@ -212,6 +245,8 @@ class ValidationBundle extends AbstractBundle
 
         if (!$container->getParameter('kernel.debug')) {
             $validatorBuilder->addMethodCall('setMappingCache', [new Reference('validator.mapping.cache.adapter')]);
+            // the validators created by kernel resets share the metadata they load, until the container is rebuilt
+            $validatorBuilder->addMethodCall('setSharedMetadataKey', [new Parameter('container.build_id')]);
         }
 
         if ($config['disable_translation']) {
@@ -229,7 +264,7 @@ class ValidationBundle extends AbstractBundle
         }
 
         $container->getDefinition('validator.not_compromised_password')
-            ->setArgument(2, $config['not_compromised_password']['enabled'])
+            ->setArgument(2, $config['not_compromised_password']['enabled'] ?? !$this->frameworkTest)
             ->setArgument(3, $config['not_compromised_password']['endpoint'])
         ;
 

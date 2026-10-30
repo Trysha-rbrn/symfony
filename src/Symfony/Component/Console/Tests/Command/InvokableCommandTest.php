@@ -33,6 +33,7 @@ use Symfony\Component\Console\Exception\InvalidArgumentException;
 use Symfony\Component\Console\Exception\InvalidOptionException;
 use Symfony\Component\Console\Exception\LogicException;
 use Symfony\Component\Console\Input\ArrayInput;
+use Symfony\Component\Console\Input\File\InputFile;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Output\NullOutput;
 use Symfony\Component\Console\Output\OutputInterface;
@@ -277,6 +278,161 @@ class InvokableCommandTest extends TestCase
         self::expectExceptionMessage('The value "incorrect" is not valid for the "enum" option. Supported values are "image", "video".');
 
         $command->run(new ArrayInput(['--enum' => 'incorrect']), new NullOutput());
+    }
+
+    public function testVariadicEnumArgument()
+    {
+        $command = new Command('foo');
+        $command->setCode(static function (#[Argument] StringEnum ...$enums) use (&$received): int {
+            $received = $enums;
+
+            return 0;
+        });
+
+        $command->run(new ArrayInput(['enums' => ['video', 'image']]), new NullOutput());
+
+        self::assertSame([StringEnum::Video, StringEnum::Image], $received);
+    }
+
+    public function testVariadicEnumOption()
+    {
+        $command = new Command('foo');
+        $command->setCode(static function (#[Option] StringEnum ...$enums) use (&$received): int {
+            $received = $enums;
+
+            return 0;
+        });
+
+        $command->run(new ArrayInput(['--enums' => ['image']]), new NullOutput());
+
+        self::assertSame([StringEnum::Image], $received);
+
+        self::expectException(InvalidOptionException::class);
+        self::expectExceptionMessage('The value "incorrect" is not valid for the "enums" option. Supported values are "image", "video".');
+
+        $command->run(new ArrayInput(['--enums' => ['image', 'incorrect']]), new NullOutput());
+    }
+
+    public function testEnumListArgument()
+    {
+        $command = new Command('foo');
+        $command->setCode(
+            /** @param list<StringEnum> $enums */
+            static function (
+                #[Argument] array $enums = [],
+            ): int {
+                Assert::assertSame([StringEnum::Image, StringEnum::Video], $enums);
+
+                return 0;
+            }
+        );
+
+        $enumsInputArgument = $command->getDefinition()->getArgument('enums');
+        self::assertFalse($enumsInputArgument->isRequired());
+        self::assertTrue($enumsInputArgument->isArray());
+        self::assertSame([], $enumsInputArgument->getDefault());
+        self::assertTrue($enumsInputArgument->hasCompletion());
+
+        $enumsInputArgument->complete(CompletionInput::fromTokens([], 0), $suggestions = new CompletionSuggestions());
+        self::assertEquals([new Suggestion('image'), new Suggestion('video')], $suggestions->getValueSuggestions());
+
+        $command->run(new ArrayInput(['enums' => ['image', 'video']]), new NullOutput());
+
+        self::expectException(InvalidArgumentException::class);
+        self::expectExceptionMessage('The value "incorrect" is not valid for the "enums" argument. Supported values are "image", "video".');
+
+        $command->run(new ArrayInput(['enums' => ['incorrect']]), new NullOutput());
+    }
+
+    public function testEnumListOption()
+    {
+        $command = new Command('foo');
+        $command->setCode(
+            /**
+             * @param list<StringEnum>      $enums
+             * @param list<StringEnum>|null $nullableEnums
+             */
+            static function (
+                #[Option] array $enums = [],
+                #[Option] ?array $nullableEnums = null,
+            ): int {
+                Assert::assertSame([StringEnum::Image, StringEnum::Video], $enums);
+                Assert::assertNull($nullableEnums);
+
+                return 0;
+            }
+        );
+
+        $enumsInputOption = $command->getDefinition()->getOption('enums');
+        self::assertTrue($enumsInputOption->isValueRequired());
+        self::assertTrue($enumsInputOption->isArray());
+        self::assertSame([], $enumsInputOption->getDefault());
+        self::assertTrue($enumsInputOption->hasCompletion());
+
+        $nullableEnumsInputOption = $command->getDefinition()->getOption('nullable-enums');
+        self::assertTrue($nullableEnumsInputOption->isArray());
+        self::assertSame([], $nullableEnumsInputOption->getDefault());
+
+        $enumsInputOption->complete(CompletionInput::fromTokens([], 0), $suggestions = new CompletionSuggestions());
+        self::assertEquals([new Suggestion('image'), new Suggestion('video')], $suggestions->getValueSuggestions());
+
+        $command->run(new ArrayInput(['--enums' => ['image', 'video']]), new NullOutput());
+
+        self::expectException(InvalidOptionException::class);
+        self::expectExceptionMessage('The value "incorrect" is not valid for the "enums" option. Supported values are "image", "video".');
+
+        $command->run(new ArrayInput(['--enums' => ['incorrect']]), new NullOutput());
+    }
+
+    public function testEnumInputsListTheirCasesInTheirDescription()
+    {
+        $command = new Command('foo');
+        $command->setCode(
+            /** @param list<StringEnum> $enumList */
+            static fn (
+                #[Argument('The type')] StringEnum $enum,
+                #[Argument] array $enumList = [],
+                #[Option('The other type')] StringEnum $otherEnum = StringEnum::Image,
+                #[Option(suggestedValues: ['video'])] ?StringEnum $suggestedEnum = null,
+                #[Option] StringEnum ...$enums,
+            ): int => 0
+        );
+
+        $definition = $command->getDefinition();
+        self::assertSame('The type [possible values: image, video]', $definition->getArgument('enum')->getDescription());
+        self::assertSame('[possible values: image, video]', $definition->getArgument('enum-list')->getDescription());
+        self::assertSame('The other type [possible values: image, video]', $definition->getOption('other-enum')->getDescription());
+        self::assertSame('[possible values: image, video]', $definition->getOption('suggested-enum')->getDescription());
+        self::assertSame('[possible values: image, video]', $definition->getOption('enums')->getDescription());
+
+        $definition->getOption('suggested-enum')->complete(CompletionInput::fromTokens([], 0), $suggestions = new CompletionSuggestions());
+        self::assertEquals([new Suggestion('video')], $suggestions->getValueSuggestions());
+    }
+
+    public function testInputFileInputsCompletePaths()
+    {
+        $command = new Command('foo');
+        $command->setCode(
+            /** @param list<InputFile> $files */
+            static fn (
+                #[Argument] InputFile $file,
+                #[Argument] array $files = [],
+                #[Option] ?InputFile $config = null,
+                #[Option(suggestedValues: ['-'])] ?InputFile $source = null,
+                #[Option] InputFile ...$includes,
+            ): int => 0
+        );
+
+        $definition = $command->getDefinition();
+        foreach ([$definition->getArgument('file'), $definition->getArgument('files'), $definition->getOption('config'), $definition->getOption('includes')] as $input) {
+            $input->complete(CompletionInput::fromTokens([], 0), $suggestions = new CompletionSuggestions());
+            self::assertSame('paths', $suggestions->getPathSuggestion(), $input->getName());
+            self::assertSame([], $suggestions->getValueSuggestions());
+        }
+
+        $definition->getOption('source')->complete(CompletionInput::fromTokens([], 0), $suggestions = new CompletionSuggestions());
+        self::assertNull($suggestions->getPathSuggestion());
+        self::assertEquals([new Suggestion('-')], $suggestions->getValueSuggestions());
     }
 
     public function testNumericArgumentIsConvertedOrRejected()

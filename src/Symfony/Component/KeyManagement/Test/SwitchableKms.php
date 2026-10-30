@@ -49,14 +49,9 @@ final class SwitchableKms implements DataKeyGeneratorInterface, DecrypterInterfa
     public array $calls = [];
 
     /**
-     * @var list<string> The key id of each encrypt() and generateDataKey() call, in order
+     * @var list<string> The key id of each encrypt(), generateDataKey() and wrapDataKey() call, in order
      */
     public array $keyIds = [];
-
-    /**
-     * @var list<bool> The `$deterministic` flag of each encrypt() call
-     */
-    public array $deterministic = [];
 
     public function __construct(
         private readonly DataKeyGeneratorInterface&DecrypterInterface&EncrypterInterface $inner,
@@ -64,12 +59,11 @@ final class SwitchableKms implements DataKeyGeneratorInterface, DecrypterInterfa
     ) {
     }
 
-    public function encrypt(string $keyId, #[\SensitiveParameter] string $plaintext, string $aad = '', bool $deterministic = false): Ciphertext
+    public function encrypt(string $keyId, #[\SensitiveParameter] string $plaintext, string $aad = ''): Ciphertext
     {
         $this->keyIds[] = $keyId;
-        $this->deterministic[] = $deterministic;
 
-        return $this->up(__FUNCTION__)->encrypt($keyId, $plaintext, $aad, $deterministic);
+        return $this->up(__FUNCTION__)->encrypt($keyId, $plaintext, $aad);
     }
 
     public function decrypt(Ciphertext $ciphertext, string $aad = ''): string
@@ -82,6 +76,13 @@ final class SwitchableKms implements DataKeyGeneratorInterface, DecrypterInterfa
         $this->keyIds[] = $keyId;
 
         return $this->up(__FUNCTION__)->generateDataKey($keyId, $length, $aad);
+    }
+
+    public function wrapDataKey(string $keyId, #[\SensitiveParameter] string $dataKey, string $aad = ''): Ciphertext
+    {
+        $this->keyIds[] = $keyId;
+
+        return $this->up(__FUNCTION__)->wrapDataKey($keyId, $dataKey, $aad);
     }
 
     public function unwrapDataKey(Ciphertext $wrapped, string $aad = ''): DataKey

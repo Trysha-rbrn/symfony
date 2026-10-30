@@ -92,6 +92,7 @@ class Process implements \IteratorAggregate
     private int $incrementalErrorOutputOffset = 0;
     private bool $tty = false;
     private bool $pty;
+    private bool $stdioInherited = false;
     private array $options = ['suppress_errors' => true, 'bypass_shell' => true];
     private array $ignoredSignals = [];
 
@@ -330,7 +331,16 @@ class Process implements \IteratorAggregate
             $env += '\\' === \DIRECTORY_SEPARATOR ? array_diff_ukey($this->env, $env, 'strcasecmp') : $this->env;
         }
 
-        $env += '\\' === \DIRECTORY_SEPARATOR ? array_diff_ukey($this->getDefaultEnv(), $env, 'strcasecmp') : $this->getDefaultEnv();
+        $defaultEnv = '\\' === \DIRECTORY_SEPARATOR ? array_diff_ukey($this->getDefaultEnv(), $env, 'strcasecmp') : array_diff_key($this->getDefaultEnv(), $env);
+
+        // Vars passed explicitly are not loaded by Dotenv: don't let the child's Dotenv override them
+        if (isset($defaultEnv['SYMFONY_DOTENV_VARS']) && $env) {
+            $dotenvVars = explode(',', $defaultEnv['SYMFONY_DOTENV_VARS']);
+            $dotenvVars = '\\' === \DIRECTORY_SEPARATOR ? array_udiff($dotenvVars, array_keys($env), 'strcasecmp') : array_diff($dotenvVars, array_keys($env));
+            $defaultEnv['SYMFONY_DOTENV_VARS'] = implode(',', $dotenvVars);
+        }
+
+        $env += $defaultEnv;
 
         if (\is_array($commandline = $this->commandline)) {
             $commandline = array_values(array_map(strval(...), $commandline));
@@ -511,41 +521,61 @@ class Process implements \IteratorAggregate
      *                                                            output available on STDOUT or STDERR
      *
      * @throws RuntimeException         When process timed out
-     * @throws LogicException           When process is not yet started
+     * @throws LogicException           When process is not yet started or the standard streams are inherited
      * @throws ProcessTimedOutException In case the timeout was reached
      */
     public function waitUntil(callable $callback): bool
     {
-        $this->requireProcessIsStarted(__FUNCTION__);
-        $this->updateStatus(false);
-
-        if (!$this->processPipes->haveReadSupport()) {
-            $this->stop(0);
-            throw new LogicException('Pass the callback to the "Process::start" method or call enableOutput to use a callback with "Process::waitUntil".');
+        if ($this->stdioInherited) {
+            throw new LogicException('The output cannot be read while the standard streams are inherited.');
         }
-        $callback = $this->buildCallback($callback);
+
+        $this->requireProcessIsStarted(__FUNCTION__);
 
         $ready = false;
-        while (true) {
-            $this->checkTimeout();
-            $running = '\\' === \DIRECTORY_SEPARATOR ? $this->isRunning() : $this->processPipes->areOpen();
-            $output = $this->processPipes->readAndWrite($running, '\\' !== \DIRECTORY_SEPARATOR || !$running);
+        $previousCallback = $this->callback;
+        // updateStatus() and isRunning() read the pipes and pass the output to $this->callback: forward it to $callback too so that no output is missed
+        $this->callback = $waitUntilCallback = static function (string $type, string $data) use ($previousCallback, $callback, &$ready): bool {
+            $previousCallback($type, $data);
 
-            foreach ($output as $type => $data) {
-                if (3 !== $type) {
-                    $ready = $callback(self::STDOUT === $type ? self::OUT : self::ERR, $data) || $ready;
-                } elseif (!isset($this->fallbackStatus['signaled'])) {
-                    $this->fallbackStatus['exitcode'] = (int) $data;
+            return $ready = $callback($type, $data) || $ready;
+        };
+
+        try {
+            $this->updateStatus(false);
+
+            if (!$this->processPipes->haveReadSupport()) {
+                $this->stop(0);
+                throw new LogicException('Pass the callback to the "Process::start" method or call enableOutput to use a callback with "Process::waitUntil".');
+            }
+            $callback = $this->buildCallback($callback);
+
+            while (true) {
+                $this->checkTimeout();
+                $running = '\\' === \DIRECTORY_SEPARATOR ? $this->isRunning() : $this->processPipes->areOpen();
+                $output = $this->processPipes->readAndWrite($running && !$ready, '\\' !== \DIRECTORY_SEPARATOR || !$running);
+
+                foreach ($output as $type => $data) {
+                    if (3 !== $type) {
+                        $ready = $callback(self::STDOUT === $type ? self::OUT : self::ERR, $data) || $ready;
+                    } elseif (!isset($this->fallbackStatus['signaled'])) {
+                        $this->fallbackStatus['exitcode'] = (int) $data;
+                    }
                 }
-            }
-            if ($ready) {
-                return true;
-            }
-            if (!$running) {
-                return false;
-            }
+                if ($ready) {
+                    return true;
+                }
+                if (!$running) {
+                    return false;
+                }
 
-            usleep(1000);
+                usleep(1000);
+            }
+        } finally {
+            // close() unsets the callback once the process is terminated
+            if ($waitUntilCallback === $this->callback) {
+                $this->callback = $previousCallback;
+            }
         }
     }
 
@@ -674,9 +704,14 @@ class Process implements \IteratorAggregate
      *
      * @throws LogicException in case the output has been disabled
      * @throws LogicException In case the process is not started
+     * @throws LogicException In case the standard streams are inherited
      */
     public function getIterator(int $flags = 0): \Generator
     {
+        if ($this->stdioInherited) {
+            throw new LogicException('The output cannot be read while the standard streams are inherited.');
+        }
+
         $this->readPipesForOutput(__FUNCTION__, false);
 
         $clearOutput = !(self::ITER_KEEP_OUTPUT & $flags);
@@ -1056,13 +1091,16 @@ class Process implements \IteratorAggregate
      *
      * @return $this
      *
-     * @throws LogicException           if the output is disabled
+     * @throws LogicException           if the output is disabled or the standard streams are inherited
      * @throws InvalidArgumentException if the timeout is negative
      */
     public function setIdleTimeout(?float $timeout): static
     {
         if (null !== $timeout && $this->outputDisabled) {
             throw new LogicException('Idle timeout cannot be set while the output is disabled.');
+        }
+        if (null !== $timeout && $this->stdioInherited) {
+            throw new LogicException('Idle timeout cannot be set while the standard streams are inherited.');
         }
 
         $this->idleTimeout = $this->validateTimeout($timeout);
@@ -1076,11 +1114,16 @@ class Process implements \IteratorAggregate
      * @return $this
      *
      * @throws RuntimeException In case the TTY mode is not supported
+     * @throws LogicException   In case the standard streams are inherited
      */
     public function setTty(bool $tty): static
     {
         if ('\\' === \DIRECTORY_SEPARATOR && $tty) {
             throw new RuntimeException('TTY mode is not supported on Windows platform.');
+        }
+
+        if ($tty && $this->stdioInherited) {
+            throw new LogicException('TTY mode cannot be enabled while the standard streams are inherited.');
         }
 
         if ($tty && !self::isTtySupported()) {
@@ -1118,6 +1161,44 @@ class Process implements \IteratorAggregate
     public function isPty(): bool
     {
         return $this->pty;
+    }
+
+    /**
+     * Makes the process inherit the standard input, output and error of the current process, like a command run from a shell script.
+     *
+     * The output is neither captured nor passed to callbacks, and the process sees the terminal the current process is attached to, if any.
+     * When an input is set, it is written to the standard input of the process instead of inheriting it.
+     *
+     * The process runs in the process group of the current process: signals sent by the terminal (e.g. Ctrl+C) reach both processes.
+     *
+     * @return $this
+     *
+     * @throws RuntimeException In case the process is already running
+     * @throws LogicException   In case the TTY mode is enabled or an idle timeout is set
+     */
+    public function inheritStdio(): static
+    {
+        if ($this->isRunning()) {
+            throw new RuntimeException('Inheriting the standard streams while the process is running is not possible.');
+        }
+        if ($this->tty) {
+            throw new LogicException('The standard streams cannot be inherited while the TTY mode is enabled.');
+        }
+        if (null !== $this->idleTimeout) {
+            throw new LogicException('The standard streams cannot be inherited while an idle timeout is set.');
+        }
+
+        $this->stdioInherited = true;
+
+        return $this;
+    }
+
+    /**
+     * Checks if the process inherits the standard input, output and error of the current process.
+     */
+    public function isStdioInherited(): bool
+    {
+        return $this->stdioInherited;
     }
 
     /**
@@ -1318,9 +1399,9 @@ class Process implements \IteratorAggregate
             $this->input->rewind();
         }
         if ('\\' === \DIRECTORY_SEPARATOR) {
-            $this->processPipes = new WindowsPipes($this->input, !$this->outputDisabled || $hasCallback);
+            $this->processPipes = new WindowsPipes($this->input, !$this->outputDisabled || $hasCallback, $this->stdioInherited);
         } else {
-            $this->processPipes = new UnixPipes($this->isTty(), $this->isPty(), $this->input, !$this->outputDisabled || $hasCallback);
+            $this->processPipes = new UnixPipes($this->isTty(), $this->isPty(), $this->input, !$this->outputDisabled || $hasCallback, $this->stdioInherited);
         }
 
         return $this->processPipes->getDescriptors();

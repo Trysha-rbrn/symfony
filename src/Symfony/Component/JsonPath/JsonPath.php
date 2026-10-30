@@ -60,12 +60,9 @@ final class JsonPath
 
     public function slice(int $start, ?int $end = null, ?int $step = null): static
     {
-        $slice = $start;
-        if (null !== $end) {
-            $slice .= ':'.$end;
-            if (null !== $step) {
-                $slice .= ':'.$step;
-            }
+        $slice = $start.':'.$end;
+        if (null !== $step) {
+            $slice .= ':'.$step;
         }
 
         return new self($this->path.'['.$slice.']');
@@ -89,14 +86,12 @@ final class JsonPath
             "\n" => '\\n',
             "\r" => '\\r',
             "\t" => '\\t',
-            "\b" => '\\b',
+            "\x08" => '\\b',
             "\f" => '\\f',
         ]);
 
         for ($i = 0; $i <= 31; ++$i) {
-            if ($i < 8 || $i > 13) {
-                $key = str_replace(\chr($i), \sprintf('\\u%04x', $i), $key);
-            }
+            $key = str_replace(\chr($i), \sprintf('\\u%04x', $i), $key);
         }
 
         return $key;

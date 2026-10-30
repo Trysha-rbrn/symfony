@@ -134,6 +134,15 @@ final class PseudoLocalizationTranslator implements TranslatorInterface, Transla
         return $this->translator->getCatalogues();
     }
 
+    public function getGlobalParameters(): array
+    {
+        if ($this->translator instanceof Translator || method_exists($this->translator, 'getGlobalParameters')) {
+            return $this->translator->getGlobalParameters();
+        }
+
+        return [];
+    }
+
     private function getParts(string $originalTrans): array
     {
         if (!$this->parseHTML) {
@@ -153,11 +162,9 @@ final class PseudoLocalizationTranslator implements TranslatorInterface, Transla
         return $this->parseNode($dom->childNodes->item(1)->childNodes->item(0)->childNodes->item(0));
     }
 
-    private function parseNode(\DOMNode $node): array
+    private function parseNode(\DOMNode $node, array &$parts = []): array
     {
-        $parts = [];
-
-        foreach ($node->childNodes as $childNode) {
+        for ($childNode = $node->firstChild; null !== $childNode; $childNode = $childNode->nextSibling) {
             if (!$childNode instanceof \DOMElement) {
                 $parts[] = [true, true, $childNode->nodeValue];
 
@@ -183,7 +190,7 @@ final class PseudoLocalizationTranslator implements TranslatorInterface, Transla
 
             $parts[] = [false, false, '>'];
 
-            $parts = array_merge($parts, $this->parseNode($childNode));
+            $this->parseNode($childNode, $parts);
 
             $parts[] = [false, false, '</'.$childNode->tagName.'>'];
         }

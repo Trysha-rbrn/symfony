@@ -11,10 +11,13 @@
 
 namespace Symfony\Component\Console\Attribute;
 
+use Symfony\Component\Console\Attribute\Reflection\DocBlockTypeResolver;
 use Symfony\Component\Console\Attribute\Reflection\ReflectionMember;
 use Symfony\Component\Console\Completion\CompletionInput;
+use Symfony\Component\Console\Completion\CompletionSuggestions;
 use Symfony\Component\Console\Completion\Suggestion;
 use Symfony\Component\Console\Exception\LogicException;
+use Symfony\Component\Console\Input\File\InputFileType;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\String\UnicodeString;
 
@@ -37,15 +40,16 @@ class Option
     private ?int $mode = null;
     private string $memberName = '';
     private string $sourceName = '';
+    private array $possibleValues = [];
 
     /**
      * Represents a console command --option definition.
      *
      * If unset, the `name` value will be inferred from the parameter definition.
      *
-     * @param string|(callable():string)                                                 $description     The description of the option, displayed with the help page
-     * @param array|string|null                                                          $shortcut        The shortcuts, can be null, a string of shortcuts delimited by | or an array of shortcuts
-     * @param array<string|Suggestion>|callable(CompletionInput):list<string|Suggestion> $suggestedValues The values used for input completion
+     * @param string|(callable():string)                                                                        $description     The description of the option, displayed with the help page
+     * @param array|string|null                                                                                 $shortcut        The shortcuts, can be null, a string of shortcuts delimited by | or an array of shortcuts
+     * @param array<string|Suggestion>|callable(CompletionInput, CompletionSuggestions):list<string|Suggestion> $suggestedValues The values used for input completion
      */
     public function __construct(
         string|callable $description = '',
@@ -121,8 +125,22 @@ class Option
             $self->suggestedValues = [$instance, $self->suggestedValues[1]];
         }
 
-        if (is_subclass_of($self->typeName, \BackedEnum::class) && !$self->suggestedValues) {
-            $self->suggestedValues = array_column($self->typeName::cases(), 'value');
+        if (is_subclass_of($self->typeName, \BackedEnum::class)) {
+            $self->possibleValues = array_column($self->typeName::cases(), 'value');
+        } elseif ('array' === $self->typeName && null !== ($itemClass = DocBlockTypeResolver::resolveArrayItemClass($member)) && is_subclass_of($itemClass, \BackedEnum::class)) {
+            $self->possibleValues = array_column($itemClass::cases(), 'value');
+        }
+
+        if (!$self->suggestedValues) {
+            $self->suggestedValues = $self->possibleValues;
+        }
+
+        if (!$self->suggestedValues && (InputFileType::isInputFile($reflection) || InputFileType::isInputFileCollection($reflection))) {
+            $self->suggestedValues = static function (CompletionInput $input, CompletionSuggestions $suggestions): array {
+                $suggestions->suggestPaths();
+
+                return [];
+            };
         }
 
         return $self;
@@ -138,8 +156,9 @@ class Option
             | ($this->hidden ? InputOption::HIDDEN : 0);
         $default = InputOption::VALUE_NONE === (InputOption::VALUE_NONE & $mode) ? null : $this->default;
         $suggestedValues = \is_callable($this->suggestedValues) ? ($this->suggestedValues)(...) : $this->suggestedValues;
+        $description = $this->possibleValues ? ('' !== $this->description ? $this->description.' ' : '').'[possible values: '.implode(', ', $this->possibleValues).']' : $this->description;
 
-        return new InputOption($this->name, $this->shortcut, $mode, $this->description, $default, $suggestedValues);
+        return new InputOption($this->name, $this->shortcut, $mode, $description, $default, $suggestedValues);
     }
 
     private function handleUnion(\ReflectionUnionType $type): self

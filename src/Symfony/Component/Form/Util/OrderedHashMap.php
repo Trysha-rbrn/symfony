@@ -94,7 +94,11 @@ class OrderedHashMap implements \ArrayAccess, \IteratorAggregate, \Countable
         private array $elements = [],
     ) {
         // the explicit string type-cast is necessary as digit-only keys would be returned as integers otherwise
-        $this->orderedKeys = array_map(strval(...), array_keys($elements));
+        $keys = [];
+        foreach ($elements as $key => $value) {
+            $keys[] = (string) $key;
+        }
+        $this->orderedKeys = $keys;
     }
 
     public function offsetExists(mixed $key): bool
@@ -126,7 +130,7 @@ class OrderedHashMap implements \ArrayAccess, \IteratorAggregate, \Countable
 
     public function offsetUnset(mixed $key): void
     {
-        if (false !== ($position = array_search((string) $key, $this->orderedKeys))) {
+        if (false !== $position = array_search((string) $key, $this->orderedKeys, true)) {
             array_splice($this->orderedKeys, $position, 1);
             unset($this->elements[$key]);
 

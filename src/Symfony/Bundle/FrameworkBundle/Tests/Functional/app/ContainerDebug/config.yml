@@ -4,6 +4,11 @@ imports:
 parameters:
     env(JSON): '[1, "2.5", 3]'
     env(APP_FOO): 'foo'
+    env(FORM_ENABLED): 'true'
+
+framework:
+    form:
+        enabled: '%env(bool:FORM_ENABLED)%'
 
 services:
     _defaults: { public: true }
@@ -27,6 +32,15 @@ services:
     Symfony\Bundle\FrameworkBundle\Tests\Fixtures\BackslashClass:
         class: Symfony\Bundle\FrameworkBundle\Tests\Fixtures\BackslashClass
     Symfony\Bundle\FrameworkBundle\Tests\Fixtures\ClassAliasExampleClass: '@public'
+    abstract_definition:
+        class: Symfony\Bundle\FrameworkBundle\Tests\Fixtures\AbstractDefinitionClass
+        abstract: true
+    Symfony\Bundle\FrameworkBundle\Tests\Fixtures\AbstractDefinitionClass:
+        alias: abstract_definition
+        public: false
+    Symfony\Bundle\FrameworkBundle\Tests\Fixtures\MissingServiceInterface:
+        alias: missing_service
+        public: false
     env:
         class: stdClass
         arguments:
@@ -40,6 +54,7 @@ services:
             - '%env(REAL)%'
             - '%env(REAL)%'
             - '%env(APP_BAZ)%'
+            - '%env(FORM_ENABLED)%'
     env_closure:
         class: stdClass
         arguments:

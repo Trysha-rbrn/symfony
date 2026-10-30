@@ -12,16 +12,20 @@
 namespace Symfony\Bundle\FrameworkBundle;
 
 use Symfony\Bundle\FrameworkBundle\Test\TestBrowserToken;
+use Symfony\Bundle\FrameworkBundle\Test\TestContainer;
 use Symfony\Component\BrowserKit\Cookie;
 use Symfony\Component\BrowserKit\CookieJar;
 use Symfony\Component\BrowserKit\History;
+use Symfony\Component\BrowserKit\Request as DomRequest;
 use Symfony\Component\DependencyInjection\ContainerInterface;
+use Symfony\Component\DomCrawler\Crawler;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpFoundation\Session\SessionInterface;
 use Symfony\Component\HttpKernel\HttpKernelBrowser;
 use Symfony\Component\HttpKernel\KernelInterface;
 use Symfony\Component\HttpKernel\Profiler\Profile as HttpProfile;
+use Symfony\Component\Routing\Exception\RouteNotFoundException;
 use Symfony\Component\Security\Core\User\UserInterface;
 
 /**
@@ -35,6 +39,12 @@ class KernelBrowser extends HttpKernelBrowser
     private bool $profiler = false;
     private bool $reboot = true;
     private ?\Closure $containerConfigurator = null;
+    private ?\WeakReference $configuredContainer = null;
+
+    /**
+     * @var array<string, TestBrowserToken>
+     */
+    private array $tokens = [];
 
     public function __construct(KernelInterface $kernel, array $server = [], ?History $history = null, ?CookieJar $cookieJar = null)
     {
@@ -140,6 +150,7 @@ class KernelBrowser extends HttpKernelBrowser
         }
 
         $this->containerConfigurator = $configurator;
+        $this->configuredContainer = \WeakReference::create($this->kernel->getContainer());
         $configurator($this->getContainer());
     }
 
@@ -150,6 +161,13 @@ class KernelBrowser extends HttpKernelBrowser
         }
 
         parent::insulate($insulated);
+    }
+
+    public function restart(): void
+    {
+        parent::restart();
+
+        $this->tokens = [];
     }
 
     /**
@@ -170,6 +188,9 @@ class KernelBrowser extends HttpKernelBrowser
 
         $token = new TestBrowserToken($user->getRoles(), $user, $firewallContext);
         $token->setAttributes($tokenAttributes);
+
+        // stateless firewalls don't read the session, so the token is also sent with each request
+        $this->tokens[$firewallContext] = $token;
 
         $container = $this->getContainer();
         $container->get('security.untracked_token_storage')->setToken($token);
@@ -192,6 +213,50 @@ class KernelBrowser extends HttpKernelBrowser
         return $this;
     }
 
+    protected function filterRequest(DomRequest $request): Request
+    {
+        $httpRequest = parent::filterRequest($request);
+
+        if ($this->tokens) {
+            $httpRequest->attributes->set('_security_test_tokens', $this->tokens);
+        }
+
+        return $httpRequest;
+    }
+
+    /**
+     * Posts a webhook to the application, signed as the "webhook.routing" entry of the given type expects it.
+     *
+     * Only the routing entries that use the generic request parser of the Webhook component are supported.
+     *
+     * @param string               $type    The key of the "webhook.routing" entry
+     * @param array<string, mixed> $payload The payload, sent as JSON
+     * @param string|null          $secret  A secret to sign the webhook with instead of the configured one, to check that it is rejected
+     */
+    public function sendWebhook(string $type, string $event, array $payload = [], #[\SensitiveParameter] ?string $secret = null): Crawler
+    {
+        $container = $this->getContainer();
+
+        if (!$container->has('webhook.test.request_factory')) {
+            throw new \LogicException(\sprintf('"%s" requires the Webhook component to be enabled. Try running "composer require symfony/webhook".', __METHOD__));
+        }
+
+        try {
+            $uri = $container->get('router')->generate('_webhook_controller', ['type' => $type]);
+        } catch (RouteNotFoundException $e) {
+            throw new \LogicException(\sprintf('"%s" requires the "_webhook_controller" route. Did you forget to import "@FrameworkBundle/Resources/config/routing/webhook.php" in your routes?', __METHOD__), 0, $e);
+        }
+
+        $request = $container->get('webhook.test.request_factory')->createRequest($uri, $type, $event, $payload, $secret);
+        $server = [];
+
+        foreach ($request->headers->all() as $name => $values) {
+            $server['content-type' === $name ? 'CONTENT_TYPE' : 'HTTP_'.strtoupper(strtr($name, '-', '_'))] = implode(', ', $values);
+        }
+
+        return $this->request('POST', $uri, [], [], $server, $request->getContent());
+    }
+
     /**
      * @param Request $request
      */
@@ -199,16 +264,39 @@ class KernelBrowser extends HttpKernelBrowser
     {
         // avoid shutting down the Kernel if no request has been performed yet
         // WebTestCase::createClient() boots the Kernel but do not handle a request
-        if ($this->hasPerformedRequest && $this->reboot) {
-            $this->kernel->boot();
-            $this->kernel->shutdown();
+        if ($this->hasPerformedRequest) {
+            // the kernel resets its services before handling the next request, with or without a reboot
+            $keptState = $this->keepState();
 
-            if ($this->containerConfigurator) {
+            if ($this->reboot) {
                 $this->kernel->boot();
-                ($this->containerConfigurator)($this->getContainer());
+                $this->kernel->shutdown();
+
+                if (($gc = gc_status())['roots'] >= $gc['threshold'] / 2) {
+                    // Collect cycles between requests, before PHP does it in the middle of one
+                    gc_collect_cycles();
+                }
+
+                if ($keptState) {
+                    $this->kernel->boot();
+                    $container = $this->getContainer();
+
+                    if ($container instanceof TestContainer) {
+                        $container->setKeptState($keptState);
+                    }
+                }
             }
         } else {
             $this->hasPerformedRequest = true;
+        }
+
+        if ($this->containerConfigurator) {
+            $this->kernel->boot();
+
+            if ($this->configuredContainer?->get() !== $container = $this->kernel->getContainer()) {
+                $this->configuredContainer = \WeakReference::create($container);
+                ($this->containerConfigurator)($this->getContainer());
+            }
         }
 
         if ($this->profiler) {
@@ -290,5 +378,20 @@ class KernelBrowser extends HttpKernelBrowser
             EOF;
 
         return $code.$this->getHandleScript();
+    }
+
+    /**
+     * @return array<string, list<object>>
+     */
+    private function keepState(): array
+    {
+        try {
+            $container = $this->getContainer();
+        } catch (\LogicException) {
+            // the kernel was shut down, its state is gone already
+            return [];
+        }
+
+        return $container instanceof TestContainer ? $container->keepState() : [];
     }
 }

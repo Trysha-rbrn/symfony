@@ -47,6 +47,9 @@ class UniqueValidator extends ConstraintValidator
         }
 
         $collectionElements = [];
+        $intElements = [];
+        $stringElements = [];
+        $instants = [];
         $normalizer = $this->getNormalizer($constraint);
         foreach ($value as $index => $element) {
             $element = $normalizer($element);
@@ -55,7 +58,19 @@ class UniqueValidator extends ConstraintValidator
                 continue;
             }
 
-            if (!\in_array($element, $collectionElements, true)) {
+            $element = self::canonicalizeDateTimes($element, $instants);
+
+            if (\is_int($element)) {
+                if (!isset($intElements[$element])) {
+                    $intElements[$element] = true;
+                    continue;
+                }
+            } elseif (\is_string($element)) {
+                if (!isset($stringElements[$element])) {
+                    $stringElements[$element] = true;
+                    continue;
+                }
+            } elseif (!\in_array($element, $collectionElements, true)) {
                 $collectionElements[] = $element;
                 continue;
             }
@@ -119,5 +134,25 @@ class UniqueValidator extends ConstraintValidator
         }
 
         return $this->propertyAccessor ??= PropertyAccess::createPropertyAccessor();
+    }
+
+    /**
+     * Replaces date-time objects by the first one seen for the same instant, so that === finds them identical.
+     */
+    private static function canonicalizeDateTimes(mixed $value, array &$instants): mixed
+    {
+        if ($value instanceof \DateTimeInterface) {
+            return $instants[$value->format('U.u')] ??= $value;
+        }
+
+        if (\is_array($value)) {
+            foreach ($value as $key => $item) {
+                if ($item !== $canonical = self::canonicalizeDateTimes($item, $instants)) {
+                    $value[$key] = $canonical;
+                }
+            }
+        }
+
+        return $value;
     }
 }

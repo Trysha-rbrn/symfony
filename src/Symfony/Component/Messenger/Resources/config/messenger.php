@@ -20,6 +20,7 @@ use Symfony\Component\Messenger\Bridge\Beanstalkd\Transport\BeanstalkdTransportF
 use Symfony\Component\Messenger\Bridge\MongoDb\Transport\MongoDbTransportFactory;
 use Symfony\Component\Messenger\Bridge\Redis\Transport\RedisTransportFactory;
 use Symfony\Component\Messenger\EventListener\AddErrorDetailsStampListener;
+use Symfony\Component\Messenger\EventListener\DispatchOnFailureListener;
 use Symfony\Component\Messenger\EventListener\DispatchPcntlSignalListener;
 use Symfony\Component\Messenger\EventListener\ReleaseDeduplicationLockOnFailureListener;
 use Symfony\Component\Messenger\EventListener\ResetMemoryUsageListener;
@@ -32,11 +33,15 @@ use Symfony\Component\Messenger\Failure\FailedMessageRepository;
 use Symfony\Component\Messenger\Handler\RedispatchMessageHandler;
 use Symfony\Component\Messenger\Middleware\AddBusNameStampMiddleware;
 use Symfony\Component\Messenger\Middleware\AddDefaultStampsMiddleware;
+use Symfony\Component\Messenger\Middleware\ChainMiddleware;
 use Symfony\Component\Messenger\Middleware\DecodeFailedMessageMiddleware;
 use Symfony\Component\Messenger\Middleware\DeduplicateMiddleware;
 use Symfony\Component\Messenger\Middleware\DispatchAfterCurrentBusMiddleware;
+use Symfony\Component\Messenger\Middleware\DispatchOnFailureMiddleware;
 use Symfony\Component\Messenger\Middleware\FailedMessageProcessingMiddleware;
+use Symfony\Component\Messenger\Middleware\FlowContextMiddleware;
 use Symfony\Component\Messenger\Middleware\HandleMessageMiddleware;
+use Symfony\Component\Messenger\Middleware\InboxMiddleware;
 use Symfony\Component\Messenger\Middleware\LoggingMiddleware;
 use Symfony\Component\Messenger\Middleware\RejectRedeliveredMessageMiddleware;
 use Symfony\Component\Messenger\Middleware\RouterContextMiddleware;
@@ -47,14 +52,19 @@ use Symfony\Component\Messenger\Retry\MultiplierRetryStrategy;
 use Symfony\Component\Messenger\RoutableMessageBus;
 use Symfony\Component\Messenger\Transport\InMemory\InMemoryTransportFactory;
 use Symfony\Component\Messenger\Transport\Sender\SendersLocator;
+use Symfony\Component\Messenger\Transport\Serialization\IdentityStampHeaderMapper;
+use Symfony\Component\Messenger\Transport\Serialization\InteropSerializer;
 use Symfony\Component\Messenger\Transport\Serialization\Normalizer\FlattenExceptionNormalizer;
+use Symfony\Component\Messenger\Transport\Serialization\Normalizer\MessageStampNormalizer;
 use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
 use Symfony\Component\Messenger\Transport\Serialization\Serializer;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
 use Symfony\Component\Messenger\Transport\Serialization\SigningSerializer;
 use Symfony\Component\Messenger\Transport\Sync\SyncTransportFactory;
 use Symfony\Component\Messenger\Transport\TransportFactory;
+use Symfony\Component\Messenger\WorkerRestarter;
 use Symfony\Component\String\LazyString;
+use Symfony\Component\Uid\Uuid;
 
 return static function (ContainerConfigurator $container) {
     $container->services()
@@ -82,7 +92,20 @@ return static function (ContainerConfigurator $container) {
                 abstract_arg('message type to serialized type map'),
             ])
 
+        ->set('messenger.transport.interop_serializer', InteropSerializer::class)
+            ->args([
+                service('messenger.transport.symfony_serializer'),
+                null,
+                tagged_iterator('messenger.stamp_header_mapper'),
+            ])
+
+        ->set('messenger.stamp_header_mapper.identity', IdentityStampHeaderMapper::class)
+            ->tag('messenger.stamp_header_mapper')
+
         ->set('serializer.normalizer.flatten_exception', FlattenExceptionNormalizer::class)
+            ->tag('serializer.normalizer', ['built_in' => true, 'priority' => -880])
+
+        ->set('serializer.normalizer.message_stamp', MessageStampNormalizer::class)
             ->tag('serializer.normalizer', ['built_in' => true, 'priority' => -880])
 
         ->set('.messenger.transport.native_php_serializer', PhpSerializer::class)
@@ -95,13 +118,25 @@ return static function (ContainerConfigurator $container) {
         ->set('messenger.signing_serializer', SigningSerializer::class)
             ->abstract()
             ->args([
-                service('.inner'),
-                inline_service('string') // wrap the signing key in a lazy string to prevent a hard dependency on the kernel.secret parameter
-                    ->factory(class_exists(LazyString::class) ? [LazyString::class, 'fromCallable'] : 'current')
-                    ->args([
-                        class_exists(LazyString::class, false) ? service_closure('.messenger.signing_serializer.signing_key') : [new Parameter('kernel.secret')],
-                    ]),
-                abstract_arg('message types to serializers'), // read and replaced by MessengerPass
+                abstract_arg('the serializer of the transport'),
+                service('.messenger.signing_serializer.lazy_signing_key'),
+                'sha256',
+                false, // set by MessengerBundle for the failure transports
+            ])
+        ->set('.messenger.signing_serializer.message_types', SigningSerializer::class)
+            ->abstract()
+            ->factory([SigningSerializer::class, 'forMessageTypes'])
+            ->args([
+                abstract_arg('the serializer of the transport'),
+                service('.messenger.signing_serializer.lazy_signing_key'),
+                abstract_arg('message types that require a signature'), // set by MessengerPass
+                'sha256',
+            ])
+        // wrap the signing key in a lazy string to prevent a hard dependency on the kernel.secret parameter
+        ->set('.messenger.signing_serializer.lazy_signing_key', 'string')
+            ->factory(class_exists(LazyString::class) ? [LazyString::class, 'fromCallable'] : 'current')
+            ->args([
+                class_exists(LazyString::class, false) ? service_closure('.messenger.signing_serializer.signing_key') : [new Parameter('kernel.secret')],
             ])
         ->set('.messenger.signing_serializer.signing_key', 'string')
             ->factory('current')
@@ -130,7 +165,38 @@ return static function (ContainerConfigurator $container) {
         ->set('messenger.middleware.add_bus_name_stamp_middleware', AddBusNameStampMiddleware::class)
             ->abstract()
 
+        ->set('messenger.message_id_generator', \Closure::class)
+            ->factory([\Closure::class, 'fromCallable'])
+            ->args([[Uuid::class, 'v7']])
+
+        ->set('messenger.middleware.flow_context', FlowContextMiddleware::class)
+            ->args([
+                false,
+                service('messenger.message_id_generator')->nullOnInvalid(),
+            ])
+
         ->set('messenger.middleware.dispatch_after_current_bus', DispatchAfterCurrentBusMiddleware::class)
+
+        ->set('messenger.middleware.inbox', InboxMiddleware::class)
+            ->args([
+                abstract_arg('inboxes, by transport name'),
+                abstract_arg('failure transport names'),
+                service('logger')->ignoreOnInvalid(),
+            ])
+            ->tag('monolog.logger', ['channel' => 'messenger'])
+
+        ->set('messenger.middleware.chain', ChainMiddleware::class)
+            ->args([
+                service('messenger.routable_message_bus'),
+                service('messenger.senders_locator'),
+            ])
+
+        ->set('messenger.middleware.dispatch_on_failure', DispatchOnFailureMiddleware::class)
+            ->args([
+                service('messenger.routable_message_bus'),
+                service('logger')->ignoreOnInvalid(),
+            ])
+            ->tag('monolog.logger', ['channel' => 'messenger'])
 
         ->set('messenger.middleware.validation', ValidationMiddleware::class)
             ->args([
@@ -215,6 +281,9 @@ return static function (ContainerConfigurator $container) {
         ->set('messenger.transport.beanstalkd.factory', BeanstalkdTransportFactory::class)
 
         ->set('messenger.transport.mongodb.factory', MongoDbTransportFactory::class)
+            ->args([
+                service('clock'),
+            ])
 
         // retry
         ->set('messenger.retry_strategy_locator', ServiceLocator::class)
@@ -232,6 +301,11 @@ return static function (ContainerConfigurator $container) {
                 abstract_arg('max delay ms'),
                 abstract_arg('jitter'),
             ])
+
+        // cooldown
+        ->set('messenger.cooldown_strategy_locator', ServiceLocator::class)
+            ->args([[]])
+            ->tag('container.service_locator')
 
         // rate limiter
         ->set('messenger.rate_limiter_locator', ServiceLocator::class)
@@ -268,6 +342,14 @@ return static function (ContainerConfigurator $container) {
             ->tag('kernel.event_subscriber')
             ->tag('monolog.logger', ['channel' => 'messenger'])
 
+        ->set('messenger.failure.dispatch_on_failure_listener', DispatchOnFailureListener::class)
+            ->args([
+                service('messenger.routable_message_bus'),
+                service('logger')->ignoreOnInvalid(),
+            ])
+            ->tag('kernel.event_subscriber')
+            ->tag('monolog.logger', ['channel' => 'messenger'])
+
         ->set('messenger.listener.dispatch_pcntl_signal_listener', DispatchPcntlSignalListener::class)
             ->tag('kernel.event_subscriber')
 
@@ -276,6 +358,13 @@ return static function (ContainerConfigurator $container) {
             ->private()
             ->tag('cache.pool')
             ->tag('container.remove_if_missing', ['service' => 'cache.app'])
+
+        ->set('messenger.worker_restarter', WorkerRestarter::class)
+            ->args([
+                service('cache.messenger.restart_workers_signal'),
+            ])
+            ->tag('container.remove_if_missing', ['service' => 'cache.messenger.restart_workers_signal'])
+        ->alias(WorkerRestarter::class, 'messenger.worker_restarter')
 
         ->set('messenger.listener.stop_worker_on_restart_signal_listener', StopWorkerOnRestartSignalListener::class)
             ->args([
@@ -309,7 +398,7 @@ return static function (ContainerConfigurator $container) {
             ->args([
                 service('messenger.default_bus'),
             ])
-            ->tag('messenger.message_handler')
+            ->tag('messenger.message_handler', ['sign' => true])
 
         ->set('messenger.failed_message_repository', FailedMessageRepository::class)
             ->args([

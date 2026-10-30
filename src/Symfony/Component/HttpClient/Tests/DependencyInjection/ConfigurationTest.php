@@ -21,7 +21,26 @@ class ConfigurationTest extends TestCase
 {
     public function testDefaultConfig()
     {
-        $this->assertSame(['enabled' => true, 'scoped_clients' => []], $this->process([]));
+        $this->assertSame([
+            'enabled' => true,
+            'recorder' => [
+                'enabled' => null,
+                'redactor' => null,
+                'redact' => [],
+                'redact_except' => [],
+            ],
+            'scoped_clients' => [],
+        ], $this->process([]));
+    }
+
+    public function testRecorderShortcuts()
+    {
+        $this->assertTrue($this->process(['recorder' => true])['recorder']['enabled']);
+        $this->assertTrue($this->process(['recorder' => null])['recorder']['enabled']);
+        $this->assertFalse($this->process(['recorder' => false])['recorder']['enabled']);
+        $this->assertNull($this->process(['recorder' => ['redact' => ['pin']]])['recorder']['enabled']);
+        $this->assertFalse($this->process(['recorder' => ['enabled' => false, 'redact' => ['pin']]])['recorder']['enabled']);
+        $this->assertNull($this->process(['recorder' => ['redact' => ['pin']]], ['recorder' => ['redact_except' => ['code']]])['recorder']['enabled']);
     }
 
     public function testScopedClientsInheritRateLimiterAndRetryFailedConfiguration()
@@ -75,8 +94,8 @@ class ConfigurationTest extends TestCase
         $this->process(['default_options' => ['retry_failed' => ['enabled' => false, 'base_uris' => ['http://example.com']]]]);
     }
 
-    private function process(mixed $config): array
+    private function process(mixed ...$configs): array
     {
-        return new Processor()->processConfiguration(new Configuration(new HttpClientBundle(), null, 'http_client'), [$config]);
+        return new Processor()->processConfiguration(new Configuration(new HttpClientBundle(), null, 'http_client'), $configs);
     }
 }

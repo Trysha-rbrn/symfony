@@ -11,6 +11,7 @@
 
 namespace Symfony\Bundle\FrameworkBundle\Tests\Functional;
 
+use PHPUnit\Framework\Attributes\BackupGlobals;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\TestWith;
@@ -25,6 +26,7 @@ use Symfony\Component\Console\Tester\CommandTester;
 use Symfony\Component\HtmlSanitizer\HtmlSanitizerBundle;
 use Symfony\Component\HttpClient\HttpClientBundle;
 use Symfony\Component\JsonPath\JsonPathBundle;
+use Symfony\Component\JsonSchema\JsonSchemaBundle;
 use Symfony\Component\JsonStreamer\JsonStreamerBundle;
 use Symfony\Component\KeyManagement\KeyManagementBundle;
 use Symfony\Component\Lock\LockBundle;
@@ -52,10 +54,15 @@ use Symfony\Component\Workflow\WorkflowBundle;
 #[Group('functional')]
 class ConfigDumpReferenceCommandTest extends AbstractWebTestCase
 {
+    #[BackupGlobals(true)]
     #[TestWith([true])]
     #[TestWith([false])]
     public function testShowList(bool $debug)
     {
+        $_SERVER['SCRIPT_FILENAME'] = __FILE__;
+        $_SERVER['SYMFONY_CLI_CONSOLE_COMMAND'] = '["symfony","console"]';
+        $_SERVER['SYMFONY_CLI_CONSOLE_SCRIPT'] = __FILE__;
+
         $tester = $this->createCommandTester($debug);
         $ret = $tester->execute([]);
 
@@ -68,6 +75,9 @@ class ConfigDumpReferenceCommandTest extends AbstractWebTestCase
         $this->assertStringContainsString('Available registered non-bundle extension aliases', $tester->getDisplay());
         $this->assertStringContainsString('  foo', $tester->getDisplay());
         $this->assertStringContainsString('  test_dump', $tester->getDisplay());
+        $display = preg_replace('/\s+/', ' ', preg_replace('/^\s*\/\/ ?/m', '', $tester->getDisplay(true)));
+        $this->assertStringContainsString('symfony console config:dump-reference FrameworkBundle', $display);
+        $this->assertStringContainsString('symfony console config:dump-reference FrameworkBundle http_client.default_options', $display);
     }
 
     #[TestWith([true])]
@@ -128,6 +138,20 @@ class ConfigDumpReferenceCommandTest extends AbstractWebTestCase
         );
     }
 
+    public function testDumpAtAliasedPath()
+    {
+        $tester = $this->createCommandTester(true);
+        $ret = $tester->execute([
+            'name' => 'framework',
+            'path' => 'cache.app',
+        ]);
+
+        $this->assertSame(0, $ret);
+        $this->assertStringContainsString('"framework.cache" is an alias of the "cache" configuration.', $tester->getDisplay());
+        $this->assertStringContainsString('# Default configuration for extension with alias: "cache" at path "app"', $tester->getDisplay());
+        $this->assertStringContainsString('app:                  cache.adapter.filesystem', $tester->getDisplay());
+    }
+
     #[TestWith([true])]
     #[TestWith([false])]
     public function testDumpAtPathXml(bool $debug)
@@ -171,7 +195,7 @@ class ConfigDumpReferenceCommandTest extends AbstractWebTestCase
         $bundles = ['DefaultConfigTestBundle', 'ExtensionWithoutConfigTestBundle', 'ServicesBundle', 'ConsoleBundle', 'RouterBundle', 'CacheBundle'];
 
         // registered through #[RequiredBundle(..., ignoreOnInvalid: true)], so absent when the component is not installed
-        foreach (['asset' => AssetBundle::class, 'serializer' => SerializerBundle::class, 'validation' => ValidationBundle::class, 'translation' => TranslationBundle::class, 'web_link' => WebLinkBundle::class, 'lock' => LockBundle::class, 'messenger' => MessengerBundle::class, 'semaphore' => SemaphoreBundle::class, 'workflow' => WorkflowBundle::class, 'remote_event' => RemoteEventBundle::class, 'html_sanitizer' => HtmlSanitizerBundle::class, 'type_info' => TypeInfoBundle::class, 'property_access' => PropertyAccessBundle::class, 'property_info' => PropertyInfoBundle::class, 'uid' => UidBundle::class, 'scheduler' => SchedulerBundle::class, 'json_streamer' => JsonStreamerBundle::class, 'asset_mapper' => AssetMapperBundle::class, 'rate_limiter' => RateLimiterBundle::class, 'webhook' => WebhookBundle::class, 'http_client' => HttpClientBundle::class, 'mailer' => MailerBundle::class, 'notifier' => NotifierBundle::class, 'process' => ProcessBundle::class, 'json_path' => JsonPathBundle::class, 'mime' => MimeBundle::class, 'object_mapper' => ObjectMapperBundle::class, 'key_management' => KeyManagementBundle::class] as $alias => $class) {
+        foreach (['asset' => AssetBundle::class, 'serializer' => SerializerBundle::class, 'validation' => ValidationBundle::class, 'translation' => TranslationBundle::class, 'web_link' => WebLinkBundle::class, 'lock' => LockBundle::class, 'messenger' => MessengerBundle::class, 'semaphore' => SemaphoreBundle::class, 'workflow' => WorkflowBundle::class, 'remote_event' => RemoteEventBundle::class, 'html_sanitizer' => HtmlSanitizerBundle::class, 'type_info' => TypeInfoBundle::class, 'property_access' => PropertyAccessBundle::class, 'property_info' => PropertyInfoBundle::class, 'uid' => UidBundle::class, 'scheduler' => SchedulerBundle::class, 'json_streamer' => JsonStreamerBundle::class, 'asset_mapper' => AssetMapperBundle::class, 'rate_limiter' => RateLimiterBundle::class, 'webhook' => WebhookBundle::class, 'http_client' => HttpClientBundle::class, 'mailer' => MailerBundle::class, 'notifier' => NotifierBundle::class, 'process' => ProcessBundle::class, 'json_path' => JsonPathBundle::class, 'mime' => MimeBundle::class, 'object_mapper' => ObjectMapperBundle::class, 'key_management' => KeyManagementBundle::class, 'json_schema' => JsonSchemaBundle::class] as $alias => $class) {
             if (class_exists($class)) {
                 $aliases[] = $alias;
                 $bundles[] = substr($class, 1 + strrpos($class, '\\'));

@@ -1,23 +1,45 @@
 <?php
 
+declare(strict_types=1);
+
 /**
  * @return array<string, Symfony\Component\JsonStreamer\Tests\Fixtures\Model\ClassicDummy>|null
  */
-return static function (string|\Stringable $string, \Psr\Container\ContainerInterface $transformers, \Symfony\Component\JsonStreamer\Read\Instantiator $instantiator, array $options): mixed {
-    $providers['array<string, Symfony\\Component\\JsonStreamer\\Tests\\Fixtures\\Model\\ClassicDummy>'] = static function ($data) use ($options, $transformers, $instantiator, &$providers) {
-        $iterable = static function ($data) use ($options, $transformers, $instantiator, &$providers) {
-            foreach ($data as $k => $v) {
-                yield $k => $providers['Symfony\\Component\\JsonStreamer\\Tests\\Fixtures\\Model\\ClassicDummy']($v);
+return static function (string|\Stringable $string, \Psr\Container\ContainerInterface $transformers, array $options): mixed {
+    $providers['array<string, Symfony\\Component\\JsonStreamer\\Tests\\Fixtures\\Model\\ClassicDummy>'] = static function ($data) use ($options, $transformers, &$providers) {
+        if (!\is_array($data)) {
+            throw new \Symfony\Component\JsonStreamer\Exception\UnexpectedValueException(\sprintf('Unexpected "%s" value for "%s".', \get_debug_type($data), 'array<string, Symfony\\Component\\JsonStreamer\\Tests\\Fixtures\\Model\\ClassicDummy>'));
+        }
+        $collection = [];
+        foreach ($data as $k => $v) {
+            $collection[$k] = $providers['Symfony\\Component\\JsonStreamer\\Tests\\Fixtures\\Model\\ClassicDummy']($v);
+        }
+        return $collection;
+    };
+    $providers['Symfony\\Component\\JsonStreamer\\Tests\\Fixtures\\Model\\ClassicDummy'] = static function ($data) use ($options, $transformers, &$providers) {
+        if (!\is_array($data)) {
+            throw new \Symfony\Component\JsonStreamer\Exception\UnexpectedValueException(\sprintf('Unexpected "%s" value for "%s".', \get_debug_type($data), 'Symfony\\Component\\JsonStreamer\\Tests\\Fixtures\\Model\\ClassicDummy'));
+        }
+        $object = new \Symfony\Component\JsonStreamer\Tests\Fixtures\Model\ClassicDummy();
+        if (\array_key_exists('id', $data)) {
+            $value = ($data['id'] ?? throw new \Symfony\Component\JsonStreamer\Exception\UnexpectedValueException('Unexpected "null" value for "Symfony\\Component\\JsonStreamer\\Tests\\Fixtures\\Model\\ClassicDummy::$id".'));
+            try {
+                $object->{'id'} = $value;
+            } catch (\TypeError $e) {
+                throw new \Symfony\Component\JsonStreamer\Exception\UnexpectedValueException($e->getMessage(), 0, $e);
             }
-        };
-        return \iterator_to_array($iterable($data));
+        }
+        if (\array_key_exists('name', $data)) {
+            $value = ($data['name'] ?? throw new \Symfony\Component\JsonStreamer\Exception\UnexpectedValueException('Unexpected "null" value for "Symfony\\Component\\JsonStreamer\\Tests\\Fixtures\\Model\\ClassicDummy::$name".'));
+            try {
+                $object->{'name'} = $value;
+            } catch (\TypeError $e) {
+                throw new \Symfony\Component\JsonStreamer\Exception\UnexpectedValueException($e->getMessage(), 0, $e);
+            }
+        }
+        return $object;
     };
-    $providers['Symfony\\Component\\JsonStreamer\\Tests\\Fixtures\\Model\\ClassicDummy'] = static function ($data) use ($options, $transformers, $instantiator, &$providers) {
-        return $instantiator->instantiate(\Symfony\Component\JsonStreamer\Tests\Fixtures\Model\ClassicDummy::class, \array_filter(['id' => $data['id'] ?? '_symfony_missing_value', 'name' => $data['name'] ?? '_symfony_missing_value'], static function ($v) {
-            return '_symfony_missing_value' !== $v;
-        }));
-    };
-    $providers['array<string, Symfony\\Component\\JsonStreamer\\Tests\\Fixtures\\Model\\ClassicDummy>|null'] = static function ($data) use ($options, $transformers, $instantiator, &$providers) {
+    $providers['array<string, Symfony\\Component\\JsonStreamer\\Tests\\Fixtures\\Model\\ClassicDummy>|null'] = static function ($data) use ($options, $transformers, &$providers) {
         if (\is_array($data)) {
             return $providers['array<string, Symfony\\Component\\JsonStreamer\\Tests\\Fixtures\\Model\\ClassicDummy>']($data);
         }

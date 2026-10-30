@@ -12,16 +12,21 @@
 namespace Symfony\Component\HttpClient\Tests;
 
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\RequiresPhpExtension;
 use PHPUnit\Framework\Attributes\TestWith;
 use Symfony\Bridge\PhpUnit\DnsMock;
+use Symfony\Component\HttpClient\AmpHttpClient;
+use Symfony\Component\HttpClient\CurlHttpClient;
 use Symfony\Component\HttpClient\Exception\ClientException;
 use Symfony\Component\HttpClient\Exception\InvalidArgumentException;
+use Symfony\Component\HttpClient\Exception\TimeoutException;
 use Symfony\Component\HttpClient\Exception\TransportException;
 use Symfony\Component\HttpClient\Internal\ClientState;
 use Symfony\Component\HttpClient\NoPrivateNetworkHttpClient;
 use Symfony\Component\HttpClient\Response\StreamWrapper;
 use Symfony\Component\HttpClient\RetryableHttpClient;
+use Symfony\Component\HttpClient\TraceableHttpClient;
 use Symfony\Component\Process\Exception\ProcessFailedException;
 use Symfony\Component\Process\Process;
 use Symfony\Contracts\HttpClient\Exception\RedirectionExceptionInterface;
@@ -169,13 +174,46 @@ abstract class HttpClientTestCase extends BaseHttpClientTestCase
         $this->assertNull($response->getInfo('trailers'));
     }
 
+    public function testHttp2WithPriorKnowledge()
+    {
+        TestSocketServer::start('h2c/server.php', 8062);
+        $client = $this->getHttpClient(__FUNCTION__);
+
+        $response = $client->request('POST', 'http://127.0.0.1:8062/', [
+            'http_version' => '2.0',
+            'body' => 'hello',
+        ]);
+
+        $this->assertSame('hello', $response->getContent());
+        $this->assertStringStartsWith('HTTP/2 200', $response->getInfo('response_headers')[0]);
+    }
+
+    #[RequiresPhpExtension('openssl')]
+    public function testRedirectFromHttpsToHttpIsNotFollowed()
+    {
+        TestSocketServer::start('tls/redirect-server.php', 8059);
+        $client = $this->getHttpClient(__FUNCTION__);
+
+        $response = $client->request('POST', 'https://127.0.0.1:8059/', [
+            'body' => 'foo',
+            'verify_peer' => false,
+            'verify_host' => false,
+        ]);
+
+        $this->assertSame(301, $response->getStatusCode());
+        $this->assertSame('POST', $response->getInfo('http_method'));
+        $this->assertSame('https://127.0.0.1:8059/', $response->getInfo('url'));
+        $this->assertSame('http://127.0.0.1:8059/', $response->getInfo('redirect_url'));
+        $this->assertSame(0, $response->getInfo('redirect_count'));
+    }
+
     #[RequiresPhpExtension('openssl')]
     public function testRedirectToADifferentSchemeDropsCredentials()
     {
         TestSocketServer::start('tls/redirect-server.php', 8059);
         $client = $this->getHttpClient(__FUNCTION__);
 
-        $response = $client->request('GET', 'https://127.0.0.1:8059/', [
+        $response = $client->request('GET', 'http://127.0.0.1:8059/upgrade', [
             'auth_basic' => 'foo:bar',
             'headers' => ['Cookie' => 'a=b', 'X-Custom' => 'kept'],
             'verify_peer' => false,
@@ -183,7 +221,7 @@ abstract class HttpClientTestCase extends BaseHttpClientTestCase
         ]);
         $headers = $response->toArray();
 
-        $this->assertSame('http://127.0.0.1:8059/', $response->getInfo('url'));
+        $this->assertSame('https://127.0.0.1:8059/echo', $response->getInfo('url'));
         $this->assertSame('kept', $headers['x-custom']);
         $this->assertArrayNotHasKey('authorization', $headers);
         $this->assertArrayNotHasKey('cookie', $headers);
@@ -223,7 +261,7 @@ abstract class HttpClientTestCase extends BaseHttpClientTestCase
         $response = $client->request('GET', 'http://localhost:8057');
         $stream = $response->toStream();
 
-        $this->assertSame("{\n    \"SER", fread($stream, 10));
+        $this->assertSame(substr("{\n    \"SERVER_PROTOCOL", 0, 10), fread($stream, 10));
         $this->assertSame('VER_PROTOCOL', fread($stream, 12));
         $this->assertFalse(feof($stream));
         $this->assertTrue(rewind($stream));
@@ -241,7 +279,7 @@ abstract class HttpClientTestCase extends BaseHttpClientTestCase
         stream_copy_to_stream($response->toStream(), $h);
 
         $this->assertTrue(rewind($h));
-        $this->assertSame("{\n    \"SER", fread($h, 10));
+        $this->assertSame(substr("{\n    \"SERVER_PROTOCOL", 0, 10), fread($h, 10));
         $this->assertSame('VER_PROTOCOL', fread($h, 12));
         $this->assertFalse(feof($h));
     }
@@ -252,7 +290,7 @@ abstract class HttpClientTestCase extends BaseHttpClientTestCase
         $response = $client->request('GET', 'http://localhost:8057/404');
         $stream = $response->toStream(false);
 
-        $this->assertSame("{\n    \"SER", fread($stream, 10));
+        $this->assertSame(substr("{\n    \"SERVER_PROTOCOL", 0, 10), fread($stream, 10));
         $this->assertSame('VER_PROTOCOL', fread($stream, 12));
         $this->assertSame($response, stream_get_meta_data($stream)['wrapper_data']->getResponse());
         $this->assertSame(404, $response->getStatusCode());
@@ -262,6 +300,7 @@ abstract class HttpClientTestCase extends BaseHttpClientTestCase
         $response->toStream();
     }
 
+    #[Group('transient-on-windows')]
     public function testNonBlockingStream()
     {
         $client = $this->getHttpClient(__FUNCTION__);
@@ -295,6 +334,137 @@ abstract class HttpClientTestCase extends BaseHttpClientTestCase
         }
 
         $this->assertCount(2, $completed);
+    }
+
+    public function testBackpressureLimitsUnreadResponseData()
+    {
+        $this->assertBackpressureLimitsResponseData(__FUNCTION__, '/body');
+    }
+
+    public function testBackpressureLimitsUnreadChunkedResponseData()
+    {
+        $this->assertBackpressureLimitsResponseData(__FUNCTION__, '/chunked');
+    }
+
+    public function testBackpressureRemainsAfterReleasingAManualPause()
+    {
+        $this->assertBackpressureLimitsResponseData(__FUNCTION__, '/body', true);
+    }
+
+    public function testBackpressurePreservesAManualPause()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+
+        if (!$client instanceof CurlHttpClient) {
+            $this->markTestSkipped('This test requires cURL backpressure.');
+        }
+
+        $server = TestHttpServer::start(8067, __DIR__.'/Fixtures/backpressure');
+
+        try {
+            $response = $client->request('GET', 'http://localhost:8067/body', ['buffer' => false]);
+            $this->assertSame(200, $response->getStatusCode());
+            usleep(100000);
+
+            $state = (new \ReflectionProperty($client, 'multi'))->getValue($client);
+            $pause = $response->getInfo('pause_handler');
+            $body = '';
+            $timedOut = false;
+
+            do {
+                $received = false;
+                foreach ($client->stream($response) as $chunk) {
+                    if ('' !== $data = $chunk->getContent()) {
+                        $body .= $data;
+                        $received = true;
+                        break;
+                    }
+                }
+
+                $this->assertTrue($received);
+                $this->assertPendingResponseDataIsBounded($client);
+                usleep(1000);
+            } while ($client instanceof CurlHttpClient && !$state->pausedHandles);
+
+            if ($client instanceof CurlHttpClient) {
+                $this->assertNotEmpty($state->pausedHandles);
+            }
+
+            $pause(30);
+
+            try {
+                foreach ($client->stream($response, 0.1) as $chunk) {
+                    if ($chunk->isTimeout()) {
+                        $timedOut = true;
+                        break;
+                    }
+
+                    $body .= $chunk->getContent();
+                    $this->assertPendingResponseDataIsBounded($client);
+                }
+            } finally {
+                $pause(0);
+            }
+
+            $this->assertTrue($timedOut);
+            $this->assertSame($this->getBackpressureBodyHash(), hash('sha256', $body.stream_get_contents($response->toStream(false))));
+        } finally {
+            $server->stop();
+        }
+    }
+
+    public function testBackpressureCanBeCanceled()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+        $server = TestHttpServer::start(8067, __DIR__.'/Fixtures/backpressure');
+
+        try {
+            $response = $client->request('GET', 'http://localhost:8067/body', ['buffer' => false]);
+            $this->assertSame(200, $response->getStatusCode());
+            usleep(100000);
+
+            $stream = $response->toStream(false);
+            $state = (new \ReflectionProperty($client, 'multi'))->getValue($client);
+
+            do {
+                $this->assertNotEmpty(fread($stream, 8192));
+                $this->assertPendingResponseDataIsBounded($client);
+                usleep(1000);
+            } while ($client instanceof CurlHttpClient && !$state->pausedHandles && !feof($stream));
+
+            if ($client instanceof CurlHttpClient) {
+                $this->assertNotEmpty($state->pausedHandles);
+            }
+
+            $response->cancel();
+            fclose($stream);
+
+            $this->assertTrue($response->getInfo('canceled'));
+            $this->assertSame([], $state->handlesActivity);
+            $this->assertSame([], $state->openHandles);
+            $this->assertSame(200, $client->request('GET', 'http://localhost:8057/')->getStatusCode());
+        } finally {
+            $server->stop();
+        }
+    }
+
+    public function testBackpressureAllowsOutOfOrderResponseConsumption()
+    {
+        $clientClass = $this->getHttpClient(__FUNCTION__)::class;
+        $client = AmpHttpClient::class === $clientClass ? new $clientClass([], null, 1) : new $clientClass([], 1);
+        $server = TestHttpServer::start(8067, __DIR__.'/Fixtures/backpressure');
+
+        try {
+            $first = $client->request('GET', 'http://localhost:8067/body', ['buffer' => false, 'timeout' => 2]);
+            $this->assertSame(200, $first->getStatusCode());
+
+            $second = $client->request('GET', 'http://localhost:8067/', ['timeout' => 2]);
+
+            $this->assertSame('Success', $second->getContent());
+            $this->assertSame($this->getBackpressureBodyHash(), hash('sha256', stream_get_contents($first->toStream(false))));
+        } finally {
+            $server->stop();
+        }
     }
 
     public function testSeekAsyncStream()
@@ -385,23 +555,24 @@ abstract class HttpClientTestCase extends BaseHttpClientTestCase
         $client = $this->getHttpClient(__FUNCTION__);
         $response = $client->request('GET', 'http://localhost:8057/');
 
-        $time = microtime(true);
+        $time = hrtime(true);
         $response->getInfo('pause_handler')(0.5);
         $this->assertSame(200, $response->getStatusCode());
-        $this->assertTrue(0.5 <= microtime(true) - $time);
+        $this->assertGreaterThanOrEqual(0.5, (hrtime(true) - $time) / 1E9);
 
         $response = $client->request('GET', 'http://localhost:8057/');
 
-        $time = microtime(true);
-        $response->getInfo('pause_handler')(1);
+        $time = hrtime(true);
+        // The pause outlasts the stream timeout by far, so that a slow machine still sees the timeout first
+        $response->getInfo('pause_handler')(30);
 
         foreach ($client->stream($response, 0.5) as $chunk) {
             $this->assertTrue($chunk->isTimeout());
             $response->cancel();
         }
         $response = null;
-        $this->assertTrue(1.0 > microtime(true) - $time);
-        $this->assertTrue(0.5 <= microtime(true) - $time);
+        $this->assertLessThan(30, (hrtime(true) - $time) / 1E9);
+        $this->assertGreaterThanOrEqual(0.5, (hrtime(true) - $time) / 1E9);
     }
 
     public function testPauseReplace()
@@ -427,6 +598,101 @@ abstract class HttpClientTestCase extends BaseHttpClientTestCase
         $response->getInfo('pause_handler')(1);
         $response->getContent();
         $this->assertGreaterThanOrEqual(1, microtime(true) - $time);
+    }
+
+    public function testPauseBeforeTheRequestIsSent()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+
+        $durations = [];
+        for ($i = 0; $i < 5; ++$i) {
+            $time = hrtime(true);
+            $response = $client->request('GET', 'http://localhost:8057/');
+            $response->getInfo('pause_handler')(0.1);
+            $this->assertSame(200, $response->getStatusCode());
+            $durations[] = (hrtime(true) - $time) / 1E9;
+        }
+
+        $this->assertLessThan(0.9, min($durations));
+    }
+
+    public function testPauseLongerThanTimeout()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+        $response = $client->request('GET', 'http://localhost:8057/', ['timeout' => 0.5]);
+
+        $time = hrtime(true);
+        $response->getInfo('pause_handler')(1);
+        $this->assertSame(200, $response->getStatusCode());
+        $this->assertGreaterThanOrEqual(0.9, (hrtime(true) - $time) / 1E9);
+    }
+
+    public function testPauseDuringBodyLongerThanTimeout()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+        $response = $client->request('GET', 'http://localhost:8057/timeout-body', ['timeout' => 0.3]);
+
+        $this->assertSame(200, $response->getStatusCode());
+        $response->getInfo('pause_handler')(0.8);
+        $this->assertSame('<1><2>', $response->getContent());
+    }
+
+    public function testPauseCountsTowardMaxDuration()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+        $response = $client->request('GET', 'http://localhost:8057/', ['max_duration' => 1]);
+
+        $time = hrtime(true);
+        $response->getInfo('pause_handler')(3);
+
+        try {
+            $response->getStatusCode();
+            $this->fail(TransportException::class.' expected');
+        } catch (TransportException $e) {
+            $this->assertSame('Max duration was reached for "http://localhost:8057/".', $e->getMessage());
+        }
+
+        $this->assertGreaterThanOrEqual(0.9, (hrtime(true) - $time) / 1E9);
+        $this->assertLessThan(2.5, (hrtime(true) - $time) / 1E9);
+    }
+
+    public function testTransferAfterPauseCountsTowardMaxDuration()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+        $response = $client->request('GET', 'http://localhost:8057/timeout-header', ['max_duration' => 1]);
+
+        $response->getInfo('pause_handler')(0.8);
+
+        try {
+            $response->getStatusCode();
+            $this->fail(TransportException::class.' expected');
+        } catch (TransportException $e) {
+            $this->assertNotInstanceOf(TimeoutException::class, $e);
+        }
+    }
+
+    #[Group('transient-on-windows')]
+    public function testPauseDoesNotDelayTheTimeoutOfOtherResponses()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+        $paused = $client->request('GET', 'http://localhost:8057/', ['timeout' => 0.2]);
+        $paused->getInfo('pause_handler')(1.2);
+        $idle = $client->request('GET', 'http://localhost:8057/timeout-body', ['timeout' => 0.2]);
+
+        $time = hrtime(true);
+        $timeouts = [];
+
+        foreach ($client->stream([$paused, $idle]) as $response => $chunk) {
+            if ($chunk->isTimeout()) {
+                $timeouts[] = [$response, (hrtime(true) - $time) / 1E9];
+            }
+        }
+
+        $this->assertCount(1, $timeouts);
+        $this->assertSame($idle, $timeouts[0][0]);
+        $this->assertLessThan(1, $timeouts[0][1]);
+        $this->assertSame(200, $paused->getStatusCode());
+        $this->assertGreaterThanOrEqual(1.1, (hrtime(true) - $time) / 1E9);
     }
 
     public function testHttp2PushVulcainWithUnusedResponse()
@@ -465,6 +731,54 @@ abstract class HttpClientTestCase extends BaseHttpClientTestCase
             Unused pushed response: "https://127.0.0.1:3000/json/3"
             EOTXT;
         $this->assertStringMatchesFormat($expected, implode("\n", $logger->logs));
+    }
+
+    public function testGetContentThrowsWhenCanceledBeforeTheHeaders()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+        $response = $client->request('GET', 'http://localhost:8057/timeout-body');
+        $response->cancel();
+
+        $this->expectException(TransportException::class);
+        $this->expectExceptionMessage('Response has been canceled.');
+
+        $response->getContent();
+    }
+
+    public function testGetContentThrowsWhenCanceledDuringTheBody()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+        $cancel = false;
+        $response = $client->request('GET', 'http://localhost:8057/max-duration', ['max_duration' => 10, 'on_progress' => static function (int $dlNow) use (&$response, &$cancel) {
+            if ($cancel && $dlNow) {
+                $cancel = false;
+                $response->cancel();
+            }
+        }]);
+
+        $this->assertSame(200, $response->getStatusCode());
+        $cancel = true;
+
+        $this->expectException(TransportException::class);
+        $this->expectExceptionMessage('Response has been canceled.');
+
+        $response->getContent();
+    }
+
+    public function testCancelingAResponseWhileStreamingKeepsStreamingTheOthers()
+    {
+        $client = $this->getHttpClient(__FUNCTION__);
+        $kept = $client->request('GET', 'http://localhost:8057/chunked');
+        $canceled = $client->request('GET', 'http://localhost:8057/timeout-body');
+
+        foreach ($client->stream([$kept, $canceled]) as $response => $chunk) {
+            if ($chunk->isFirst() && $response === $canceled) {
+                $response->cancel();
+            }
+        }
+
+        $this->assertSame('Symfony is awesome!', $kept->getContent());
+        $this->assertTrue($canceled->getInfo('canceled'));
     }
 
     public function testDnsFailure()
@@ -909,6 +1223,19 @@ abstract class HttpClientTestCase extends BaseHttpClientTestCase
         $this->expectNotToPerformAssertions();
     }
 
+    public function testDestructingATracedResponseKeepsTheResolveOptionOfPendingRequests()
+    {
+        $client = new TraceableHttpClient($this->getHttpClient(__FUNCTION__));
+
+        $response = $client->request('GET', 'http://localhost:8057/');
+        $response->getContent();
+
+        $pending = $client->request('GET', 'http://symfony.invalid:8057/', ['resolve' => ['symfony.invalid' => '127.0.0.1']]);
+        unset($response);
+
+        $this->assertSame(200, $pending->getStatusCode());
+    }
+
     public function testHeadRequestWithClosureBody()
     {
         $p = TestHttpServer::start(8067);
@@ -984,13 +1311,70 @@ abstract class HttpClientTestCase extends BaseHttpClientTestCase
         $this->assertSame('/run/docker.sock', $info['primary_ip']);
     }
 
-    public function testMaxConnectDurationInfo()
+    private function assertBackpressureLimitsResponseData(string $testCase, string $path, bool $releasePause = false): void
     {
-        $this->markTestSkipped('The "max_connect_duration" option is not supported in this version of the HttpClient component.');
+        $client = $this->getHttpClient($testCase);
+        $server = TestHttpServer::start(8067, __DIR__.'/Fixtures/backpressure');
+
+        try {
+            $response = $client->request('GET', 'http://localhost:8067'.$path, ['buffer' => false]);
+            $this->assertSame(200, $response->getStatusCode());
+            usleep(100000);
+            $stream = $response->toStream(false);
+            $state = (new \ReflectionProperty($client, 'multi'))->getValue($client);
+            $body = '';
+
+            while (!feof($stream)) {
+                $body .= fread($stream, 8192);
+                $this->assertPendingResponseDataIsBounded($client);
+
+                if ($releasePause && (!$client instanceof CurlHttpClient || $state->pausedHandles)) {
+                    if ($client instanceof CurlHttpClient) {
+                        $this->assertNotEmpty($state->pausedHandles);
+                    }
+
+                    $pause = $response->getInfo('pause_handler');
+                    $pause(30);
+                    $pause(0);
+                    $releasePause = false;
+                }
+
+                if ($client instanceof CurlHttpClient) {
+                    // Give curl time to fill its buffers and pause; other clients only read
+                    // while their event loop runs, so sleeping would just slow the draining
+                    // down, up to the 10s send timeout of PHP's built-in server on busy CIs
+                    usleep(1000);
+                }
+            }
+
+            $this->assertFalse($releasePause);
+            $this->assertSame($this->getBackpressureBodyHash(), hash('sha256', $body));
+        } finally {
+            $server->stop();
+        }
     }
 
-    public function testMaxConnectDuration()
+    private function assertPendingResponseDataIsBounded(HttpClientInterface $client): void
     {
-        $this->markTestSkipped('The "max_connect_duration" option is not supported in this version of the HttpClient component.');
+        $state = (new \ReflectionProperty($client, 'multi'))->getValue($client);
+        $pendingBytes = 0;
+
+        foreach ($state->handlesActivity as $activity) {
+            foreach ($activity as $chunk) {
+                $pendingBytes += \is_string($chunk) ? \strlen($chunk) : 0;
+            }
+        }
+
+        $this->assertLessThanOrEqual(1048576 + 16384, $pendingBytes);
+    }
+
+    private function getBackpressureBodyHash(): string
+    {
+        $hash = hash_init('sha256');
+        for ($i = 0; $i < 256; ++$i) {
+            hash_update($hash, str_repeat(\chr($i), 16384));
+        }
+
+        return hash_final($hash);
     }
 }

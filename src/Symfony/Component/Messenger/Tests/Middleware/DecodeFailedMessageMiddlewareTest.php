@@ -11,10 +11,14 @@
 
 namespace Symfony\Component\Messenger\Tests\Middleware;
 
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\Group;
+use PHPUnit\Framework\Attributes\IgnoreDeprecations;
 use PHPUnit\Framework\TestCase;
 use Psr\Container\ContainerInterface;
 use Psr\Container\NotFoundExceptionInterface;
 use Symfony\Component\Messenger\Envelope;
+use Symfony\Component\Messenger\Exception\InvalidMessageSignatureException;
 use Symfony\Component\Messenger\Exception\MessageDecodingFailedException;
 use Symfony\Component\Messenger\Exception\UnrecoverableMessageHandlingException;
 use Symfony\Component\Messenger\Middleware\DecodeFailedMessageMiddleware;
@@ -22,10 +26,20 @@ use Symfony\Component\Messenger\Middleware\MiddlewareInterface;
 use Symfony\Component\Messenger\Middleware\StackInterface;
 use Symfony\Component\Messenger\Middleware\StackMiddleware;
 use Symfony\Component\Messenger\Stamp\AckStamp;
+use Symfony\Component\Messenger\Stamp\BusNameStamp;
+use Symfony\Component\Messenger\Stamp\DelayStamp;
 use Symfony\Component\Messenger\Stamp\ReceivedStamp;
+use Symfony\Component\Messenger\Stamp\RedeliveryStamp;
 use Symfony\Component\Messenger\Stamp\SentToFailureTransportStamp;
+use Symfony\Component\Messenger\Stamp\SerializedMessageStamp;
+use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
+use Symfony\Component\Messenger\Stamp\TrustStamp;
+use Symfony\Component\Messenger\Tests\Fixtures\DefaultStampsProviderDummyMessage;
 use Symfony\Component\Messenger\Tests\Fixtures\DummyMessage;
+use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
+use Symfony\Component\Messenger\Transport\Serialization\Serializer;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
+use Symfony\Component\Messenger\Transport\Serialization\SigningSerializer;
 
 class DecodeFailedMessageMiddlewareTest extends TestCase
 {
@@ -96,6 +110,229 @@ class DecodeFailedMessageMiddlewareTest extends TestCase
         $middleware->handle($envelope, new StackMiddleware($nextMiddleware));
 
         $this->assertInstanceOf(DummyMessage::class, $nextMiddleware->envelope?->getMessage());
+        $this->assertNotNull($nextMiddleware->envelope->last(SentToFailureTransportStamp::class));
+    }
+
+    public function testItRemovesTheFailureTransportStampOfARedispatchedFailure()
+    {
+        $serializer = $this->createStub(SerializerInterface::class);
+        $serializer->method('decode')->willReturn(new Envelope(new DummyMessage('decoded')));
+
+        $middleware = new DecodeFailedMessageMiddleware(new InMemoryLocator(['async' => $serializer]));
+
+        $nextMiddleware = new class implements MiddlewareInterface {
+            public ?Envelope $envelope = null;
+
+            public function handle(Envelope $envelope, StackInterface $stack): Envelope
+            {
+                return $this->envelope = $envelope;
+            }
+        };
+
+        $envelope = MessageDecodingFailedException::wrap(['body' => 'body', 'headers' => []], 'Could not decode.')
+            ->with(new SentToFailureTransportStamp('async'), new RedeliveryStamp(1));
+
+        $middleware->handle($envelope, new StackMiddleware($nextMiddleware));
+
+        $this->assertInstanceOf(DummyMessage::class, $nextMiddleware->envelope?->getMessage());
+        $this->assertSame([], $nextMiddleware->envelope->all(SentToFailureTransportStamp::class));
+        $this->assertNotNull($nextMiddleware->envelope->last(RedeliveryStamp::class));
+    }
+
+    public function testItDoesNotDuplicateTheStampsKeptByTheFailedEnvelope()
+    {
+        $serializer = Serializer::create();
+        $encodedEnvelope = $serializer->encode(new Envelope(new DummyMessage('Hello'), [new BusNameStamp('bus'), new RedeliveryStamp(1)]));
+
+        $middleware = new DecodeFailedMessageMiddleware(new InMemoryLocator(['async' => $serializer]));
+
+        $nextMiddleware = new class implements MiddlewareInterface {
+            public ?Envelope $envelope = null;
+
+            public function handle(Envelope $envelope, StackInterface $stack): Envelope
+            {
+                return $this->envelope = $envelope;
+            }
+        };
+
+        $envelope = MessageDecodingFailedException::wrap($encodedEnvelope, 'Could not decode.')
+            ->with(
+                new BusNameStamp('bus'),
+                new RedeliveryStamp(1),
+                new SentToFailureTransportStamp('async'),
+                new RedeliveryStamp(0),
+                new ReceivedStamp('failed'),
+            );
+
+        $middleware->handle($envelope, new StackMiddleware($nextMiddleware));
+
+        $envelope = $nextMiddleware->envelope;
+        $this->assertInstanceOf(DummyMessage::class, $envelope?->getMessage());
+        $this->assertCount(1, $envelope->all(BusNameStamp::class));
+        $this->assertSame([1, 0], array_map(static fn (RedeliveryStamp $stamp): int => $stamp->getRetryCount(), $envelope->all(RedeliveryStamp::class)));
+        $this->assertCount(1, $envelope->all(SentToFailureTransportStamp::class));
+        $this->assertCount(1, $envelope->all(SerializedMessageStamp::class));
+    }
+
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
+    public function testItKeepsOnlyTheLocalStampsOfAnUnverifiedFailureThatDecodesToASignedMessage()
+    {
+        $envelope = $this->handleUnverifiedFailure(new DummyMessage('decoded'), 'the_bus');
+
+        $this->assertInstanceOf(DummyMessage::class, $envelope->getMessage());
+        $this->assertSame(['the_bus'], array_map(static fn (BusNameStamp $stamp): string => $stamp->getBusName(), $envelope->all(BusNameStamp::class)));
+        $this->assertSame([], $envelope->all(RedeliveryStamp::class));
+        $this->assertSame('async', $envelope->last(SentToFailureTransportStamp::class)?->getOriginalReceiverName());
+        $this->assertSame([42], array_map(static fn (TransportMessageIdStamp $stamp): mixed => $stamp->getId(), $envelope->all(TransportMessageIdStamp::class)));
+        $this->assertSame('async', $envelope->last(ReceivedStamp::class)?->getTransportName());
+        $this->assertCount(1, $envelope->all(AckStamp::class));
+    }
+
+    public function testItRejectsAnUnverifiedFailureOnAnotherBusThanTheSignedMessageItDecodesTo()
+    {
+        $this->expectException(InvalidMessageSignatureException::class);
+        $this->expectExceptionMessage('the message belongs to the "the_bus" bus');
+
+        $this->handleUnverifiedFailure(new \stdClass(), 'failed_bus', [TrustStamp::trusted()], new PhpSerializer());
+    }
+
+    #[DataProvider('provideUnverifiedFailuresOfMessagesSignedPerMessageType')]
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
+    public function testItRejectsAnUnverifiedFailureOfAFailureTransportThatSignsMessageTypesOnAnotherBusThanTheSignedMessageItDecodesTo(object $decodedMessage, array $decodedStamps, \Closure $createFailureSerializer)
+    {
+        $this->expectException(InvalidMessageSignatureException::class);
+        $this->expectExceptionMessage('the message belongs to the "the_bus" bus');
+
+        $this->handleUnverifiedFailure($decodedMessage, 'failed_bus', $decodedStamps, $createFailureSerializer());
+    }
+
+    public static function provideUnverifiedFailuresOfMessagesSignedPerMessageType(): iterable
+    {
+        yield 'message type that requires a signature' => [new DummyMessage('decoded'), [], static fn () => new SigningSerializer(new PhpSerializer(), 'signing-key', [DummyMessage::class])];
+        yield 'verified message' => [new \stdClass(), [TrustStamp::trusted()], static fn () => new SigningSerializer(new PhpSerializer(), 'signing-key', [DummyMessage::class])];
+    }
+
+    public function testItKeepsTheStampsOfAnUnverifiedFailureThatDecodesToAMessageWithoutSignature()
+    {
+        $this->assertKeepsTheStampsOfAnUnverifiedFailureThatDecodesToAMessageWithoutSignature(new PhpSerializer());
+    }
+
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
+    public function testItKeepsTheStampsOfAnUnverifiedFailureOfAFailureTransportThatSignsMessageTypesThatDecodesToAMessageWithoutSignature()
+    {
+        $this->assertKeepsTheStampsOfAnUnverifiedFailureThatDecodesToAMessageWithoutSignature(new SigningSerializer(new PhpSerializer(), 'signing-key', [DummyMessage::class]));
+    }
+
+    public function testItKeepsOnlyTheLocalStampsOfAnUnverifiedFailureThatDecodesToAVerifiedMessage()
+    {
+        $this->assertKeepsOnlyTheLocalStampsOfAnUnverifiedFailureThatDecodesToAVerifiedMessage(new PhpSerializer());
+    }
+
+    #[Group('legacy')]
+    #[IgnoreDeprecations]
+    public function testItKeepsOnlyTheLocalStampsOfAnUnverifiedFailureOfAFailureTransportThatSignsMessageTypesThatDecodesToAVerifiedMessage()
+    {
+        $this->assertKeepsOnlyTheLocalStampsOfAnUnverifiedFailureThatDecodesToAVerifiedMessage(new SigningSerializer(new PhpSerializer(), 'signing-key', [DummyMessage::class]));
+    }
+
+    private function assertKeepsTheStampsOfAnUnverifiedFailureThatDecodesToAMessageWithoutSignature(SerializerInterface $failureSerializer): void
+    {
+        $envelope = $this->handleUnverifiedFailure(new \stdClass(), 'failed_bus', [], $failureSerializer);
+
+        $this->assertInstanceOf(\stdClass::class, $envelope->getMessage());
+        $this->assertSame(['failed_bus'], array_map(static fn (BusNameStamp $stamp): string => $stamp->getBusName(), $envelope->all(BusNameStamp::class)));
+        $this->assertSame(1, RedeliveryStamp::getRetryCountFromEnvelope($envelope));
+        $this->assertSame(['failed_id', 42], array_map(static fn (TransportMessageIdStamp $stamp): mixed => $stamp->getId(), $envelope->all(TransportMessageIdStamp::class)));
+        $this->assertSame('async', $envelope->last(ReceivedStamp::class)?->getTransportName());
+        $this->assertCount(1, $envelope->all(AckStamp::class));
+    }
+
+    private function assertKeepsOnlyTheLocalStampsOfAnUnverifiedFailureThatDecodesToAVerifiedMessage(SerializerInterface $failureSerializer): void
+    {
+        $envelope = $this->handleUnverifiedFailure(new \stdClass(), 'the_bus', [TrustStamp::trusted()], $failureSerializer);
+
+        $this->assertSame(['the_bus'], array_map(static fn (BusNameStamp $stamp): string => $stamp->getBusName(), $envelope->all(BusNameStamp::class)));
+        $this->assertSame([], $envelope->all(RedeliveryStamp::class));
+        $this->assertSame('async', $envelope->last(SentToFailureTransportStamp::class)?->getOriginalReceiverName());
+        $this->assertSame([42], array_map(static fn (TransportMessageIdStamp $stamp): mixed => $stamp->getId(), $envelope->all(TransportMessageIdStamp::class)));
+        $this->assertSame('async', $envelope->last(ReceivedStamp::class)?->getTransportName());
+        $this->assertCount(1, $envelope->all(AckStamp::class));
+    }
+
+    #[DataProvider('provideTrustStamps')]
+    public function testTheDecodedMessageIsTrustedOnlyWhenTheFailureThatCarriedItWasTrustedToo(?bool $failureVerified, ?bool $messageVerified, ?bool $expected)
+    {
+        $createStamps = static fn (?bool $verified): array => match ($verified) {
+            null => [],
+            false => [TrustStamp::untrusted()],
+            true => [TrustStamp::trusted()],
+        };
+
+        $serializer = $this->createStub(SerializerInterface::class);
+        $serializer->method('decode')->willReturn(new Envelope(new DummyMessage('decoded'), $createStamps($messageVerified)));
+
+        $middleware = new DecodeFailedMessageMiddleware(new InMemoryLocator(['async' => $serializer]));
+
+        $nextMiddleware = new class implements MiddlewareInterface {
+            public ?Envelope $envelope = null;
+
+            public function handle(Envelope $envelope, StackInterface $stack): Envelope
+            {
+                return $this->envelope = $envelope;
+            }
+        };
+
+        $failure = MessageDecodingFailedException::wrap(['body' => 'body'], 'Could not decode.')->with(new ReceivedStamp('async'), ...$createStamps($failureVerified));
+        $middleware->handle($failure, new StackMiddleware($nextMiddleware));
+
+        $this->assertLessThanOrEqual(1, \count($nextMiddleware->envelope->all(TrustStamp::class)));
+        $this->assertSame($expected, $nextMiddleware->envelope->last(TrustStamp::class)?->isTrusted());
+    }
+
+    public static function provideTrustStamps(): iterable
+    {
+        yield 'both verified' => [true, true, true];
+        yield 'message verified, failure not' => [false, true, false];
+        yield 'message verified, failure not checked' => [null, true, false];
+        yield 'failure verified, message not' => [true, false, false];
+        yield 'failure verified, message not checked' => [true, null, false];
+        yield 'none checked' => [null, null, null];
+    }
+
+    #[DataProvider('provideDefaultStamps')]
+    public function testItAddsTheDefaultStampsOfTheDecodedMessageThatTheEnvelopeDoesNotCarry(array $failedStamps, array $decodedStamps, int $expectedDelay)
+    {
+        $serializer = $this->createStub(SerializerInterface::class);
+        $serializer->method('decode')->willReturn(new Envelope(new DefaultStampsProviderDummyMessage('decoded'), $decodedStamps));
+
+        $middleware = new DecodeFailedMessageMiddleware(new InMemoryLocator(['async' => $serializer]));
+
+        $nextMiddleware = new class implements MiddlewareInterface {
+            public ?Envelope $envelope = null;
+
+            public function handle(Envelope $envelope, StackInterface $stack): Envelope
+            {
+                return $this->envelope = $envelope;
+            }
+        };
+
+        $envelope = MessageDecodingFailedException::wrap(['body' => 'body', 'headers' => []], 'Could not decode.')
+            ->with(new ReceivedStamp('async'), ...$failedStamps);
+
+        $middleware->handle($envelope, new StackMiddleware($nextMiddleware));
+
+        $this->assertInstanceOf(DefaultStampsProviderDummyMessage::class, $nextMiddleware->envelope?->getMessage());
+        $this->assertSame([$expectedDelay], array_map(static fn (DelayStamp $stamp): int => $stamp->getDelay(), $nextMiddleware->envelope->all(DelayStamp::class)));
+    }
+
+    public static function provideDefaultStamps(): iterable
+    {
+        yield 'missing' => [[], [], 1];
+        yield 'carried by the failed envelope' => [[new DelayStamp(5)], [], 5];
+        yield 'decoded with the message' => [[], [new DelayStamp(5)], 5];
     }
 
     public function testItThrowsWhenNoReceivedStampAndNoSentToFailureStamp()
@@ -168,6 +405,32 @@ class DecodeFailedMessageMiddlewareTest extends TestCase
         $envelope = new Envelope(new DummyMessage('ok'));
 
         $middleware->handle($envelope, new StackMiddleware());
+    }
+
+    private function handleUnverifiedFailure(object $decodedMessage, string $failureBusName, array $decodedStamps = [], ?SerializerInterface $failureSerializer = null): Envelope
+    {
+        $phpSerializer = new PhpSerializer();
+        $encodedFailure = $phpSerializer->encode(new Envelope(new MessageDecodingFailedException('Could not retrieve the claim.', 0, null, ['body' => 'claim']), [new BusNameStamp($failureBusName), new RedeliveryStamp(1), new TransportMessageIdStamp('failed_id'), new SentToFailureTransportStamp('async')]));
+        $failure = ($failureSerializer ?? SigningSerializer::forMessageTypes($phpSerializer, 'signing-key', [DummyMessage::class]))->decode($encodedFailure);
+        $this->assertInstanceOf(MessageDecodingFailedException::class, $failure->getMessage());
+
+        $serializer = $this->createStub(SerializerInterface::class);
+        $serializer->method('decode')->willReturn(new Envelope($decodedMessage, [new BusNameStamp('the_bus'), ...$decodedStamps]));
+
+        $middleware = new DecodeFailedMessageMiddleware(new InMemoryLocator(['async' => $serializer]));
+
+        $nextMiddleware = new class implements MiddlewareInterface {
+            public ?Envelope $envelope = null;
+
+            public function handle(Envelope $envelope, StackInterface $stack): Envelope
+            {
+                return $this->envelope = $envelope;
+            }
+        };
+
+        $middleware->handle($failure->with(new TransportMessageIdStamp(42), new ReceivedStamp('async'), new AckStamp(static fn () => null)), new StackMiddleware($nextMiddleware));
+
+        return $nextMiddleware->envelope;
     }
 }
 

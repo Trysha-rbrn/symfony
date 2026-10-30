@@ -11,13 +11,13 @@
 
 namespace Symfony\Component\Messenger\Bridge\Amqp\Transport;
 
-use Symfony\Component\Messenger\Stamp\NonSendableStampInterface;
+use Symfony\Component\Messenger\Stamp\SenderStampInterface;
 
 /**
  * @author Guillaume Gammelin <ggammelin@gmail.com>
  * @author Samuel Roze <samuel.roze@gmail.com>
  */
-final class AmqpStamp implements NonSendableStampInterface
+final class AmqpStamp implements SenderStampInterface
 {
     private bool $isRetryAttempt = false;
 
@@ -47,7 +47,8 @@ final class AmqpStamp implements NonSendableStampInterface
     {
         $attr = $previousStamp->attributes ?? [];
 
-        $attr['headers'] ??= $amqpEnvelope->getHeaders();
+        // the broker also routes a message to the routing keys of its CC header, and keeps that header when delivering it
+        $attr['headers'] ??= array_diff_key($amqpEnvelope->getHeaders(), ['CC' => true]);
         $attr['content_type'] ??= $amqpEnvelope->getContentType();
         $attr['content_encoding'] ??= $amqpEnvelope->getContentEncoding();
         $attr['delivery_mode'] ??= $amqpEnvelope->getDeliveryMode();
@@ -62,7 +63,7 @@ final class AmqpStamp implements NonSendableStampInterface
         $attr['timestamp'] ??= $amqpEnvelope->getTimestamp();
         $attr['app_id'] ??= $amqpEnvelope->getAppId();
         $attr['message_id'] ??= $amqpEnvelope->getMessageId();
-        $attr['user_id'] ??= $amqpEnvelope->getUserId();
+        // user_id is not copied: the broker rejects a user_id that is not the user of the connection that publishes the message
         $attr['expiration'] ??= $amqpEnvelope->getExpiration();
         $attr['type'] ??= $amqpEnvelope->getType();
         $attr['reply_to'] ??= $amqpEnvelope->getReplyTo();

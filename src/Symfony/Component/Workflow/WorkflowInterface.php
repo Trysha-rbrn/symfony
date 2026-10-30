@@ -17,7 +17,7 @@ use Symfony\Component\Workflow\MarkingStore\MarkingStoreInterface;
 use Symfony\Component\Workflow\Metadata\MetadataStoreInterface;
 
 /**
- * Describes a workflow instance.
+ * Applies transitions to a subject, and tells which ones are enabled or blocked.
  *
  * @author Amrouche Hamza <hamza.simperfit@gmail.com>
  */
@@ -26,9 +26,11 @@ interface WorkflowInterface
     /**
      * Returns the object's Marking.
      *
+     * @param array<string, mixed> $context The context of the "entered" event dispatched when the subject gets its initial marking
+     *
      * @throws LogicException
      */
-    public function getMarking(object $subject): Marking;
+    public function getMarking(object $subject/* , array $context = [] */): Marking;
 
     /**
      * Returns true if the transition is enabled.

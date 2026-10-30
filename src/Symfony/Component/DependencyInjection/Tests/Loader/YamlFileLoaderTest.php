@@ -11,9 +11,12 @@
 
 namespace Symfony\Component\DependencyInjection\Tests\Loader;
 
+use Opis\JsonSchema\Errors\ErrorFormatter;
+use Opis\JsonSchema\Validator;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\IgnoreDeprecations;
+use PHPUnit\Framework\Attributes\RequiresMethod;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Config\Exception\FileLocatorFileNotFoundException;
 use Symfony\Component\Config\Exception\LoaderLoadException;
@@ -50,6 +53,8 @@ use Symfony\Component\DependencyInjection\Tests\Fixtures\FooUnitEnum;
 use Symfony\Component\DependencyInjection\Tests\Fixtures\NamedArgumentsDummy;
 use Symfony\Component\DependencyInjection\Tests\Fixtures\Prototype;
 use Symfony\Component\ExpressionLanguage\Expression;
+use Symfony\Component\Filesystem\Filesystem;
+use Symfony\Component\Yaml\Tag\TaggedValue;
 use Symfony\Component\Yaml\Yaml;
 
 class YamlFileLoaderTest extends TestCase
@@ -979,6 +984,31 @@ class YamlFileLoaderTest extends TestCase
         $this->assertFalse($anonymous->isAutowired());
     }
 
+    public function testAnonymousServicesIdsDoNotDependOnTheProjectDirectory()
+    {
+        $filesystem = new Filesystem();
+        $ids = [];
+
+        foreach (['project_a', 'project_b'] as $project) {
+            $dir = sys_get_temp_dir().'/sf_anonymous_services_'.$project;
+            $filesystem->copy(self::$fixturesPath.'/yaml/anonymous_services.yml', $dir.'/config/services.yml', true);
+            $filesystem->copy(self::$fixturesPath.'/yaml/anonymous_services_in_instanceof.yml', $dir.'/config/anonymous_services_in_instanceof.yml', true);
+
+            $container = new ContainerBuilder();
+            $container->setParameter('kernel.project_dir', $dir);
+
+            try {
+                (new YamlFileLoader($container, new FileLocator($dir.'/config')))->load('services.yml');
+            } finally {
+                $filesystem->remove($dir);
+            }
+
+            $ids[$project] = array_keys($container->getDefinitions());
+        }
+
+        $this->assertSame($ids['project_a'], $ids['project_b']);
+    }
+
     public function testAnonymousServicesInDifferentFilesWithSameNameDoNotConflict()
     {
         $container = new ContainerBuilder();
@@ -1441,6 +1471,56 @@ class YamlFileLoaderTest extends TestCase
         $this->assertEquals((new Definition('stdClass'))->setFactory([null, 'create']), $definition);
     }
 
+    #[RequiresMethod(Validator::class, 'validate')]
+    public function testSchemaAcceptsTheFilesTheLoaderAccepts()
+    {
+        $validator = new Validator(null, 100, false);
+        $schema = json_decode(file_get_contents(\dirname(self::$fixturesPath, 2).'/Loader/schema/services.schema.json'));
+        // A service without a class cannot be compiled, so the schema rejects the short syntax for ids that are not class names.
+        $ignored = ['services_short_syntax.yml'];
+        $failures = [];
+
+        foreach (array_merge(glob(self::$fixturesPath.'/yaml/*.yml'), glob(self::$fixturesPath.'/yaml/*.yaml')) as $file) {
+            if (\in_array(basename($file), $ignored, true)) {
+                continue;
+            }
+
+            set_error_handler(static fn (int $type, string $message) => throw new \ErrorException($message, 0, $type));
+            try {
+                (new YamlFileLoader(new ContainerBuilder(), new FileLocator(\dirname($file)), 'dev'))->load(basename($file));
+            } catch (\Exception) {
+                continue;
+            } finally {
+                restore_error_handler();
+            }
+
+            if (null === $data = Yaml::parseFile($file, Yaml::PARSE_CONSTANT | Yaml::PARSE_CUSTOM_TAGS | Yaml::PARSE_OBJECT_FOR_MAP)) {
+                continue;
+            }
+
+            $result = $validator->validate(self::toJsonData($data), $schema);
+
+            if (!$result->isValid()) {
+                $failures[basename($file)] = (new ErrorFormatter())->format($result->error(), false);
+            }
+        }
+
+        $this->assertSame([], $failures);
+    }
+
+    #[RequiresMethod(Validator::class, 'validate')]
+    public function testSchemaRejectsTagsGivenAsAMap()
+    {
+        $schema = json_decode(file_get_contents(\dirname(self::$fixturesPath, 2).'/Loader/schema/services.schema.json'));
+        $data = Yaml::parse(<<<YAML
+            services:
+                App\\Processor:
+                    tags: { name: monolog.processor, handler: main }
+            YAML, Yaml::PARSE_OBJECT_FOR_MAP);
+
+        $this->assertFalse((new Validator())->validate(self::toJsonData($data), $schema)->isValid());
+    }
+
     #[IgnoreDeprecations]
     #[Group('legacy')]
     #[DataProvider('provideForbiddenKeys')]
@@ -1465,6 +1545,53 @@ class YamlFileLoaderTest extends TestCase
         yield 'calls' => ['calls', [['method' => 'setFoo', 'arguments' => ['bar']]]];
     }
 
+    public function testDecorationOrder()
+    {
+        $container = new ContainerBuilder();
+        $loader = new YamlFileLoader($container, new FileLocator(self::$fixturesPath.'/yaml'));
+        $loader->load('services_decoration_order.yaml');
+
+        $this->assertSame([['within' => ['traceable'], 'around' => ['retryable'], 'priority' => null]], $container->getDefinition('uri_template')->getTag('container.decoration_order'));
+        $this->assertSame([['around' => ['caching'], 'priority' => null]], $container->getDefinition('logging')->getTag('container.decoration_order'));
+        $this->assertSame([['around' => ['throttling']]], $container->getDefinition('mailer_stack')->getTag('container.decoration_order'));
+        $this->assertFalse($container->getDefinition('retryable')->hasTag('container.decoration_order'));
+
+        $container->compile();
+
+        $this->assertEquals((object) [
+            'label' => 'traceable',
+            'inner' => (object) [
+                'label' => 'uri_template',
+                'inner' => (object) [
+                    'label' => 'retryable',
+                    'inner' => (object) ['label' => 'original'],
+                ],
+            ],
+        ], $container->get('http_client'));
+
+        $this->assertEquals((object) [
+            'label' => 'logging',
+            'inner' => (object) [
+                'label' => 'caching',
+                'inner' => (object) ['label' => 'handler'],
+            ],
+        ], $container->get('handler'));
+
+        $this->assertEquals((object) [
+            'label' => 'A',
+            'inner' => (object) [
+                'label' => 'B',
+                'inner' => (object) [
+                    'label' => 'audit',
+                    'inner' => (object) [
+                        'label' => 'throttling',
+                        'inner' => (object) ['label' => 'mailer'],
+                    ],
+                ],
+            ],
+        ], $container->get('mailer'));
+    }
+
     public function testDecoratesTag()
     {
         $container = new ContainerBuilder();
@@ -1480,5 +1607,16 @@ class YamlFileLoaderTest extends TestCase
         $this->assertTrue($container->hasAlias('bar'));
 
         $this->assertStringContainsString('.decorator.foo.', (string) $container->getAlias('foo'));
+    }
+
+    private static function toJsonData(mixed $value): mixed
+    {
+        return match (true) {
+            $value instanceof TaggedValue => self::toJsonData($value->getValue()),
+            $value instanceof \UnitEnum => $value->name,
+            $value instanceof \stdClass => (object) array_map(self::toJsonData(...), (array) $value),
+            \is_array($value) => array_map(self::toJsonData(...), $value),
+            default => $value,
+        };
     }
 }

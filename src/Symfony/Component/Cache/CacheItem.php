@@ -12,6 +12,7 @@
 namespace Symfony\Component\Cache;
 
 use Psr\Cache\CacheItemInterface;
+use Psr\Clock\ClockInterface;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\Cache\Exception\InvalidArgumentException;
 use Symfony\Component\Cache\Exception\LogicException;
@@ -34,6 +35,7 @@ final class CacheItem implements ItemInterface
     protected ?CacheItemInterface $innerItem = null;
     protected ?string $poolHash = null;
     protected bool $isTaggable = false;
+    protected ?ClockInterface $clock = null;
 
     public function getKey(): string
     {
@@ -65,7 +67,7 @@ final class CacheItem implements ItemInterface
      */
     public function expiresAt(?\DateTimeInterface $expiration): static
     {
-        $this->expiry = null !== $expiration ? (float) $expiration->format('U.u') : null;
+        $this->expiry = null !== $expiration ? self::toTimestamp($expiration) : null;
 
         return $this;
     }
@@ -78,9 +80,9 @@ final class CacheItem implements ItemInterface
         if (null === $time) {
             $this->expiry = null;
         } elseif ($time instanceof \DateInterval) {
-            $this->expiry = microtime(true) + \DateTimeImmutable::createFromFormat('U', 0)->add($time)->format('U.u');
+            $this->expiry = $this->now() + self::toTimestamp(\DateTimeImmutable::createFromTimestamp(0)->add($time));
         } elseif (\is_int($time)) {
-            $this->expiry = $time + microtime(true);
+            $this->expiry = $time + $this->now();
         } else {
             throw new InvalidArgumentException(\sprintf('Expiration date must be an integer, a DateInterval or null, "%s" given.', get_debug_type($time)));
         }
@@ -199,6 +201,16 @@ final class CacheItem implements ItemInterface
         $this->metadata['expiry'] += self::METADATA_EXPIRY_OFFSET;
 
         return true;
+    }
+
+    private function now(): float
+    {
+        return null !== $this->clock ? self::toTimestamp($this->clock->now()) : microtime(true);
+    }
+
+    private static function toTimestamp(\DateTimeInterface $date): float
+    {
+        return \PHP_INT_SIZE >= 8 ? $date->getTimestamp() + $date->getMicrosecond() / 1e6 : (float) $date->format('U.u');
     }
 }
 

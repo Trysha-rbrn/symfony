@@ -20,6 +20,7 @@ use Symfony\Component\VarDumper\Caster\Caster;
 use Symfony\Component\VarDumper\Cloner\Stub;
 use Symfony\Component\Workflow\Debug\ListenerExtractor;
 use Symfony\Component\Workflow\Debug\TraceableWorkflow;
+use Symfony\Component\Workflow\Definition;
 use Symfony\Component\Workflow\Dumper\MermaidDumper;
 use Symfony\Component\Workflow\Marking;
 use Symfony\Component\Workflow\TransitionBlocker;
@@ -56,10 +57,13 @@ final class WorkflowDataCollector extends DataCollector implements LateDataColle
             // We always use a workflow type because we want to mermaid to
             // create a node for transitions
             $dumper = new MermaidDumper(MermaidDumper::TRANSITION_TYPE_WORKFLOW);
+            $description = $workflow->getDefinition()->getMetadataStore()->getMetadata('description');
             $this->data['workflows'][$workflow->getName()] = [
                 'dump' => $dumper->dump($workflow->getDefinition()),
                 'calls' => $calls,
                 'listeners' => $this->getEventListeners($workflow),
+                'description' => \is_string($description) ? $description : null,
+                'descriptions' => $this->getDescriptions($workflow->getDefinition()),
             ];
         }
     }
@@ -147,5 +151,26 @@ final class WorkflowDataCollector extends DataCollector implements LateDataColle
         }
 
         return $normalizedListeners;
+    }
+
+    private function getDescriptions(Definition $definition): array
+    {
+        $metadataStore = $definition->getMetadataStore();
+        $descriptions = [];
+        $placeId = 0;
+        // An empty description is skipped, as Mermaid rejects an empty tooltip and would fail to render the whole diagram
+        foreach ($definition->getPlaces() as $place) {
+            if (\is_string($description = $metadataStore->getMetadata('description', $place)) && '' !== $description) {
+                $descriptions["place{$placeId}"] = $description;
+            }
+            ++$placeId;
+        }
+        foreach ($definition->getTransitions() as $k => $transition) {
+            if (\is_string($description = $metadataStore->getMetadata('description', $transition)) && '' !== $description) {
+                $descriptions["transition$k"] = $description;
+            }
+        }
+
+        return $descriptions;
     }
 }

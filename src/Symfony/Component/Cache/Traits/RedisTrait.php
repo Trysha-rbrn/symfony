@@ -17,6 +17,7 @@ use Predis\Connection\Aggregate\RedisCluster;
 use Predis\Connection\Aggregate\ReplicationInterface;
 use Predis\Connection\Cluster\ClusterInterface as Predis2ClusterInterface;
 use Predis\Connection\Cluster\RedisCluster as Predis2RedisCluster;
+use Predis\Connection\NodeConnectionInterface;
 use Predis\Connection\Replication\ReplicationInterface as Predis2ReplicationInterface;
 use Predis\Response\ErrorInterface;
 use Predis\Response\Status;
@@ -27,6 +28,7 @@ use Symfony\Component\Cache\Exception\CacheException;
 use Symfony\Component\Cache\Exception\InvalidArgumentException;
 use Symfony\Component\Cache\Marshaller\DefaultMarshaller;
 use Symfony\Component\Cache\Marshaller\MarshallerInterface;
+use Symfony\Contracts\Service\ResetInterface;
 
 /**
  * @author Aurimas Niekis <aurimas@niekis.lt>
@@ -529,6 +531,25 @@ trait RedisTrait
         return $redis;
     }
 
+    /**
+     * @param bool $shutdown Whether the pool is being shut down
+     */
+    public function reset(/* bool $shutdown = false */): void
+    {
+        parent::reset(...\func_get_args());
+
+        if (!\func_num_args() || !func_get_arg(0)) {
+            return;
+        }
+
+        if ($this->redis instanceof ResetInterface) {
+            // a lazy connection reconnects when it is used again
+            $this->redis->reset();
+        } elseif ($this->redis instanceof \Predis\ClientInterface && ($connection = $this->redis->getConnection()) instanceof NodeConnectionInterface && !$connection->getParameters()->persistent) {
+            $connection->disconnect();
+        }
+    }
+
     protected function doFetch(array $ids): iterable
     {
         if (!$ids) {
@@ -581,10 +602,9 @@ trait RedisTrait
             $prefixLen = \strlen($prefix ?? '');
             $pattern = addcslashes($prefix.$namespace, '*?[]\\').'*';
             foreach ($this->redis->_masters() as $ipAndPort) {
-                $address = implode(':', $ipAndPort);
                 $cursor = null;
                 do {
-                    $keys = $this->redis->scan($cursor, $address, $pattern, 1000);
+                    $keys = $this->redis->scan($cursor, $ipAndPort, $pattern, 1000);
                     if (isset($keys[1]) && \is_array($keys[1])) {
                         $cursor = $keys[0];
                         $keys = $keys[1];

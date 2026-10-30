@@ -11,18 +11,27 @@
 
 namespace Symfony\Component\Routing\Tests\Loader;
 
+use Opis\JsonSchema\Errors\ErrorFormatter;
+use Opis\JsonSchema\Validator;
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\RequiresMethod;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Config\FileLocator;
 use Symfony\Component\Config\FileLocatorInterface;
 use Symfony\Component\Config\Loader\LoaderResolver;
 use Symfony\Component\Config\Resource\FileResource;
+use Symfony\Component\Routing\Controller\RedirectController;
 use Symfony\Component\Routing\Loader\AttributeClassLoader;
+use Symfony\Component\Routing\Loader\DirectoryLoader;
+use Symfony\Component\Routing\Loader\PhpFileLoader;
 use Symfony\Component\Routing\Loader\Psr4DirectoryLoader;
 use Symfony\Component\Routing\Loader\YamlFileLoader;
 use Symfony\Component\Routing\Route;
 use Symfony\Component\Routing\RouteCollection;
 use Symfony\Component\Routing\Tests\Fixtures\Psr4Controllers\MyController;
+use Symfony\Component\Routing\Tests\Fixtures\TraceableAttributeClassLoader;
+use Symfony\Component\Yaml\Tag\TaggedValue;
+use Symfony\Component\Yaml\Yaml;
 
 class YamlFileLoaderTest extends TestCase
 {
@@ -171,6 +180,47 @@ class YamlFileLoaderTest extends TestCase
         $this->expectExceptionMessageMatches('/The routing file "[^"]*" must not specify both the "controller" key and the defaults key "_controller" for "app_blog"/');
 
         $loader->load('override_defaults.yml');
+    }
+
+    public function testLoadRoutesWithControllerShortcuts()
+    {
+        $loader = new YamlFileLoader(new FileLocator([__DIR__.'/../Fixtures/controller_shortcuts']));
+        $routeCollection = $loader->load('routing.yml');
+
+        $this->assertSame(['maxAge' => 300, '_template' => 'pages/faq.html.twig'], $routeCollection->get('faq')->getDefaults());
+        $this->assertSame([
+            'page' => 'configuration/front_controllers_and_kernel',
+            '_fragment' => 'debug-mode',
+            '_controller' => RedirectController::class.'::redirectAction',
+            'route' => 'doc_page',
+        ], $routeCollection->get('doc_debug_mode')->getDefaults());
+        $this->assertSame(['_controller' => RedirectController::class.'::urlRedirectAction', 'path' => '/doc/current/{page}'], $routeCollection->get('doc_index')->getDefaults());
+        $this->assertSame(['_controller' => RedirectController::class.'::urlRedirectAction', 'path' => 'https://example.com/some/path'], $routeCollection->get('external')->getDefaults());
+    }
+
+    #[DataProvider('provideInvalidControllerShortcuts')]
+    public function testLoadThrowsExceptionWithInvalidControllerShortcut(string $file, string $message)
+    {
+        $loader = new YamlFileLoader(new FileLocator([__DIR__.'/../Fixtures/controller_shortcuts']));
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage($message);
+
+        $loader->load($file);
+    }
+
+    public static function provideInvalidControllerShortcuts(): iterable
+    {
+        yield ['template_with_controller.yml', 'must not specify both the "template" key and a controller for "faq".'];
+        yield ['redirect_with_controller_default.yml', 'must not specify both the "redirect_to" key and a controller for "external".'];
+        yield ['two_shortcuts.yml', 'must not specify more than one of the "redirect_to_route", "redirect_to" keys for "doc".'];
+        yield ['import_with_shortcut.yml', 'The "template" key for the import "pages" in'];
+        yield ['template_with_template_default.yml', 'must not specify both the "template" key and the defaults key "_template" for "faq".'];
+        yield ['redirect_to_route_with_route_default.yml', 'must not specify both the "redirect_to_route" key and the defaults key "route" for "doc".'];
+        yield ['redirect_to_with_path_default.yml', 'must not specify both the "redirect_to" key and the defaults key "path" for "doc".'];
+        yield ['redirect_to_route_with_route_placeholder.yml', 'must not specify both the "redirect_to_route" key and a "{route}" placeholder for "doc".'];
+        yield ['redirect_to_with_path_placeholder.yml', 'must not specify both the "redirect_to" key and a "{path}" placeholder for "go".'];
+        yield ['redirect_to_with_path_host_placeholder.yml', 'must not specify both the "redirect_to" key and a "{path}" placeholder for "go".'];
     }
 
     #[DataProvider('provideFilesImportingRoutesWithControllers')]
@@ -575,5 +625,70 @@ class YamlFileLoaderTest extends TestCase
         $route = $loader->load('class-attributes.yaml')->get('my_route');
         $this->assertSame('/my-prefix/my/route', $route->getPath());
         $this->assertSame(MyController::class.'::__invoke', $route->getDefault('_controller'));
+    }
+
+    #[RequiresMethod(Validator::class, 'validate')]
+    public function testSchemaAcceptsTheFilesTheLoaderAccepts()
+    {
+        $validator = new Validator(null, 100, false);
+        $schema = json_decode(file_get_contents(\dirname(__DIR__, 2).'/Loader/schema/routing.schema.json'));
+        $fixturesPath = \dirname(__DIR__).'/Fixtures';
+        $failures = [];
+
+        foreach (new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($fixturesPath, \FilesystemIterator::SKIP_DOTS)) as $file) {
+            if (!\in_array($file->getExtension(), ['yml', 'yaml'], true)) {
+                continue;
+            }
+
+            $locator = new FileLocator($file->getPath());
+            new LoaderResolver([
+                $loader = new YamlFileLoader($locator, 'some-env'),
+                new PhpFileLoader($locator),
+                new DirectoryLoader($locator),
+                new Psr4DirectoryLoader($locator),
+                new TraceableAttributeClassLoader(),
+            ]);
+
+            set_error_handler(static fn (int $type, string $message) => throw new \ErrorException($message, 0, $type));
+            try {
+                $loader->load($file->getFilename());
+            } catch (\Exception) {
+                continue;
+            } finally {
+                restore_error_handler();
+            }
+
+            if (null === $data = Yaml::parseFile($file->getPathname(), Yaml::PARSE_CONSTANT | Yaml::PARSE_CUSTOM_TAGS | Yaml::PARSE_OBJECT_FOR_MAP)) {
+                continue;
+            }
+
+            $result = $validator->validate(self::toJsonData($data), $schema);
+
+            if (!$result->isValid()) {
+                $failures[substr($file->getPathname(), \strlen($fixturesPath) + 1)] = (new ErrorFormatter())->format($result->error(), false);
+            }
+        }
+
+        $this->assertSame([], $failures);
+    }
+
+    #[RequiresMethod(Validator::class, 'validate')]
+    public function testSchemaRejectsTheDeprecatedKeyOnRouteDefinitions()
+    {
+        $schema = json_decode(file_get_contents(\dirname(__DIR__, 2).'/Loader/schema/routing.schema.json'));
+        $data = (object) ['blog_show' => (object) ['path' => '/blog/{slug}', 'deprecated' => (object) ['package' => 'acme/blog', 'version' => '1.2']]];
+
+        $this->assertFalse((new Validator())->validate($data, $schema)->isValid());
+    }
+
+    private static function toJsonData(mixed $value): mixed
+    {
+        return match (true) {
+            $value instanceof TaggedValue => self::toJsonData($value->getValue()),
+            $value instanceof \UnitEnum => $value->name,
+            $value instanceof \stdClass => (object) array_map(self::toJsonData(...), (array) $value),
+            \is_array($value) => array_map(self::toJsonData(...), $value),
+            default => $value,
+        };
     }
 }

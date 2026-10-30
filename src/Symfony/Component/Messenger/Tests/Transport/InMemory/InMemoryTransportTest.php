@@ -11,7 +11,9 @@
 
 namespace Symfony\Component\Messenger\Tests\Transport\InMemory;
 
+use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\TestCase;
+use Symfony\Bridge\PhpUnit\ClockMock;
 use Symfony\Component\Clock\MockClock;
 use Symfony\Component\Clock\Test\ClockSensitiveTrait;
 use Symfony\Component\DependencyInjection\ServiceLocator;
@@ -19,14 +21,23 @@ use Symfony\Component\EventDispatcher\EventDispatcher;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Event\WorkerRunningEvent;
 use Symfony\Component\Messenger\EventListener\SendFailedMessageToFailureTransportListener;
+use Symfony\Component\Messenger\EventListener\StopWorkerOnMessageLimitListener;
 use Symfony\Component\Messenger\Exception\MessageDecodingFailedException;
+use Symfony\Component\Messenger\Handler\HandlersLocator;
 use Symfony\Component\Messenger\MessageBus;
 use Symfony\Component\Messenger\Middleware\DecodeFailedMessageMiddleware;
+use Symfony\Component\Messenger\Middleware\HandleMessageMiddleware;
+use Symfony\Component\Messenger\Middleware\SendMessageMiddleware;
 use Symfony\Component\Messenger\Stamp\DelayStamp;
+use Symfony\Component\Messenger\Stamp\ReceivedStamp;
+use Symfony\Component\Messenger\Stamp\RedispatchStamp;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
+use Symfony\Component\Messenger\Stamp\TrustStamp;
 use Symfony\Component\Messenger\Tests\Fixtures\AnEnvelopeStamp;
 use Symfony\Component\Messenger\Tests\Fixtures\DummyMessage;
 use Symfony\Component\Messenger\Transport\InMemory\InMemoryTransport;
+use Symfony\Component\Messenger\Transport\Sender\SendersLocator;
+use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
 use Symfony\Component\Messenger\Worker;
 
@@ -110,6 +121,19 @@ class InMemoryTransportTest extends TestCase
         $this->assertSame([$envelope], $transport->get());
     }
 
+    #[Group('time-sensitive')]
+    public function testQueueWithSubSecondDelayWithoutAClock()
+    {
+        ClockMock::withClockMock(1577836800);
+        $envelope = $this->transport->send((new Envelope(new \stdClass()))->with(new DelayStamp(500)));
+
+        usleep(100000);
+        $this->assertSame([], $this->transport->get());
+
+        usleep(500000);
+        $this->assertSame([$envelope], $this->transport->get());
+    }
+
     public function testQueueWithDelayAcrossDstTransition()
     {
         // spring forward, fall back, and a day without a transition
@@ -170,6 +194,26 @@ class InMemoryTransportTest extends TestCase
 
         $this->assertSame([$envelope1], $this->transport->get(1));
         $this->assertSame([$envelope1, $envelope2], $this->transport->get(2));
+    }
+
+    public function testGetDecodesOnlyTheEnvelopesItReturns()
+    {
+        $decoded = 0;
+        $serializer = $this->createStub(SerializerInterface::class);
+        $serializer->method('encode')->willReturn(['body' => 'foo']);
+        $serializer->method('decode')->willReturnCallback(static function () use (&$decoded) {
+            ++$decoded;
+
+            return new Envelope(new DummyMessage('Hello'));
+        });
+
+        $transport = new InMemoryTransport($serializer);
+        for ($i = 0; $i < 3; ++$i) {
+            $transport->send(new Envelope(new \stdClass()));
+        }
+
+        $this->assertCount(1, $transport->get());
+        $this->assertSame(1, $decoded);
     }
 
     public function testAcknowledgeSameMessageWithDifferentStamps()
@@ -285,6 +329,24 @@ class InMemoryTransportTest extends TestCase
         $this->assertInstanceOf(MessageDecodingFailedException::class, $failed[0]->getMessage());
     }
 
+    public function testARedispatchedMessageIsHandledWhenConsumedFromTheTransportItWasSentTo()
+    {
+        $calls = 0;
+        $transport = $this->transport;
+        $bus = new MessageBus([
+            new SendMessageMiddleware(new SendersLocator([DummyMessage::class => ['transport']], new ServiceLocator(['transport' => static fn () => $transport]))),
+            new HandleMessageMiddleware(new HandlersLocator([DummyMessage::class => [static function () use (&$calls) { ++$calls; }]])),
+        ]);
+        $dispatcher = new EventDispatcher();
+        $dispatcher->addSubscriber(new StopWorkerOnMessageLimitListener(1));
+
+        $bus->dispatch(new Envelope(new DummyMessage('Hello.'), [new ReceivedStamp('scheduler_default'), TrustStamp::trusted(), new RedispatchStamp()]));
+        (new Worker(['transport' => $transport], $bus, $dispatcher))->run(['sleep' => 0]);
+
+        $this->assertSame(1, $calls);
+        $this->assertSame(0, $transport->getMessageCount());
+    }
+
     public function testReset()
     {
         $envelope = new Envelope(new \stdClass());
@@ -372,6 +434,39 @@ class InMemoryTransportTest extends TestCase
         $this->assertNull($this->transport->find(1));
         $this->transport->reject($envelope2);
         $this->assertNull($this->transport->find(2));
+    }
+
+    public function testEnvelopesDispatchedInThisProcessAreHandedBackTrusted()
+    {
+        $this->transport->send(new Envelope(new \stdClass()));
+
+        $this->assertTrue($this->transport->get()[0]->last(TrustStamp::class)?->isTrusted());
+        $this->assertTrue($this->transport->all()[0]->last(TrustStamp::class)?->isTrusted());
+        $this->assertTrue($this->transport->find(1)?->last(TrustStamp::class)?->isTrusted());
+        $this->assertNull($this->transport->getSent()[0]->last(TrustStamp::class));
+    }
+
+    public function testEnvelopesReceivedFromATransportAreHandedBackWithTheirOwnTrust()
+    {
+        $untrusted = TrustStamp::untrusted();
+        $trusted = TrustStamp::trusted();
+        $this->transport->send(new Envelope(new \stdClass(), [new ReceivedStamp('async')]));
+        $this->transport->send(new Envelope(new \stdClass(), [new ReceivedStamp('async'), $untrusted]));
+        $this->transport->send(new Envelope(new \stdClass(), [new ReceivedStamp('scheduler_default'), $trusted]));
+
+        [$received, $receivedUntrusted, $receivedTrusted] = $this->transport->get(3);
+
+        $this->assertNull($received->last(TrustStamp::class));
+        $this->assertSame($untrusted, $receivedUntrusted->last(TrustStamp::class));
+        $this->assertSame($trusted, $receivedTrusted->last(TrustStamp::class));
+    }
+
+    public function testEnvelopesAreNotTrustedWhenTheyAreSerialized()
+    {
+        $transport = new InMemoryTransport(new PhpSerializer());
+        $transport->send(new Envelope(new DummyMessage('Hello.')));
+
+        $this->assertNull($transport->get()[0]->last(TrustStamp::class));
     }
 
     private function createUndecodableSerializer(): SerializerInterface

@@ -147,6 +147,39 @@ class ConnectionTest extends TestCase
         $this->assertInstanceOf(Connection::class, new Connection([], $redis));
     }
 
+    public function testRedisClusterExceptionsAreWrapped()
+    {
+        $exception = new \RedisClusterException('Unable to send command to the specified node');
+        $redis = $this->createStub(\RedisCluster::class);
+        foreach (['xgroup', 'xreadgroup', 'xack', 'xclaim', 'xadd', 'xRange', 'xRevRange', 'rawCommand'] as $method) {
+            $redis->method($method)->willThrowException($exception);
+        }
+
+        $connection = new Connection(['auto_setup' => false], $redis);
+
+        $operations = [
+            'setup' => static fn () => $connection->setup(),
+            'get' => static fn () => $connection->get(),
+            'ack' => static fn () => $connection->ack('1-0'),
+            'reject' => static fn () => $connection->reject('1-0'),
+            'keepalive' => static fn () => $connection->keepalive('1-0'),
+            'add' => static fn () => $connection->add('body', []),
+            'add delayed' => static fn () => $connection->add('body', [], 1000),
+            'find' => static fn () => $connection->find('1-0'),
+            'findAll' => static fn () => $connection->findAll(),
+            'findAllInBatches' => static fn () => iterator_to_array($connection->findAllInBatches()),
+        ];
+
+        foreach ($operations as $name => $operation) {
+            try {
+                $operation();
+                $this->fail(\sprintf('"%s" should have thrown a TransportException.', $name));
+            } catch (TransportException $e) {
+                $this->assertSame($exception, $e->getPrevious(), $name);
+            }
+        }
+    }
+
     public function testPendingScanAdvancesCursorWithoutDuplicates()
     {
         $redis = $this->createRedisMock();
@@ -471,6 +504,57 @@ class ConnectionTest extends TestCase
         $connection->get();
     }
 
+    public function testReconnectsAfterConnectionLoss()
+    {
+        $connected = false;
+        $calls = 0;
+        $redis = $this->createMock(\Redis::class);
+        $redis->expects($this->exactly(2))->method('connect')->willReturnCallback(static function () use (&$connected) {
+            return $connected = true;
+        });
+        $redis->method('isConnected')->willReturnCallback(static function () use (&$connected) {
+            return $connected;
+        });
+        // like phpredis, the client stays broken until it connects again
+        $redis->expects($this->exactly(2))->method('xadd')->willReturnCallback(static function () use (&$connected, &$calls) {
+            if (1 === ++$calls) {
+                $connected = false;
+
+                throw new \RedisException('Connection lost');
+            }
+
+            return $connected ? '1-0' : throw new \RedisException('Redis server localhost:6379 went away');
+        });
+
+        $connection = Connection::fromDsn('redis://localhost/queue', ['auto_setup' => false], $redis);
+
+        try {
+            $connection->add('1', []);
+            $this->fail('A TransportException should have been thrown.');
+        } catch (TransportException $e) {
+            $this->assertSame('Connection lost', $e->getMessage());
+        }
+
+        $this->assertSame('1-0', $connection->add('2', []));
+    }
+
+    public function testFailedConnectionThrowsTransportException()
+    {
+        $exception = new \RedisException('Connection refused');
+        $redis = $this->createMock(\Redis::class);
+        $redis->method('isConnected')->willReturn(false);
+        $redis->expects($this->once())->method('connect')->willThrowException($exception);
+
+        $connection = Connection::fromDsn('redis://localhost/queue', ['lazy' => true, 'auto_setup' => false], $redis);
+
+        try {
+            $connection->add('1', []);
+            $this->fail('A TransportException should have been thrown.');
+        } catch (TransportException $e) {
+            $this->assertSame($exception, $e->getPrevious());
+        }
+    }
+
     public function testMaxEntries()
     {
         $redis = $this->createRedisMock();
@@ -520,12 +604,29 @@ class ConnectionTest extends TestCase
         $redis->expects($this->exactly(1))->method('xack')
             ->with('queue', 'symfony', ['1'])
             ->willReturn(0);
-        $redis->expects($this->never())->method('xdel');
+        $redis->expects($this->exactly(1))->method('xdel')
+            ->with('queue', ['1'])
+            ->willReturn(0);
 
         $connection = Connection::fromDsn('redis://localhost/queue', [], $redis);
 
         $this->expectException(TransportException::class);
         $this->expectExceptionMessage('Could not acknowledge redis message "1".');
+        $connection->ack('1');
+    }
+
+    public function testAckDeletesMessageNotInPendingList()
+    {
+        $redis = $this->createRedisMock();
+
+        $redis->expects($this->exactly(1))->method('xack')
+            ->with('queue', 'symfony', ['1'])
+            ->willReturn(0);
+        $redis->expects($this->exactly(1))->method('xdel')
+            ->with('queue', ['1'])
+            ->willReturn(1);
+
+        $connection = Connection::fromDsn('redis://localhost/queue', [], $redis);
         $connection->ack('1');
     }
 
@@ -566,12 +667,29 @@ class ConnectionTest extends TestCase
         $redis->expects($this->exactly(1))->method('xack')
             ->with('queue', 'symfony', ['1'])
             ->willReturn(0);
-        $redis->expects($this->never())->method('xdel');
+        $redis->expects($this->exactly(1))->method('xdel')
+            ->with('queue', ['1'])
+            ->willReturn(0);
 
         $connection = Connection::fromDsn('redis://localhost/queue?delete_after_reject=true', [], $redis);
 
         $this->expectException(TransportException::class);
         $this->expectExceptionMessage('Could not reject redis message "1".');
+        $connection->reject('1');
+    }
+
+    public function testRejectDeletesMessageNotInPendingList()
+    {
+        $redis = $this->createRedisMock();
+
+        $redis->expects($this->exactly(1))->method('xack')
+            ->with('queue', 'symfony', ['1'])
+            ->willReturn(0);
+        $redis->expects($this->exactly(1))->method('xdel')
+            ->with('queue', ['1'])
+            ->willReturn(1);
+
+        $connection = Connection::fromDsn('redis://localhost/queue?delete_after_reject=true', [], $redis);
         $connection->reject('1');
     }
 
@@ -600,6 +718,49 @@ class ConnectionTest extends TestCase
         }
 
         $this->assertSame('xack error', $e->getMessage());
+    }
+
+    public function testGetRunsSetupAgainWhenTheGroupIsGone()
+    {
+        $groupExists = false;
+        $redis = $this->createRedisMock();
+        $redis->expects($this->exactly(2))->method('xgroup')
+            ->with('CREATE', 'queue', 'symfony', 0, true)
+            ->willReturnCallback(static function () use (&$groupExists) {
+                return $groupExists = true;
+            });
+        $redis->method('getLastError')->willReturnCallback(static function () use (&$groupExists) {
+            return $groupExists ? null : "NOGROUP No such key 'queue' or consumer group 'symfony' in XREADGROUP with GROUP option";
+        });
+        $redis->method('xreadgroup')->willReturnCallback(static function ($group, $consumer, $streams) use (&$groupExists) {
+            if (!$groupExists) {
+                return false;
+            }
+
+            return '>' === $streams['queue'] ? ['queue' => ['1-0' => ['message' => '{"body":"1","headers":[]}']]] : [];
+        });
+
+        $connection = Connection::fromDsn('redis://localhost/queue', [], $redis);
+        $this->assertSame('1-0', $connection->get()[0]['id']);
+
+        // the stream and its group are lost, like when Redis restarts without persistence
+        $groupExists = false;
+
+        $this->assertSame('1-0', $connection->get()[0]['id']);
+    }
+
+    public function testGetDoesNotRunSetupWhenTheGroupIsGoneWithoutAutoSetup()
+    {
+        $redis = $this->createRedisMock();
+        $redis->expects($this->never())->method('xgroup');
+        $redis->expects($this->once())->method('xreadgroup')->willReturn(false);
+        $redis->method('getLastError')->willReturn("NOGROUP No such key 'queue' or consumer group 'symfony' in XREADGROUP with GROUP option");
+
+        $connection = Connection::fromDsn('redis://localhost/queue', ['auto_setup' => false], $redis);
+
+        $this->expectException(TransportException::class);
+        $this->expectExceptionMessage('NOGROUP');
+        $connection->get();
     }
 
     #[DataProvider('provideIdPatterns')]
@@ -1043,6 +1204,28 @@ class ConnectionTest extends TestCase
         $this->assertEquals('1234567890-0', $messages[0]['id']);
     }
 
+    public function testFindAllInBatchesReadsTheStreamInBatches()
+    {
+        $redis = $this->createRedisMock();
+        $entries = [];
+        foreach (range(0, 149) as $sequence) {
+            $entries['1234567890-'.$sequence] = ['message' => json_encode(['body' => (string) $sequence, 'headers' => []])];
+        }
+
+        $calls = [];
+        $redis->expects($this->once())->method('xRevRange')->with('queue', '+', '-', 1)->willReturn(\array_slice($entries, -1, 1, true));
+        $redis->method('xRange')->willReturnCallback(static function (string $stream, string $start, string $end, int $count) use ($entries, &$calls) {
+            $calls[] = [$stream, $start, $end, $count];
+
+            return \array_slice($entries, '-' === $start ? 0 : (int) explode('-', $start)[1], $count);
+        });
+
+        $connection = Connection::fromDsn('redis://localhost/queue', [], $redis);
+
+        $this->assertSame(array_keys($entries), array_column(iterator_to_array($connection->findAllInBatches(), false), 'id'));
+        $this->assertSame([['queue', '-', '1234567890-149', 100], ['queue', '1234567890-100', '1234567890-149', 100]], $calls);
+    }
+
     public function testFindAllWhenRedisExceptionOccurs()
     {
         $redis = $this->createRedisMock();
@@ -1095,5 +1278,180 @@ class ConnectionTest extends TestCase
         $message = $connection->find(123);
 
         $this->assertNull($message);
+    }
+
+    public function testAddBatch()
+    {
+        $redis = $this->createRedisMock();
+        $commands = [];
+
+        $redis->expects($this->once())->method('pipeline')->willReturnSelf();
+        $redis->method('xadd')->willReturnCallback(static function (...$arguments) use (&$commands, $redis) {
+            $commands[] = ['xadd', ...$arguments];
+
+            return $redis;
+        });
+        $redis->method('rawCommand')->willReturnCallback(static function (...$arguments) use (&$commands, $redis) {
+            $commands[] = ['rawCommand', ...$arguments];
+
+            return $redis;
+        });
+        $redis->expects($this->once())->method('exec')->willReturn(['1-0', 1, '1-1']);
+
+        $connection = Connection::fromDsn('redis://localhost/queue?stream_max_entries=20000', ['auto_setup' => false], $redis);
+
+        [$ids, $exceptions] = $connection->addBatch([
+            'a' => ['1', [], 0],
+            'b' => ['2', ['foo' => 'bar'], 100],
+            'c' => ['3', [], 0],
+        ]);
+
+        $this->assertSame([], $exceptions);
+        $this->assertSame(['a', 'b', 'c'], array_keys($ids));
+        $this->assertSame('1-0', $ids['a']);
+        $this->assertSame('1-1', $ids['c']);
+
+        $this->assertCount(3, $commands);
+        $this->assertSame(['xadd', 'queue', '*', ['message' => '{"body":"1","headers":[]}'], 20000, true], \array_slice($commands[0], 0, 6));
+        $this->assertSame(['xadd', 'queue', '*', ['message' => '{"body":"3","headers":[]}'], 20000, true], \array_slice($commands[2], 0, 6));
+        $this->assertSame(['rawCommand', 'ZADD', 'queue__queue', 'NX'], \array_slice($commands[1], 0, 4));
+        $this->assertSame(['body' => '2', 'headers' => ['foo' => 'bar'], 'uniqid' => $ids['b']], json_decode($commands[1][5], true));
+    }
+
+    public function testAddBatchReportsFailedCommands()
+    {
+        $redis = $this->createRedisMock();
+
+        $redis->expects($this->once())->method('exec')->willReturn(['1-0', false, '1-2', false, $e = new \RedisException('ERR from the pipeline')]);
+        $redis->method('getLastError')->willReturn('WRONGTYPE Operation against a key holding the wrong kind of value');
+        $redis->expects($this->once())->method('clearLastError');
+
+        $connection = Connection::fromDsn('redis://localhost/queue', ['auto_setup' => false], $redis);
+
+        [$ids, $exceptions] = $connection->addBatch([
+            'a' => ['1', [], 0],
+            'b' => ['2', [], 0],
+            'c' => ['3', [], 0],
+            'd' => ['4', [], 100],
+            'e' => ['5', [], 0],
+        ]);
+
+        $this->assertSame(['a' => '1-0', 'c' => '1-2'], $ids);
+        $this->assertSame(['b', 'd', 'e'], array_keys($exceptions));
+        $this->assertContainsOnlyInstancesOf(TransportException::class, $exceptions);
+        $this->assertSame('WRONGTYPE Operation against a key holding the wrong kind of value', $exceptions['b']->getMessage());
+        $this->assertSame('WRONGTYPE Operation against a key holding the wrong kind of value', $exceptions['d']->getMessage());
+        $this->assertSame('ERR from the pipeline', $exceptions['e']->getMessage());
+        $this->assertSame($e, $exceptions['e']->getPrevious());
+    }
+
+    public function testAddBatchReportsMessagesThatCannotBeEncoded()
+    {
+        $redis = $this->createRedisMock();
+
+        $redis->expects($this->once())->method('xadd')->with('queue', '*', ['message' => '{"body":"1","headers":[]}'])->willReturnSelf();
+        $redis->expects($this->once())->method('exec')->willReturn(['1-0']);
+
+        $connection = Connection::fromDsn('redis://localhost/queue', ['auto_setup' => false], $redis);
+
+        [$ids, $exceptions] = $connection->addBatch([
+            'a' => ["\xB1\x31", [], 0],
+            'b' => ['1', [], 0],
+        ]);
+
+        $this->assertSame(['b' => '1-0'], $ids);
+        $this->assertSame(['a'], array_keys($exceptions));
+        $this->assertInstanceOf(TransportException::class, $exceptions['a']);
+        $this->assertSame('Malformed UTF-8 characters, possibly incorrectly encoded', $exceptions['a']->getMessage());
+    }
+
+    #[DataProvider('provideBatchesSplitInPipelines')]
+    public function testAddBatchSplitsPipelines(array $messages, array $pipelines)
+    {
+        $redis = $this->createRedisMock();
+
+        $redis->expects($this->exactly(\count($pipelines)))->method('pipeline')->willReturnSelf();
+        $redis->expects($this->exactly(\count($pipelines)))->method('exec')->willReturnOnConsecutiveCalls(...array_map(static fn (int $commands) => array_fill(0, $commands, '1-0'), $pipelines));
+
+        $connection = Connection::fromDsn('redis://localhost/queue', ['auto_setup' => false], $redis);
+
+        [$ids, $exceptions] = $connection->addBatch($messages);
+
+        $this->assertCount(\count($messages), $ids);
+        $this->assertSame([], $exceptions);
+    }
+
+    public static function provideBatchesSplitInPipelines(): iterable
+    {
+        yield 'by commands' => [array_fill(0, 1001, ['1', [], 0]), [1000, 1]];
+        yield 'by size' => [array_fill(0, 3, [str_repeat('a', 400000), [], 0]), [2, 1]];
+    }
+
+    public function testAddBatchStopsAtTheFirstFailingPipeline()
+    {
+        $redis = $this->createRedisMock();
+
+        $redis->expects($this->exactly(2))->method('pipeline')->willReturnSelf();
+        $redis->expects($this->exactly(2))->method('exec')->willReturnOnConsecutiveCalls(
+            array_fill(0, 1000, '1-0'),
+            $this->throwException($e = new \RedisException('Connection closed')),
+        );
+        $redis->method('getMode')->willReturn(\Redis::PIPELINE);
+        $redis->expects($this->once())->method('discard');
+
+        $connection = Connection::fromDsn('redis://localhost/queue', ['auto_setup' => false], $redis);
+
+        [$ids, $exceptions] = $connection->addBatch(array_fill(0, 2001, ['1', [], 0]));
+
+        $this->assertSame(range(0, 999), array_keys($ids));
+        $this->assertSame(range(1000, 2000), array_keys($exceptions));
+        $this->assertContainsOnlyInstancesOf(TransportException::class, $exceptions);
+        $this->assertSame('Connection closed', $exceptions[1000]->getMessage());
+        $this->assertSame($e, $exceptions[1000]->getPrevious());
+        $this->assertSame($exceptions[1000], $exceptions[2000]);
+    }
+
+    public function testAddBatchReportsPipelinesWithoutResults()
+    {
+        $redis = $this->createRedisMock();
+
+        $redis->expects($this->once())->method('exec')->willReturn(false);
+        $redis->method('getLastError')->willReturn('Connection lost');
+        $redis->expects($this->once())->method('clearLastError');
+
+        $connection = Connection::fromDsn('redis://localhost/queue', ['auto_setup' => false], $redis);
+
+        [$ids, $exceptions] = $connection->addBatch(['a' => ['1', [], 0], 'b' => ['2', [], 0]]);
+
+        $this->assertSame([], $ids);
+        $this->assertSame(['a', 'b'], array_keys($exceptions));
+        $this->assertInstanceOf(TransportException::class, $exceptions['a']);
+        $this->assertSame('Connection lost', $exceptions['a']->getMessage());
+        $this->assertSame($exceptions['a'], $exceptions['b']);
+    }
+
+    public function testAddBatchOnRedisClusterSendsMessagesOneByOne()
+    {
+        $redis = $this->createMock(\RedisCluster::class);
+
+        $redis->expects($this->exactly(2))->method('xadd')->willReturnOnConsecutiveCalls('1-0', $this->throwException($e = new \RedisClusterException('Connection lost')));
+        $redis->expects($this->once())->method('rawCommand')->with('queue__queue', 'ZADD', 'queue__queue', 'NX')->willReturn(1);
+
+        $connection = Connection::fromDsn('redis://localhost/queue', ['auto_setup' => false], $redis);
+
+        [$ids, $exceptions] = $connection->addBatch([
+            'a' => ['1', [], 0],
+            'b' => ['2', [], 100],
+            'c' => ['3', [], 0],
+            'd' => ['4', [], 0],
+        ]);
+
+        $this->assertSame(['a', 'b'], array_keys($ids));
+        $this->assertSame('1-0', $ids['a']);
+        $this->assertSame(['c', 'd'], array_keys($exceptions));
+        $this->assertInstanceOf(TransportException::class, $exceptions['c']);
+        $this->assertSame('Connection lost', $exceptions['c']->getMessage());
+        $this->assertSame($e, $exceptions['c']->getPrevious());
+        $this->assertSame($exceptions['c'], $exceptions['d']);
     }
 }

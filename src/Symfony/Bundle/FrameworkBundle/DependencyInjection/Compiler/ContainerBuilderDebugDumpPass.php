@@ -40,6 +40,7 @@ class ContainerBuilderDebugDumpPass implements CompilerPassInterface
         // the compiler knows which variables are referenced; the dumps below cannot be asked,
         // since the serialized one has its placeholders already resolved
         $container->setParameter('.debug.container.env_vars', array_keys($container->getEnvCounters()));
+        $container->setParameter('.debug.container.inlined_env_vars', $container->getInlinedEnvVars());
 
         $file = $container->getParameter('debug.container.dump');
         $cache = new ConfigCache($file, true);
@@ -68,6 +69,8 @@ class ContainerBuilderDebugDumpPass implements CompilerPassInterface
                 $dump->__construct(new EnvPlaceholderParameterBag($container->resolveEnvPlaceholders($this->escapeParameters($bag->all()))));
             }
 
+            $dump->setParameter('.debug.container.autoconfiguration', $this->escapeParameters(self::getAutoconfiguration($container)));
+
             $fs = new Filesystem();
             $fs->dumpFile($file, serialize($dump));
             $fs->chmod($file, 0o666, umask());
@@ -78,6 +81,30 @@ class ContainerBuilderDebugDumpPass implements CompilerPassInterface
                 @unlink($file);
             }
         }
+    }
+
+    /**
+     * Lists the autoconfiguration rules of a container as strings, since the rules can hold closures that cannot be serialized.
+     *
+     * @return array{instanceof: array<string, array{tags: list<string>, calls: list<string>, bindings: list<string>}>, attributes: list<class-string>}
+     *
+     * @internal
+     */
+    public static function getAutoconfiguration(ContainerBuilder $container): array
+    {
+        $instanceof = [];
+        foreach ($container->getAutoconfiguredInstanceof() as $type => $definition) {
+            $instanceof[$type] = [
+                'tags' => array_keys($definition->getTags()),
+                'calls' => array_column($definition->getMethodCalls(), 0),
+                'bindings' => array_keys($definition->getBindings()),
+            ];
+        }
+
+        return [
+            'instanceof' => $instanceof,
+            'attributes' => array_keys($container->getAttributeAutoconfigurators()),
+        ];
     }
 
     private function resolveEnvPlaceholdersOnCopies(ContainerBuilder $container): bool

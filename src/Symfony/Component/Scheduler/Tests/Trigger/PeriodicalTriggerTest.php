@@ -13,12 +13,16 @@ namespace Symfony\Component\Scheduler\Tests\Trigger;
 
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use Symfony\Component\Clock\Clock;
+use Symfony\Component\Clock\Test\ClockSensitiveTrait;
 use Symfony\Component\Scheduler\Exception\InvalidArgumentException;
 use Symfony\Component\Scheduler\Trigger\PeriodicalTrigger;
 use Symfony\Component\Scheduler\Trigger\TriggerInterface;
 
 class PeriodicalTriggerTest extends TestCase
 {
+    use ClockSensitiveTrait;
+
     #[DataProvider('provideForConstructor')]
     public function testConstructor(PeriodicalTrigger $trigger, bool $optimizable = true)
     {
@@ -171,6 +175,33 @@ class PeriodicalTriggerTest extends TestCase
         yield 'comma-separated weekdays' => ['Monday, Thursday, Saturday', '2024-11-25 15:53:20', '2024-12-31 00:00:00'];
     }
 
+    #[DataProvider('provideRelativeDates')]
+    public function testRelativeDatesAreResolvedWithTheClock(string|int $interval, string $from, string $until, ?\DateTimeImmutable $expected)
+    {
+        self::mockTime('2020-01-01 06:00:00');
+
+        $trigger = new PeriodicalTrigger($interval, $from, $until);
+
+        $this->assertEquals($expected, $trigger->getNextRunDate(new \DateTimeImmutable('2020-01-01 06:00:00')));
+    }
+
+    public static function provideRelativeDates(): iterable
+    {
+        yield 'from now' => [3600, 'now', '+1 day', new \DateTimeImmutable('2020-01-01 07:00:00')];
+        yield 'from a time of day' => ['1 day', '08:00', '3000-01-01', new \DateTimeImmutable('2020-01-01 08:00:00')];
+        yield 'until a relative date' => [3600, '2020-01-01 05:00:00', '+30 minutes', null];
+    }
+
+    public function testRelativeDatesAreReadInTheDefaultTimezone()
+    {
+        self::mockTime(new \DateTimeImmutable('2030-01-01 06:00:00', new \DateTimeZone('Pacific/Kiritimati')));
+
+        $nextRun = (new PeriodicalTrigger(3600, 'now'))->getNextRunDate(Clock::get()->now());
+
+        $this->assertEquals(new \DateTimeImmutable('2030-01-01 07:00:00 Pacific/Kiritimati'), $nextRun);
+        $this->assertSame(date_default_timezone_get(), $nextRun->getTimezone()->getName());
+    }
+
     #[DataProvider('providerGetNextRunDateAgain')]
     public function testGetNextRunDateAgain(PeriodicalTrigger $trigger, \DateTimeImmutable $lastRun, ?\DateTimeImmutable $expected)
     {
@@ -187,7 +218,7 @@ class PeriodicalTriggerTest extends TestCase
 
         yield [
             $trigger,
-            new \DateTimeImmutable('@0'),
+            \DateTimeImmutable::createFromTimestamp(0),
             new \DateTimeImmutable('2020-02-20T02:00:00+02:00'),
         ];
         yield [

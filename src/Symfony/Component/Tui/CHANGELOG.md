@@ -4,6 +4,8 @@ CHANGELOG
 8.2
 ---
 
+ * Add `TerminalInterface::setProgramStatus()` and `TerminalInterface::clearProgramStatus()` to report the status of the program and its tasks with the Program Status Protocol (OSC 7501)
+ * Add `Tui::getWidgetRect()` to know where a widget was drawn, so pointer events can be placed
  * Add `CollapsibleWidget` for collapsible detail/summary panels
  * Add `AbstractWidget::off()` to remove listeners registered with `AbstractWidget::on()`
  * Add `AnsiUtils::walkCells()` to iterate the cells and escape sequences of a rendered line
@@ -11,13 +13,15 @@ CHANGELOG
  * Add `AbstractWidget::postRender()` to post-process a widget's finished lines, chrome included
  * Make `LoopClock` part of the public API
  * Dispatch paste lifecycle events through the terminal event dispatcher
- * Reuse unchanged rendered line segments during differential updates
  * Add `AbstractWidget::attachChild()` and `AbstractWidget::detachChild()` to wire child widgets
  * Add multi-select support to `SelectListWidget`
  * Make `SelectListWidget` wrap option labels and descriptions in aligned columns, and vertically expandable
- * Add the tab widget
- * [BC BREAK] Add `$multiselect` as the third argument of `SelectListWidget::__construct()`, moving `$keybindings` to fourth position
+ * Add `TabsWidget`
+ * Add `$multiselect` as the third argument of `SelectListWidget::__construct()`, moving `$keybindings` to fourth position
  * Add `KeyBindingWidget` to display the keybindings of the focused widget
+ * Add the `super`, `hyper` and `meta` modifiers to key ids, and `Key::super()`
+ * Make a key id naming an unknown modifier match nothing instead of the bare key
+ * Make `Keybindings` throw an `InvalidArgumentException` for a key id that has no key, names an unknown modifier or an unknown key
 
 8.1
 ---

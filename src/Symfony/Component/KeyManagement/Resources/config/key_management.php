@@ -14,9 +14,12 @@ namespace Symfony\Component\DependencyInjection\Loader\Configurator;
 use Symfony\Component\KeyManagement\Bridge\AwsKms\AwsKmsFactory;
 use Symfony\Component\KeyManagement\Bridge\AzureKeyVault\AzureKeyVaultFactory;
 use Symfony\Component\KeyManagement\Bridge\DoctrineOrm\EventListener\BlindIndexListener;
+use Symfony\Component\KeyManagement\Bridge\DoctrineOrm\EventListener\EncryptedColumnListener;
 use Symfony\Component\KeyManagement\Bridge\Flysystem\FlysystemKmsFactory;
 use Symfony\Component\KeyManagement\Bridge\GoogleCloudKms\GoogleCloudKmsFactory;
 use Symfony\Component\KeyManagement\Bridge\HashiCorpVault\TransitKmsFactory;
+use Symfony\Component\KeyManagement\Bridge\Kmip\KmipKmsFactory;
+use Symfony\Component\KeyManagement\Bridge\Scaleway\ScalewayKmsFactory;
 use Symfony\Component\KeyManagement\Factory\FactoryRegistry;
 use Symfony\Component\KeyManagement\Local\OpenSslKmsFactory;
 use Symfony\Component\KeyManagement\Local\SealedBoxKmsFactory;
@@ -66,6 +69,15 @@ return static function (ContainerConfigurator $container) {
             ->tag('key_management.factory')
             ->tag('container.remove_if_missing', ['class' => GoogleCloudKmsFactory::class, 'package' => 'symfony/google-cloud-key-management', 'parent_packages' => ['symfony/key-management']])
 
+        ->set('key_management.factory.scaleway', ScalewayKmsFactory::class)
+            ->args([service('http_client')->nullOnInvalid()])
+            ->tag('key_management.factory')
+            ->tag('container.remove_if_missing', ['class' => ScalewayKmsFactory::class, 'package' => 'symfony/scaleway-key-management', 'parent_packages' => ['symfony/key-management']])
+
+        ->set('key_management.factory.kmip', KmipKmsFactory::class)
+            ->tag('key_management.factory')
+            ->tag('container.remove_if_missing', ['class' => KmipKmsFactory::class, 'package' => 'symfony/kmip-key-management', 'parent_packages' => ['symfony/key-management']])
+
         ->set('serializer.normalizer.key_management_envelope', EnvelopeNormalizer::class)
             ->tag('serializer.normalizer', ['built_in' => true, 'priority' => -880])
             ->tag('container.remove_if_missing', ['class' => DenormalizerInterface::class])
@@ -78,5 +90,20 @@ return static function (ContainerConfigurator $container) {
             ->args([service_locator([])])
             ->tag('doctrine.event_listener', ['event' => 'onFlush'])
             ->tag('container.remove_if_missing', ['class' => BlindIndexListener::class, 'package' => 'symfony/doctrine-orm-key-management', 'parent_packages' => ['symfony/key-management']])
+
+        // kept when the container finds no encrypted column, so that a column it missed is reported instead of being stored in clear
+        ->set('key_management.encrypted_column_listener', EncryptedColumnListener::class)
+            ->args([[]])
+            // after the listeners that rename tables or columns, since the scope of a column that omits its key comes from the final names
+            ->tag('doctrine.event_listener', ['event' => 'loadClassMetadata', 'priority' => -1024])
+            ->tag('container.remove_if_missing', ['class' => EncryptedColumnListener::class, 'package' => 'symfony/doctrine-orm-key-management', 'parent_packages' => ['symfony/key-management']])
+
+        // keeps the types of the columns whose key is omitted, so that finding them loads all the metadata once
+        ->set('cache.key_management.encrypted_columns')
+            ->parent('cache.system')
+            ->private()
+            ->tag('cache.pool')
+            ->tag('container.remove_if_missing', ['service' => 'cache.system'])
+            ->tag('container.remove_if_missing', ['class' => EncryptedColumnListener::class, 'package' => 'symfony/doctrine-orm-key-management', 'parent_packages' => ['symfony/key-management']])
     ;
 };

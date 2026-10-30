@@ -45,8 +45,12 @@ trait LockableTrait
 
     /**
      * Locks a command.
+     *
+     * @param string|null $name     The name of the lock, which defaults to the name of the command
+     * @param bool        $blocking Whether to wait for the lock to be released instead of returning false
+     * @param float|null  $ttl      The maximum expected duration of the command in seconds, after which the lock expires. Null uses the default TTL of the store, 300 seconds for the stores that expire locks. Stores that don't expire locks ignore the TTL
      */
-    private function lock(?string $name = null, bool $blocking = false): bool
+    private function lock(?string $name = null, bool $blocking = false, ?float $ttl = 300.0): bool
     {
         if (!class_exists(SemaphoreStore::class)) {
             throw new LogicException('To enable the locking feature you must install the symfony/lock component. Try running "composer require symfony/lock".');
@@ -69,19 +73,21 @@ trait LockableTrait
         if (!$name) {
             if ($this instanceof Command) {
                 $name = $this->getName();
+            } elseif ($command = InvokableCommand::getRunningCommand($this)) {
+                $name = $command->getName();
             } elseif ($attribute = (new \ReflectionClass($this::class))->getAttributes(AsCommand::class)) {
-                $name = $attribute[0]->newInstance()->name;
+                $name = explode('|', ltrim($attribute[0]->newInstance()->name, '|'), 2)[0];
             } else {
                 throw new LogicException(\sprintf('Lock name missing: provide it via "%s()", #[AsCommand] attribute, or by extending Command class.', __METHOD__));
             }
         }
 
-        $this->lock = $this->lockFactory->createLock($name);
-        if (!$this->lock->acquire($blocking)) {
-            $this->lock = null;
-
+        $lock = $this->lockFactory->createLock($name, $ttl);
+        if (!$lock->acquire($blocking)) {
             return false;
         }
+
+        $this->lock = $lock;
 
         return true;
     }
@@ -91,9 +97,9 @@ trait LockableTrait
      */
     private function release(): void
     {
-        if ($this->lock) {
-            $this->lock->release();
+        if ($lock = $this->lock) {
             $this->lock = null;
+            $lock->release();
         }
     }
 }

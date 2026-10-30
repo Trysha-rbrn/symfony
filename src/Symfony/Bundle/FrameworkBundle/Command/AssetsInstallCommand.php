@@ -13,6 +13,8 @@ namespace Symfony\Bundle\FrameworkBundle\Command;
 
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
+use Symfony\Component\Console\Completion\CompletionInput;
+use Symfony\Component\Console\Completion\CompletionSuggestions;
 use Symfony\Component\Console\Exception\InvalidArgumentException;
 use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
@@ -60,7 +62,7 @@ class AssetsInstallCommand extends Command
                 The <info>%command.name%</info> command installs bundle assets into a given
                 directory (e.g. the <comment>public</comment> directory).
 
-                  <info>php %command.full_name% public</info>
+                  <info>%command.invocation% public</info>
 
                 A "bundles" directory will be created inside the target directory and the
                 "Resources/public" directory of each bundle will be copied into it.
@@ -68,11 +70,11 @@ class AssetsInstallCommand extends Command
                 To create a symlink to each bundle instead of copying its assets, use the
                 <info>--symlink</info> option (will fall back to hard copies when symbolic links aren't possible:
 
-                  <info>php %command.full_name% public --symlink</info>
+                  <info>%command.invocation% public --symlink</info>
 
                 To make symlink relative, add the <info>--relative</info> option:
 
-                  <info>php %command.full_name% public --symlink --relative</info>
+                  <info>%command.invocation% public --symlink --relative</info>
 
                 EOT
             )
@@ -178,6 +180,13 @@ class AssetsInstallCommand extends Command
         }
 
         return $exitCode;
+    }
+
+    public function complete(CompletionInput $input, CompletionSuggestions $suggestions): void
+    {
+        if ($input->mustSuggestArgumentValuesFor('target') && method_exists($suggestions, 'suggestDirectories')) {
+            $suggestions->suggestDirectories();
+        }
     }
 
     /**

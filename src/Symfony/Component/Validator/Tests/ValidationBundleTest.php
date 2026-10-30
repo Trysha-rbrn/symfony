@@ -12,17 +12,24 @@
 namespace Symfony\Component\Validator\Tests;
 
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\TestWith;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
+use Symfony\Component\Clock\MockClock;
 use Symfony\Component\Config\Resource\FileResource;
 use Symfony\Component\DependencyInjection\Argument\ServiceLocatorArgument;
 use Symfony\Component\DependencyInjection\Compiler\MergeExtensionConfigurationPass;
 use Symfony\Component\DependencyInjection\Compiler\RemoveMissingDependenciesPass as ContainerRemoveMissingDependenciesPass;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
+use Symfony\Component\DependencyInjection\Extension\Extension;
+use Symfony\Component\DependencyInjection\Parameter;
 use Symfony\Component\DependencyInjection\ParameterBag\EnvPlaceholderParameterBag;
 use Symfony\Component\DependencyInjection\Reference;
 use Symfony\Component\PropertyInfo\PropertyInfoExtractor;
 use Symfony\Component\Validator\Constraints\Email;
+use Symfony\Component\Validator\Constraints\GreaterThan;
+use Symfony\Component\Validator\Constraints\LessThan;
+use Symfony\Component\Validator\Constraints\Range;
 use Symfony\Component\Validator\DependencyInjection\RemoveMissingDependenciesPass;
 use Symfony\Component\Validator\Tests\Fixtures\NestedAttribute\Entity;
 use Symfony\Component\Validator\ValidationBundle;
@@ -61,7 +68,9 @@ class ValidationBundleTest extends TestCase
         $this->assertSame(['loadValidatorMetadata'], $calls[5][1]);
         $this->assertSame('setMappingCache', $calls[6][0]);
         $this->assertEquals([new Reference('validator.mapping.cache.adapter')], $calls[6][1]);
-        $this->assertCount(7, $calls);
+        $this->assertSame('setSharedMetadataKey', $calls[7][0]);
+        $this->assertEquals([new Parameter('container.build_id')], $calls[7][1]);
+        $this->assertCount(8, $calls);
     }
 
     public function testAttributeMappingCanBeDisabled()
@@ -88,6 +97,12 @@ class ValidationBundleTest extends TestCase
     {
         $this->assertContains('setMappingCache', $this->methodCalls([]));
         $this->assertNotContains('setMappingCache', $this->methodCalls([], debug: true));
+    }
+
+    public function testTheMetadataIsOnlySharedOutsideDebugMode()
+    {
+        $this->assertContains('setSharedMetadataKey', $this->methodCalls([]));
+        $this->assertNotContains('setSharedMetadataKey', $this->methodCalls([], debug: true));
     }
 
     public function testTranslationCanBeDisabled()
@@ -130,6 +145,47 @@ class ValidationBundleTest extends TestCase
 
         $this->assertFalse($definition->getArgument(2));
         $this->assertSame('https://example.com', $definition->getArgument(3));
+    }
+
+    public function testNotCompromisedPasswordIsDisabledWhenFrameworkTestIsEnabled()
+    {
+        $this->assertTrue($this->load([])->getDefinition('validator.not_compromised_password')->getArgument(2));
+        $this->assertTrue($this->load([], framework: ['test' => false])->getDefinition('validator.not_compromised_password')->getArgument(2));
+        $this->assertFalse($this->load([], framework: ['test' => true])->getDefinition('validator.not_compromised_password')->getArgument(2));
+        $this->assertFalse($this->load([], framework: ['test' => null])->getDefinition('validator.not_compromised_password')->getArgument(2));
+        $this->assertFalse($this->load(['not_compromised_password' => ['endpoint' => 'https://example.com']], framework: ['test' => true])->getDefinition('validator.not_compromised_password')->getArgument(2));
+        $this->assertTrue($this->load([], framework: ['test' => '%env(bool:UNDEFINED_FRAMEWORK_TEST)%'])->getDefinition('validator.not_compromised_password')->getArgument(2));
+    }
+
+    #[TestWith(['true', false])]
+    #[TestWith(['false', true])]
+    public function testFrameworkTestSetByAnEnvVarDrivesNotCompromisedPassword(string $env, bool $enabled)
+    {
+        $_ENV['FRAMEWORK_TEST'] = $env;
+
+        try {
+            $container = $this->load([], framework: ['test' => '%env(bool:FRAMEWORK_TEST)%']);
+        } finally {
+            unset($_ENV['FRAMEWORK_TEST']);
+        }
+
+        $this->assertSame($enabled, $container->getDefinition('validator.not_compromised_password')->getArgument(2));
+    }
+
+    #[DataProvider('provideExplicitNotCompromisedPasswordConfigs')]
+    public function testExplicitNotCompromisedPasswordConfigWinsOverFrameworkTest(array $config, bool $enabled)
+    {
+        $this->assertSame($enabled, $this->load($config, framework: ['test' => true])->getDefinition('validator.not_compromised_password')->getArgument(2));
+        $this->assertSame($enabled, $this->load($config, framework: ['test' => false])->getDefinition('validator.not_compromised_password')->getArgument(2));
+    }
+
+    public static function provideExplicitNotCompromisedPasswordConfigs(): iterable
+    {
+        yield 'true' => [['not_compromised_password' => true], true];
+        yield 'null' => [['not_compromised_password' => null], true];
+        yield 'enabled' => [['not_compromised_password' => ['enabled' => true]], true];
+        yield 'false' => [['not_compromised_password' => false], false];
+        yield 'disabled' => [['not_compromised_password' => ['enabled' => false, 'endpoint' => 'https://example.com']], false];
     }
 
     public function testAutoMapping()
@@ -245,6 +301,21 @@ class ValidationBundleTest extends TestCase
         $this->assertInstanceOf(ValidatorInterface::class, $container->get('validator.alias'));
     }
 
+    public function testComparisonAndRangeValidatorsUseTheClock()
+    {
+        $container = $this->load([], merge: false);
+        $container->register('clock', MockClock::class)->setArguments(['2020-01-01 12:00:00']);
+        $container->setAlias('validator.alias', 'validator')->setPublic(true);
+        $container->compile();
+
+        $validator = $container->get('validator.alias');
+        $value = new \DateTimeImmutable('2020-02-01');
+
+        $this->assertCount(0, $validator->validate($value, new Range(min: '+48 hours', max: '+1 year')));
+        $this->assertCount(0, $validator->validate($value, new GreaterThan('+48 hours')));
+        $this->assertCount(0, $validator->validate($value, new LessThan('+1 year')));
+    }
+
     /**
      * @return list<string>
      */
@@ -256,7 +327,7 @@ class ValidationBundleTest extends TestCase
     /**
      * @param array<string, mixed> $config
      */
-    private function load(array $config, bool $debug = false, bool $merge = true, bool $cache = true, bool $profiler = false, ?string $projectDir = null): ContainerBuilder
+    private function load(array $config, bool $debug = false, bool $merge = true, bool $cache = true, bool $profiler = false, ?string $projectDir = null, ?array $framework = null): ContainerBuilder
     {
         $container = new ContainerBuilder(new EnvPlaceholderParameterBag([
             'kernel.debug' => $debug,
@@ -266,6 +337,7 @@ class ValidationBundleTest extends TestCase
             'kernel.enabled_locales' => [],
             'kernel.bundles_metadata' => [],
             'kernel.container_class' => 'TestContainer',
+            'container.build_id' => 'abc123',
         ]));
 
         // what the neighbouring bundles would have registered
@@ -283,6 +355,20 @@ class ValidationBundleTest extends TestCase
         $bundle->build($container);
         $container->registerExtension($bundle->getContainerExtension());
         $container->loadFromExtension('validation', $config);
+
+        if (null !== $framework) {
+            $container->registerExtension(new class extends Extension {
+                public function load(array $configs, ContainerBuilder $container): void
+                {
+                }
+
+                public function getAlias(): string
+                {
+                    return 'framework';
+                }
+            });
+            $container->loadFromExtension('framework', $framework);
+        }
 
         if (!$merge) {
             // the caller compiles, which runs the passes build() registered

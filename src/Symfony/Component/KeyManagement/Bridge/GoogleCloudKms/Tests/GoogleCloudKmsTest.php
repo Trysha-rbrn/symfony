@@ -24,7 +24,6 @@ use Symfony\Component\KeyManagement\Exception\DecryptionFailedException;
 use Symfony\Component\KeyManagement\Exception\InvalidArgumentException;
 use Symfony\Component\KeyManagement\Exception\KeyNotFoundException;
 use Symfony\Component\KeyManagement\Exception\RuntimeException;
-use Symfony\Component\KeyManagement\Exception\UnsupportedOperationException;
 
 class GoogleCloudKmsTest extends TestCase
 {
@@ -430,14 +429,6 @@ class GoogleCloudKmsTest extends TestCase
         $this->assertSame(base64_encode('tenant=acme'), $captured['additionalAuthenticatedData']);
     }
 
-    public function testEncryptRejectsDeterministic()
-    {
-        $kms = new GoogleCloudKms(new MockHttpClient([], self::BASE), $this->staticToken('T'));
-
-        $this->expectException(UnsupportedOperationException::class);
-        $kms->encrypt(self::KEY, 'hello', deterministic: true);
-    }
-
     public function testDecryptDecodesPlaintext()
     {
         $client = new MockHttpClient(
@@ -541,6 +532,20 @@ class GoogleCloudKmsTest extends TestCase
         }
     }
 
+    public function testRedirectsAreNotFollowed()
+    {
+        $response = new MockResponse('', ['http_code' => 307, 'response_headers' => ['location' => 'https://elsewhere.example.com/']]);
+        $client = (new MockHttpClient($response, self::BASE))->withOptions(['max_redirects' => 20]);
+
+        try {
+            (new GoogleCloudKms($client, $this->staticToken('T')))->encrypt(self::KEY, 'hello');
+            $this->fail('A RuntimeException should have been thrown.');
+        } catch (RuntimeException) {
+        }
+
+        $this->assertSame(0, $response->getRequestOptions()['max_redirects']);
+    }
+
     public function testGenerateDataKeyDrawsLocallyAndCallsEncrypt()
     {
         $captured = null;
@@ -565,6 +570,22 @@ class GoogleCloudKmsTest extends TestCase
 
         $this->expectException(InvalidArgumentException::class);
         $kms->generateDataKey(self::KEY, 8);
+    }
+
+    public function testWrapDataKeyCallsEncrypt()
+    {
+        $captured = null;
+        $client = new MockHttpClient(static function ($method, $url, array $options) use (&$captured): MockResponse {
+            $captured = [$url, json_decode($options['body'], true)];
+
+            return new MockResponse(json_encode(['ciphertext' => 'WrappedDek']));
+        }, self::BASE);
+
+        $wrapped = (new GoogleCloudKms($client, $this->staticToken('T')))->wrapDataKey(self::KEY, str_repeat("\xAB", 32), 'tenant=acme');
+
+        $this->assertSame([self::BASE.self::KEY.':encrypt', ['plaintext' => base64_encode(str_repeat("\xAB", 32)), 'additionalAuthenticatedData' => base64_encode('tenant=acme')]], $captured);
+        $this->assertSame(self::KEY, $wrapped->keyId);
+        $this->assertSame('WrappedDek', $wrapped->blob);
     }
 
     public function testUnwrapDataKeyDecodesPlaintext()

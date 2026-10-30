@@ -37,6 +37,7 @@ class Parser
     private array $names;
     private int $flags = 0;
     private int $nestingLevel = 0;
+    private array $variables = [];
 
     public function __construct(
         private array $functions,
@@ -132,10 +133,16 @@ class Parser
         $this->stream = $stream;
         $this->names = $names;
         $this->nestingLevel = 0;
+        $this->variables = [];
 
         $node = $this->parseExpression();
         if (!$stream->isEOF()) {
             throw new SyntaxError(\sprintf('Unexpected token "%s" of value "%s".', $stream->current->type, $stream->current->value), $stream->current->cursor, $stream->getExpression());
+        }
+
+        // a node tree is at most one level deeper than its number of tokens
+        if (self::MAX_NESTING_LEVEL <= \strlen($stream->getExpression())) {
+            $this->checkDepth($node);
         }
 
         unset($this->stream, $this->names);
@@ -163,6 +170,8 @@ class Parser
             }
 
             if (0 === $precedence) {
+                $this->nestingLevel = $nestingLevel + 1;
+
                 return $this->parseConditionalExpression($expr);
             }
 
@@ -253,8 +262,14 @@ class Parser
                                 throw new SyntaxError(\sprintf('The function "%s" does not exist.', $token->value), $token->cursor, $this->stream->getExpression(), $token->value, array_keys($this->functions));
                             }
 
+                            if (isset($this->functions[$token->value]['deprecation'])) {
+                                trigger_deprecation(...$this->functions[$token->value]['deprecation']);
+                            }
+
                             $node = new Node\FunctionNode($token->value, $this->parseArguments());
                         } else {
+                            $this->variables[$token->value] ??= $this->stream->current->test(Token::PUNCTUATION_TYPE, '??') ? null : $token->cursor;
+
                             if (!($this->flags & self::IGNORE_UNKNOWN_VARIABLES)) {
                                 if (!\in_array($token->value, $this->names, true)) {
                                     if ($this->stream->current->test(Token::PUNCTUATION_TYPE, '??')) {
@@ -456,10 +471,23 @@ class Parser
     }
 
     /**
+     * Returns the variables read by the last parsed expression.
+     *
+     * Each name maps to the position where the expression first reads it without "??", or to null when "??" guards every read.
+     *
+     * @return array<string, int|null>
+     *
+     * @internal
+     */
+    public function getVariables(): array
+    {
+        return $this->variables;
+    }
+
+    /**
      * Accounts for one more node on the branch being built.
      *
-     * The nesting level bounds the depth of the resulting node tree. Beyond a few
-     * thousand levels, destroying such a tree overflows the native stack.
+     * The nesting level bounds the recursion of the parser.
      *
      * @throws SyntaxError
      */
@@ -467,6 +495,31 @@ class Parser
     {
         if (self::MAX_NESTING_LEVEL < ++$this->nestingLevel) {
             throw new SyntaxError(\sprintf('Expression is nested too deeply, the maximum nesting level is %d', self::MAX_NESTING_LEVEL), $this->stream->current->cursor, $this->stream->getExpression());
+        }
+    }
+
+    /**
+     * Bounds the depth of the resulting node tree.
+     *
+     * Beyond a few thousand levels, serializing or destroying such a tree overflows the native stack.
+     * The nesting level is not enough: it misses the levels that a chain of binary operators or of property accesses adds above its first operand, as in "((a + b + c) + d + e)".
+     *
+     * @throws SyntaxError
+     */
+    private function checkDepth(Node\Node $node): void
+    {
+        $nodes = [[$node, 1]];
+
+        while ($nodes) {
+            [$node, $depth] = array_pop($nodes);
+
+            if (self::MAX_NESTING_LEVEL < $depth) {
+                throw new SyntaxError(\sprintf('Expression is nested too deeply, the maximum nesting level is %d', self::MAX_NESTING_LEVEL), $this->stream->current->cursor, $this->stream->getExpression());
+            }
+
+            foreach ($node->nodes as $child) {
+                $nodes[] = [$child, $depth + 1];
+            }
         }
     }
 }

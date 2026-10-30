@@ -157,7 +157,7 @@ class BoundsTypeTest extends BaseTypeTestCase
     public function testACompoundInnerTypeDoesNotBubbleItsErrorsToTheRange()
     {
         // FormType bubbles the errors of a compound form by default, which would move them
-        // to the range, where "bounds_row" does not render them
+        // to the range, away from the bound they are about
         $form = $this->factory->create(static::TESTED_TYPE, null, [
             'type' => FormType::class,
         ]);
@@ -310,6 +310,40 @@ class BoundsTypeTest extends BaseTypeTestCase
         $this->assertNull($form->getData());
         $this->assertNull($form->getNormData());
         $this->assertNull($form->getViewData());
+    }
+
+    public function testSubmitEmptyBoundsKeepsTheObject()
+    {
+        $range = new BoundsTypeRange(1, 9);
+        $form = $this->factory->create(static::TESTED_TYPE, $range, [
+            'type' => IntegerType::class,
+            'data_class' => BoundsTypeRange::class,
+        ]);
+        $form->submit(['from' => '', 'to' => '']);
+
+        $this->assertSame($range, $form->getData());
+        $this->assertNull($range->from);
+        $this->assertNull($range->to);
+    }
+
+    public function testSubmitEmptyBoundsFollowsTheEmptyDataOfTheDataClass()
+    {
+        $form = $this->factory->create(static::TESTED_TYPE, null, [
+            'type' => IntegerType::class,
+            'data_class' => BoundsTypeRange::class,
+        ]);
+        $form->submit(['from' => '', 'to' => '']);
+
+        $this->assertEquals(new BoundsTypeRange(), $form->getData());
+
+        $form = $this->factory->create(static::TESTED_TYPE, null, [
+            'type' => IntegerType::class,
+            'data_class' => BoundsTypeRange::class,
+            'required' => false,
+        ]);
+        $form->submit(['from' => '', 'to' => '']);
+
+        $this->assertNull($form->getData());
     }
 
     public function testSubmitHalfOpenRangeIsKept()

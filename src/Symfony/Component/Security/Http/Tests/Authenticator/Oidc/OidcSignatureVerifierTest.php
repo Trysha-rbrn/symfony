@@ -16,6 +16,7 @@ use Jose\Component\Core\JWK;
 use Jose\Component\Signature\Algorithm\ES256;
 use Jose\Component\Signature\JWSBuilder;
 use Jose\Component\Signature\Serializer\CompactSerializer;
+use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\RequiresPhpExtension;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
@@ -27,6 +28,7 @@ use Symfony\Component\Security\Core\Exception\AuthenticationException;
 use Symfony\Component\Security\Http\Authenticator\Oidc\OidcSignatureVerifier;
 use Symfony\Component\Security\Http\Oidc\OidcDiscovery;
 use Symfony\Contracts\Cache\CacheInterface;
+use Symfony\Contracts\Cache\ItemInterface;
 use Symfony\Contracts\HttpClient\HttpClientInterface;
 
 #[RequiresPhpExtension('openssl')]
@@ -283,6 +285,18 @@ class OidcSignatureVerifierTest extends TestCase
         $this->assertSame(1, $requests);
     }
 
+    public function testVerifyCachesTheProviderKeysUntilTheirExpiresOnTheClock()
+    {
+        $item = $this->createMock(ItemInterface::class);
+        $item->expects($this->once())->method('expiresAfter')->with(600);
+        $cache = $this->createStub(CacheInterface::class);
+        $cache->method('get')->willReturnCallback(static fn (string $key, callable $callback) => $callback($item));
+        $httpClient = new MockHttpClient(new JsonMockResponse(['keys' => [self::PUBLIC_JWK]], ['response_headers' => ['Expires' => 'Sat, 01 Jan 2000 00:10:00 GMT']]));
+        $verifier = $this->createVerifier(httpClient: $httpClient, clock: new MockClock('2000-01-01 00:00:00 UTC'), jwksCache: $cache);
+
+        $this->assertSame(['sub' => 'user-42'], $verifier->verify($this->buildJws(json_encode(['sub' => 'user-42']))));
+    }
+
     public function testVerifyRefetchesTheKeysWhenTheTokenAnnouncesAnUnknownKid()
     {
         // the JWKS is cached before the provider rotated its keys, the next one holds the new key
@@ -293,6 +307,21 @@ class OidcSignatureVerifierTest extends TestCase
         $this->warmTheJwksCache($verifier);
 
         $clock->sleep(120);
+        $claims = $verifier->verify($this->buildJws(json_encode(['sub' => 'user-42']), 'rotated-key'));
+
+        $this->assertSame(['sub' => 'user-42'], $claims);
+    }
+
+    #[Group('time-sensitive')]
+    public function testVerifyRefetchesTheKeysAfterTheCooldownWithoutAClock()
+    {
+        $verifier = $this->createVerifier(jwks: [
+            ['keys' => [self::FOREIGN_JWK]],
+            ['keys' => [['kid' => 'rotated-key'] + self::PUBLIC_JWK]],
+        ]);
+        $this->warmTheJwksCache($verifier);
+
+        sleep(120);
         $claims = $verifier->verify($this->buildJws(json_encode(['sub' => 'user-42']), 'rotated-key'));
 
         $this->assertSame(['sub' => 'user-42'], $claims);
@@ -353,7 +382,7 @@ class OidcSignatureVerifierTest extends TestCase
             $algorithms,
             3600,
             $enforceKeyUsageVerification,
-            clock: $clock ?? new MockClock(),
+            clock: $clock,
         );
     }
 

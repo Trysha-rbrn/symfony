@@ -426,11 +426,11 @@ class DebugClassLoader
 
         $parent = get_parent_class($class) ?: null;
         self::$returnTypes[$class] = [];
-        $classIsTemplate = false;
+        $classTemplates = [];
 
         // Detect annotations on the class
-        if ($doc = $this->parsePhpDoc($refl)) {
-            $classIsTemplate = isset($doc['template']) || isset($doc['template-covariant']);
+        if ($doc = $this->parsePhpDoc($refl, ['@final', '@deprecated', '@internal', '@template', '@method'])) {
+            $classTemplates = [...$doc['template'] ?? [], ...$doc['template-covariant'] ?? []];
 
             foreach (['final', 'deprecated', 'internal'] as $annotation) {
                 if (null !== $description = $doc[$annotation][0] ?? null) {
@@ -456,7 +456,7 @@ class DebugClassLoader
                     self::$method[$class][] = [$class, $static, $returnType, $name.$signature, $description];
 
                     if ('' !== $returnType) {
-                        $this->setReturnType($returnType, $refl->name, $name, $refl->getFileName(), $parent);
+                        $this->setReturnType($returnType, $refl->name, $name, $refl->getFileName(), $parent, null, $classTemplates);
                     }
                 }
             }
@@ -540,6 +540,8 @@ class DebugClassLoader
                 }
             }
 
+            $this->checkAttributes($refl, $class, $deprecations);
+
             return $deprecations;
         }
 
@@ -592,10 +594,13 @@ class DebugClassLoader
                 }
             }
 
-            // To read method annotations
-            $doc = $this->parsePhpDoc($method);
+            $forcePatchTypes = $this->patchTypes['force'];
 
-            if (($classIsTemplate || isset($doc['template']) || isset($doc['template-covariant'])) && $method->hasReturnType()) {
+            // To read method annotations
+            $doc = null !== $forcePatchTypes || $this->isPhpDocNeeded($method, $class) ? $this->parsePhpDoc($method) : [];
+            $templates = isset($doc['template']) || isset($doc['template-covariant']) ? [...$classTemplates, ...$doc['template'] ?? [], ...$doc['template-covariant'] ?? []] : $classTemplates;
+
+            if ($templates && $method->hasReturnType()) {
                 unset($doc['return']);
             }
 
@@ -611,8 +616,6 @@ class DebugClassLoader
                     }
                 }
             }
-
-            $forcePatchTypes = $this->patchTypes['force'];
 
             if ($canAddReturnType = null !== $forcePatchTypes && !str_contains($method->getFileName(), \DIRECTORY_SEPARATOR.'vendor'.\DIRECTORY_SEPARATOR)) {
                 $this->patchTypes['force'] = $forcePatchTypes ?: 'docblock';
@@ -654,8 +657,8 @@ class DebugClassLoader
                 continue;
             }
 
-            if (isset($doc['return'])) {
-                $this->setReturnType($doc['return'] ?? self::MAGIC_METHODS[$method->name], $method->class, $method->name, $method->getFileName(), $parent, $method->getReturnType());
+            if (isset($doc['return']) && (null !== $forcePatchTypes || !$method->hasReturnType())) {
+                $this->setReturnType($doc['return'] ?? self::MAGIC_METHODS[$method->name], $method->class, $method->name, $method->getFileName(), $parent, $method->getReturnType(), $templates);
 
                 if (isset(self::$returnTypes[$class][$method->name][0]) && $canAddReturnType) {
                     $this->fixReturnStatements($method, self::$returnTypes[$class][$method->name][0]);
@@ -707,7 +710,7 @@ class DebugClassLoader
                     continue;
                 }
 
-                $doc = $this->parsePhpDoc($r);
+                $doc = $this->parsePhpDoc($r, ['@final', '@deprecated']);
 
                 foreach ($parentAndOwnInterfaces as $use) {
                     if (isset(self::${$type}[$use][$r->name]) && !isset($doc['deprecated']) && ('finalConstants' === $type || substr($use, 0, strrpos($use, '\\')) !== substr($use, 0, strrpos($class, '\\')))) {
@@ -721,6 +724,8 @@ class DebugClassLoader
                 }
             }
         }
+
+        $this->checkAttributes($refl, $class, $deprecations);
 
         return $deprecations;
     }
@@ -910,7 +915,7 @@ class DebugClassLoader
         return self::$vendorPrefixCache[$class] = substr($lookupKey, 0, $sep);
     }
 
-    private function setReturnType(string $types, string $class, string $method, string $filename, ?string $parent, ?\ReflectionType $returnType = null): void
+    private function setReturnType(string $types, string $class, string $method, string $filename, ?string $parent, ?\ReflectionType $returnType = null, array $templates = []): void
     {
         if ('__construct' === $method) {
             return;
@@ -931,6 +936,18 @@ class DebugClassLoader
         $typesMap = [];
         $glue = str_contains($types, '&') ? '&' : '|';
         foreach (explode($glue, $types) as $t) {
+            if (\in_array($t, $templates, true)) {
+                // there is no native type for a template, but $class remains the declaring class for its child classes
+                if (isset(self::$returnTypes[$class][$method])) {
+                    self::$returnTypes[$class][$method][2] = $class;
+                } else {
+                    // a null entry hides the types that child classes get from their own interfaces
+                    self::$returnTypes[$class][$method] = null;
+                }
+
+                return;
+            }
+
             $t = self::SPECIAL_RETURN_TYPES[strtolower($t)] ?? $t;
             $typesMap[$this->normalizeType($t, $class, $parent, $returnType)][$t] = $t;
         }
@@ -1303,11 +1320,65 @@ class DebugClassLoader
     }
 
     /**
-     * @param \ReflectionClass|\ReflectionMethod|\ReflectionProperty $reflector
+     * Tells whether the docblock of a method can trigger a deprecation when types are not patched.
+     *
+     * The "@return" tag of a method that has a native return type does not matter. PHP requires a return type on the methods that override it.
      */
-    private function parsePhpDoc(\Reflector $reflector): array
+    private function isPhpDocNeeded(\ReflectionMethod $method, string $class): bool
+    {
+        if ($method->isPrivate() || !$doc = $method->getDocComment()) {
+            return false;
+        }
+
+        if (str_contains($doc, '@final') || str_contains($doc, '@internal')) {
+            return true;
+        }
+
+        if (!$method->hasReturnType() && (str_contains($doc, '@return') || str_contains($doc, '@deprecated'))) {
+            return true;
+        }
+
+        if (!str_contains($doc, '@param') || !preg_match_all('/\$(\S*+)/', $doc, $matches)) {
+            return false;
+        }
+
+        if (isset(self::$annotatedParameters[$class][$method->name])) {
+            return true;
+        }
+
+        $parameters = [];
+        foreach ($method->getParameters() as $parameter) {
+            $parameters[$parameter->name] = true;
+        }
+
+        // Parsing is needed only when a "@param" tag is about a parameter that the method does not declare
+        foreach ($matches[1] as $name) {
+            if (!isset($parameters[$name])) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * @param \ReflectionClass|\ReflectionClassConstant|\ReflectionMethod|\ReflectionProperty $reflector
+     * @param list<string>                                                                    $tags      The tags that make parsing worth it, or an empty list to always parse
+     */
+    private function parsePhpDoc(\Reflector $reflector, array $tags = []): array
     {
         if (!$doc = $reflector->getDocComment()) {
+            return [];
+        }
+
+        foreach ($tags as $tag) {
+            if (str_contains($doc, $tag)) {
+                $tags = [];
+                break;
+            }
+        }
+
+        if ($tags) {
             return [];
         }
 
@@ -1402,6 +1473,12 @@ class DebugClassLoader
             $tags['param'][$param] = $type;
         }
 
+        foreach (['template', 'template-covariant'] as $k) {
+            if ($templates = [...$tags[$k] ?? [], ...$tags['phpstan-'.$k] ?? [], ...$tags['psalm-'.$k] ?? []]) {
+                $tags[$k] = array_map(static fn ($v) => substr($v, 0, strpos($v, ' ') ?: \strlen($v)), $templates);
+            }
+        }
+
         foreach (['var', 'return'] as $k) {
             if (null === $v = $tags[$k][0] ?? null) {
                 continue;
@@ -1414,5 +1491,97 @@ class DebugClassLoader
         }
 
         return $tags;
+    }
+
+    /**
+     * Reports the attributes that resolve to a missing class in the namespace of the class using them, or below it.
+     *
+     * This is where PHP puts an unqualified or a relative attribute name when its "use" statement is missing.
+     * Attributes of other namespaces are left alone: using an attribute whose class is not available is by design.
+     */
+    private function checkAttributes(\ReflectionClass $refl, string $class, array &$deprecations): void
+    {
+        // Anonymous classes carry a file path instead of a namespace, and the root namespace matches every vendor.
+        if ($refl->isAnonymous() || false === $sep = strrpos($class, '\\')) {
+            return;
+        }
+
+        $namespace = substr($class, 0, 1 + $sep);
+
+        // The attributes a trait brings in are reported when the trait itself is checked, not for each class using it.
+        // Constants and properties do not tell which trait they come from, so they are matched by name and attribute.
+        $fromTraits = [];
+        foreach ($refl->getTraits() as $trait) {
+            foreach ($trait->getReflectionConstants() as $constant) {
+                foreach ($constant->getAttributes() as $attribute) {
+                    $fromTraits[$constant->name][$attribute->getName()] = true;
+                }
+            }
+            foreach ($trait->getProperties() as $property) {
+                foreach ($property->getAttributes() as $attribute) {
+                    $fromTraits['$'.$property->name][$attribute->getName()] = true;
+                }
+            }
+        }
+
+        $this->collectMissingAttributes($refl, $namespace, $class, $deprecations);
+
+        foreach ($refl->getReflectionConstants() as $constant) {
+            if ($constant->getDeclaringClass()->name === $class) {
+                $this->collectMissingAttributes($constant, $namespace, $class.'::'.$constant->name, $deprecations, $fromTraits[$constant->name] ?? []);
+            }
+        }
+
+        foreach ($refl->getProperties() as $property) {
+            // The attributes of a promoted property are the ones of the constructor parameter declaring it.
+            if ($property->class === $class && !$property->isPromoted()) {
+                $this->collectMissingAttributes($property, $namespace, $class.'::$'.$property->name, $deprecations, $fromTraits['$'.$property->name] ?? []);
+            }
+        }
+
+        foreach ($refl->getMethods() as $method) {
+            // Methods keep the file and line of the trait they come from, aliased or not.
+            if ($method->class !== $class || $class !== (self::$methodTraits[$method->getFileName()][$method->getStartLine()] ?? $class)) {
+                continue;
+            }
+
+            $this->collectMissingAttributes($method, $namespace, $class.'::'.$method->name.'()', $deprecations);
+
+            foreach ($method->getParameters() as $parameter) {
+                $this->collectMissingAttributes($parameter, $namespace, $class.'::'.$method->name.'($'.$parameter->name.')', $deprecations);
+            }
+        }
+    }
+
+    /**
+     * @param array<string, true> $fromTrait The attributes a trait declares on the same member, which it reports itself
+     */
+    private function collectMissingAttributes(\ReflectionClass|\ReflectionClassConstant|\ReflectionMethod|\ReflectionParameter|\ReflectionProperty $reflector, string $namespace, string $target, array &$deprecations, array $fromTrait = []): void
+    {
+        foreach ($reflector->getAttributes() as $attribute) {
+            $name = $attribute->getName();
+
+            // Only the namespace of the declaring class and below, so that the autoloader is not asked for third-party attributes.
+            if (isset($fromTrait[$name]) || !str_starts_with($name, $namespace)) {
+                continue;
+            }
+
+            try {
+                if (class_exists($name)) {
+                    continue;
+                }
+            } catch (\Error $e) {
+                // A plain \Error is a missing parent, interface or trait, which is fine as long as the attribute is not instantiated
+                if (\Error::class !== $e::class) {
+                    throw $e;
+                }
+
+                $deprecations[] = \sprintf('Attribute "%s" used on "%s" cannot be loaded: %s', $name, $target, $e->getMessage());
+
+                continue;
+            }
+
+            $deprecations[] = \sprintf('Attribute "%s" used on "%s" does not exist. Did you forget a "use" statement?', $name, $target);
+        }
     }
 }

@@ -15,7 +15,9 @@ use Psr\Clock\ClockInterface;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Exception\LogicException;
 use Symfony\Component\Messenger\Stamp\DelayStamp;
+use Symfony\Component\Messenger\Stamp\ReceivedStamp;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
+use Symfony\Component\Messenger\Stamp\TrustStamp;
 use Symfony\Component\Messenger\Transport\Receiver\ListableReceiverInterface;
 use Symfony\Component\Messenger\Transport\Receiver\MessageCountAwareInterface;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
@@ -65,10 +67,10 @@ class InMemoryTransport implements TransportInterface, ListableReceiverInterface
     {
         $fetchSize = \func_num_args() > 0 ? max(1, func_get_arg(0)) : 1;
         $envelopes = [];
-        $now = $this->clock?->now() ?? new \DateTimeImmutable();
-        foreach ($this->decodeQueue($this->queue) as $id => $envelope) {
+        $now = $this->clock?->now() ?? \DateTimeImmutable::createFromTimestamp(microtime(true));
+        foreach ($this->queue as $id => $encodedEnvelope) {
             if (!isset($this->availableAt[$id]) || $now > $this->availableAt[$id]) {
-                $envelopes[] = $envelope;
+                $envelopes[] = $this->decodeQueue([$id => $encodedEnvelope])[$id];
                 if (\count($envelopes) >= $fetchSize) {
                     break;
                 }
@@ -130,11 +132,17 @@ class InMemoryTransport implements TransportInterface, ListableReceiverInterface
         $envelope = $envelope->with(new TransportMessageIdStamp($id));
         $encodedEnvelope = $this->encode($envelope);
         $this->sent[] = $encodedEnvelope;
+
+        if (null === $this->serializer && !$envelope->last(TrustStamp::class) && !$envelope->last(ReceivedStamp::class)) {
+            // the envelope is handed back as is: a ReceivedStamp must not hide that it was dispatched in this process
+            $encodedEnvelope = $envelope = $envelope->with(TrustStamp::trusted());
+        }
+
         $this->queue[$id] = $encodedEnvelope;
 
         /** @var DelayStamp|null $delayStamp */
         if ($delayStamp = $envelope->last(DelayStamp::class)) {
-            $now = $this->clock?->now() ?? new \DateTimeImmutable();
+            $now = $this->clock?->now() ?? \DateTimeImmutable::createFromTimestamp(microtime(true));
             $this->availableAt[$id] = $now->setTimezone(new \DateTimeZone('UTC'))->modify(\sprintf('+%d milliseconds', $delayStamp->getDelay()));
         }
 

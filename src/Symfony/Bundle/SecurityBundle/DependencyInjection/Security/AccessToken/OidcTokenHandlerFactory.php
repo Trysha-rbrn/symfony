@@ -38,6 +38,7 @@ class OidcTokenHandlerFactory implements TokenHandlerFactoryInterface
         $audience = [0] === array_keys($config['audience']) ? $config['audience'][0] : $config['audience'];
 
         $tokenHandlerDefinition = $container->setDefinition($id, (new ChildDefinition('security.access_token_handler.oidc'))
+            ->setLazy(true)
             ->replaceArgument(2, $audience)
             ->replaceArgument(3, $config['issuers'])
             ->replaceArgument(4, $config['claim'])
@@ -61,10 +62,18 @@ class OidcTokenHandlerFactory implements TokenHandlerFactoryInterface
             // disable JWKSet argument
             $tokenHandlerDefinition->replaceArgument(1, null);
 
+            $checkIssuer = $config['discovery']['check_issuer'] ?? null;
             $clients = [];
             foreach ($config['discovery']['base_uri'] as $uri) {
-                $clients[] = (new ChildDefinition('security.access_token_handler.oidc_discovery.http_client'))
+                $client = (new ChildDefinition('security.access_token_handler.oidc_discovery.http_client'))
                     ->replaceArgument(0, ['base_uri' => $uri]);
+
+                if (null === $checkIssuer) {
+                    $clients[] = $client;
+                } else {
+                    // OIDC Discovery 1.0 §4.1 builds the discovery URL by appending the well-known path to the issuer
+                    $clients[$checkIssuer[$uri] ?? $uri] = $client;
+                }
             }
 
             $tokenHandlerDefinition->addMethodCall('enableDiscovery', [
@@ -106,6 +115,7 @@ class OidcTokenHandlerFactory implements TokenHandlerFactoryInterface
         if (!$container->hasDefinition('security.access_token_handler.oidc.command.generate')) {
             $container
                 ->register('security.access_token_handler.oidc.command.generate', OidcTokenGenerateCommand::class)
+                ->setArguments([new Reference('clock')])
                 ->addTag('console.command')
             ;
         }
@@ -139,21 +149,50 @@ class OidcTokenHandlerFactory implements TokenHandlerFactoryInterface
                     ->ifTrue(static fn ($v) => !isset($v['discovery']) && !isset($v['keyset']))
                     ->thenInvalid('You must set either "discovery" or "keyset".')
                 ->end()
+                ->validate()
+                    ->ifTrue(static fn ($v) => !isset($v['discovery']) && !$v['issuers'])
+                    ->thenInvalid('You must set "issuers" when "discovery" is not set.')
+                ->end()
                 ->children()
                     ->arrayNode('discovery')
                         ->info('Enable the OIDC discovery.')
+                        ->validate()
+                            ->always(static function (array $v): array {
+                                if (!isset($v['check_issuer'])) {
+                                    return $v;
+                                }
+
+                                if ($unknown = array_diff(array_keys($v['check_issuer']), $v['base_uri'])) {
+                                    throw new \InvalidArgumentException(\sprintf('The "check_issuer" option lists "%s", which is not a "base_uri".', implode('", "', $unknown)));
+                                }
+
+                                $issuers = [];
+                                foreach ($v['base_uri'] as $uri) {
+                                    $issuer = $v['check_issuer'][$uri] ?? $uri;
+
+                                    if (isset($issuers[$key = rtrim($issuer, '/')])) {
+                                        throw new \InvalidArgumentException(\sprintf('The "check_issuer" option expects the issuer "%s" from more than one "base_uri".', $issuer));
+                                    }
+
+                                    $issuers[$key] = true;
+                                }
+
+                                return $v;
+                            })
+                        ->end()
                         ->children()
                             ->arrayNode('base_uri')
                                 ->acceptAndWrap(['string'])
-                                ->info('Base URI of the OIDC server.')
+                                ->info('Base URI of the OIDC server, e.g. "https://example.com/realms/demo/". The discovery path is resolved against it as a relative URL, so it must end with a slash when it has a path.')
                                 ->isRequired()
                                 ->scalarPrototype()->end()
                             ->end()
                             ->arrayNode('cache')
+                                ->addDefaultsIfNotSet()
                                 ->children()
                                     ->scalarNode('id')
                                         ->info('Cache service id to use to cache the OIDC discovery configuration.')
-                                        ->isRequired()
+                                        ->defaultValue('cache.security.discovery')
                                         ->cannotBeEmpty()
                                     ->end()
                                 ->end()
@@ -161,6 +200,16 @@ class OidcTokenHandlerFactory implements TokenHandlerFactoryInterface
                             ->booleanNode('enforce_key_usage_verification')
                                 ->info('When enabled (default), only keys explicitly designated for signature (via "use":"sig" or a "key_ops" entry containing "sign"/"verify") are accepted. When disabled, keys without any usage designation are also accepted; keys explicitly restricted to encryption are still rejected.')
                                 ->defaultTrue()
+                            ->end()
+                            ->arrayNode('check_issuer')
+                                ->info('Whether the discovery document of each "base_uri" must announce that URL as its issuer, a trailing slash aside, so that its keys only verify the tokens of that issuer. A map from "base_uri" to issuer turns the check on and expects the given issuer from the listed ones instead.')
+                                ->useAttributeAsKey('base_uri')
+                                ->normalizeKeys(false)
+                                ->canBeUnset()
+                                ->defaultNull()
+                                ->treatNullLike(false)
+                                ->beforeNormalization()->ifTrue()->then(static fn () => [])->end()
+                                ->stringPrototype()->cannotBeEmpty()->end()
                             ->end()
                         ->end()
                     ->end()
@@ -176,8 +225,7 @@ class OidcTokenHandlerFactory implements TokenHandlerFactoryInterface
                         ->scalarPrototype()->cannotBeEmpty()->end()
                     ->end()
                     ->arrayNode('issuers', 'issuer')
-                        ->info('Issuers allowed to generate the token, for validation purpose.')
-                        ->isRequired()
+                        ->info('Issuers allowed to generate the token, for validation purpose. When "discovery" is set, defaults to the issuers that the discovery documents announce.')
                         ->scalarPrototype()->end()
                     ->end()
                     ->arrayNode('algorithms', 'algorithm')

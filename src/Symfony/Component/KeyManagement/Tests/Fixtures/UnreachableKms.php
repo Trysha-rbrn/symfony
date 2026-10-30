@@ -36,7 +36,7 @@ final class UnreachableKms implements DataKeyGeneratorInterface, DecrypterInterf
     ) {
     }
 
-    public function encrypt(string $keyId, #[\SensitiveParameter] string $plaintext, string $aad = '', bool $deterministic = false): Ciphertext
+    public function encrypt(string $keyId, #[\SensitiveParameter] string $plaintext, string $aad = ''): Ciphertext
     {
         throw null !== $this->failure ? ($this->failure)() : new \RuntimeException('The backend is down.');
     }
@@ -47,6 +47,11 @@ final class UnreachableKms implements DataKeyGeneratorInterface, DecrypterInterf
     }
 
     public function generateDataKey(string $keyId, int $length = 32, string $aad = ''): DataKey
+    {
+        throw null !== $this->failure ? ($this->failure)() : new \RuntimeException('The backend is down.');
+    }
+
+    public function wrapDataKey(string $keyId, #[\SensitiveParameter] string $dataKey, string $aad = ''): Ciphertext
     {
         throw null !== $this->failure ? ($this->failure)() : new \RuntimeException('The backend is down.');
     }

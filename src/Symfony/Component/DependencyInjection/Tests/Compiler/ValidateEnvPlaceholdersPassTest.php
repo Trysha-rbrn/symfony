@@ -314,6 +314,195 @@ class ValidateEnvPlaceholdersPassTest extends TestCase
         $this->assertSame('1', $container->getParameter('boolish'));
     }
 
+    public function testEnvVarsAreInlinedBeforeTheExtensionIsLoaded()
+    {
+        $_ENV['STATIC_LEVEL'] = 'notice';
+
+        $container = new ContainerBuilder();
+        $container->registerExtension($ext = new EnvExtension(new ConfigurationWithInlinedEnvVars()));
+        $container->prependExtensionConfig('env_extension', [
+            'level' => '%env(STATIC_LEVEL)%',
+            'dynamic' => '%env(STATIC_LEVEL)%',
+        ]);
+
+        try {
+            (new MergeExtensionConfigurationPass())->process($container);
+        } finally {
+            unset($_ENV['STATIC_LEVEL']);
+        }
+
+        $config = $ext->getConfig();
+
+        $this->assertSame('notice', $config['level']);
+        $this->assertStringStartsWith('env_', $config['dynamic']);
+    }
+
+    public function testInlinedEnvVarsCanUseACast()
+    {
+        $_ENV['STATIC_LOCALES'] = 'en,fr';
+
+        $container = new ContainerBuilder();
+        $container->registerExtension($ext = new EnvExtension(new ConfigurationWithInlinedEnvVars()));
+        $container->prependExtensionConfig('env_extension', [
+            'locales' => '%env(csv:STATIC_LOCALES)%',
+        ]);
+
+        try {
+            $this->doProcess($container);
+        } finally {
+            unset($_ENV['STATIC_LOCALES']);
+        }
+
+        $this->assertSame(['en', 'fr'], $ext->getConfig()['locales']);
+    }
+
+    public function testInliningAnUndefinedEnvVarReportsTheOption()
+    {
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('The value of the configuration option "env_extension.level" must be known when the container is compiled: Environment variable not found: "UNDEFINED_STATIC".');
+
+        $container = new ContainerBuilder();
+        $container->registerExtension(new EnvExtension(new ConfigurationWithInlinedEnvVars()));
+        $container->prependExtensionConfig('env_extension', [
+            'level' => '%env(UNDEFINED_STATIC)%',
+        ]);
+
+        $this->doProcess($container);
+    }
+
+    public function testInlinedEnvVarsAreValidatedByTheirValue()
+    {
+        $_ENV['INLINED_MODE'] = 'safe';
+
+        $container = new ContainerBuilder();
+        $container->registerExtension($ext = new EnvExtension(new ConfigurationWithInlinedEnvVars()));
+        $container->prependExtensionConfig('env_extension', ['mode' => '%env(INLINED_MODE)%']);
+
+        try {
+            $this->doProcess($container);
+        } finally {
+            unset($_ENV['INLINED_MODE']);
+        }
+
+        $this->assertSame('safe', $ext->getConfig()['mode']);
+    }
+
+    public function testInlinedEnvVarsInsideAStringAreValidatedByTheirValue()
+    {
+        $_ENV['INLINED_HOST'] = 'localhost';
+
+        $container = new ContainerBuilder();
+        $container->registerExtension($ext = new EnvExtension(new ConfigurationWithInlinedEnvVars()));
+        $container->prependExtensionConfig('env_extension', ['url' => 'http://%env(INLINED_HOST)%/api']);
+
+        try {
+            $this->doProcess($container);
+        } finally {
+            unset($_ENV['INLINED_HOST']);
+        }
+
+        $this->assertSame('http://localhost/api', $ext->getConfig()['url']);
+    }
+
+    public function testInlinedEnvVarsAreRejectedByTheirValue()
+    {
+        $_ENV['INLINED_MODE'] = 'fast';
+
+        $container = new ContainerBuilder();
+        $container->registerExtension(new EnvExtension(new ConfigurationWithInlinedEnvVars()));
+        $container->prependExtensionConfig('env_extension', ['mode' => '%env(INLINED_MODE)%']);
+
+        $this->expectException(InvalidConfigurationException::class);
+        $this->expectExceptionMessage('Not that fast.');
+
+        try {
+            $this->doProcess($container);
+        } finally {
+            unset($_ENV['INLINED_MODE']);
+        }
+    }
+
+    public function testOverriddenValuesOfInlinedEnvVarsAreNotResolved()
+    {
+        $container = new ContainerBuilder();
+        $container->registerExtension($ext = new EnvExtension(new ConfigurationWithInlinedEnvVars()));
+        $container->loadFromExtension('env_extension', ['level' => '%env(UNDEFINED_STATIC)%']);
+        $container->loadFromExtension('env_extension', ['level' => 'debug']);
+
+        $this->doProcess($container);
+
+        $this->assertSame('debug', $ext->getConfig()['level']);
+    }
+
+    public function testInlinedEnvVarsAreReportedByTheirNameInTheProcessedConfig()
+    {
+        $_ENV['REPORTED_LEVEL'] = 'notice';
+        $_ENV['REPORTED_DYNAMIC'] = 'whatever';
+
+        $container = new ContainerBuilder();
+        $container->registerExtension(new EnvExtension(new ConfigurationWithInlinedEnvVars()));
+        $container->prependExtensionConfig('env_extension', [
+            'level' => '%env(REPORTED_LEVEL)%',
+            'dynamic' => '%env(REPORTED_DYNAMIC)%',
+        ]);
+
+        $pass = new ValidateEnvPlaceholdersPass();
+
+        try {
+            (new MergeExtensionConfigurationPass())->process($container);
+            (new RegisterEnvVarProcessorsPass())->process($container);
+            $pass->process($container);
+        } finally {
+            unset($_ENV['REPORTED_LEVEL'], $_ENV['REPORTED_DYNAMIC']);
+        }
+
+        $config = $container->resolveEnvPlaceholders($pass->getExtensionConfig()['env_extension']);
+
+        $this->assertSame('%env(REPORTED_LEVEL)%', $config['level']);
+        $this->assertSame('%env(REPORTED_DYNAMIC)%', $config['dynamic']);
+    }
+
+    public function testTheEnabledNodeOfAnEnableableSectionInlinesItsEnvVar()
+    {
+        $_ENV['SECTION_ENABLED'] = 'false';
+
+        $container = new ContainerBuilder();
+        $container->registerExtension($ext = new EnvExtension(new EnableableConfiguration()));
+        $container->prependExtensionConfig('env_extension', [
+            'section' => ['enabled' => '%env(bool:SECTION_ENABLED)%'],
+        ]);
+
+        try {
+            $this->doProcess($container);
+        } finally {
+            unset($_ENV['SECTION_ENABLED']);
+        }
+
+        $this->assertFalse($ext->getConfig()['section']['enabled']);
+    }
+
+    public function testEnvVarsResolvedAtCompileTimeAreLogged()
+    {
+        $_ENV['LOGGED_LEVEL'] = 'notice';
+
+        $container = new ContainerBuilder();
+        $container->registerExtension(new EnvExtension(new ConfigurationWithInlinedEnvVars()));
+        $container->registerExtension(new ResolvingEnvExtension());
+        $container->prependExtensionConfig('env_extension', ['level' => '%env(LOGGED_LEVEL)%', 'dynamic' => '%env(LOGGED_LEVEL)%']);
+        $container->prependExtensionConfig('resolving_env_extension', ['level' => '%env(LOGGED_LEVEL)%']);
+
+        try {
+            (new MergeExtensionConfigurationPass())->process($container);
+        } finally {
+            unset($_ENV['LOGGED_LEVEL']);
+        }
+
+        $this->assertSame([
+            MergeExtensionConfigurationPass::class.': Inlined env var "%env(LOGGED_LEVEL)%" into option "env_extension.level".',
+            MergeExtensionConfigurationPass::class.': Inlined env var "%env(LOGGED_LEVEL)%" while loading extension "resolving_env_extension".',
+        ], $container->getCompiler()->getLog());
+    }
+
     private function doProcess(ContainerBuilder $container): void
     {
         (new MergeExtensionConfigurationPass())->process($container);
@@ -399,6 +588,48 @@ class ConfigurationWithArrayNodeRequiringOneElement implements ConfigurationInte
     }
 }
 
+class EnableableConfiguration implements ConfigurationInterface
+{
+    public function getConfigTreeBuilder(): TreeBuilder
+    {
+        $treeBuilder = new TreeBuilder('env_extension');
+        $treeBuilder->getRootNode()
+            ->children()
+                ->arrayNode('section')->canBeEnabled()->end()
+            ->end();
+
+        return $treeBuilder;
+    }
+}
+
+class ConfigurationWithInlinedEnvVars implements ConfigurationInterface
+{
+    public function getConfigTreeBuilder(): TreeBuilder
+    {
+        $treeBuilder = new TreeBuilder('env_extension');
+        $treeBuilder->getRootNode()
+            ->children()
+                ->scalarNode('level')->attribute('resolves_at_compile_time', true)->end()
+                ->enumNode('mode')
+                    ->attribute('resolves_at_compile_time', true)
+                    ->values(['fast', 'safe'])
+                    ->validate()->ifTrue(static fn ($v) => 'fast' === $v)->thenInvalid('Not that fast.')->end()
+                ->end()
+                ->scalarNode('url')
+                    ->attribute('resolves_at_compile_time', true)
+                    ->validate()->ifTrue(static fn ($v) => !str_starts_with($v, 'http://localhost/'))->thenInvalid('Not a local URL.')->end()
+                ->end()
+                ->scalarNode('dynamic')->end()
+                ->arrayNode('locales')
+                    ->attribute('resolves_at_compile_time', true)
+                    ->scalarPrototype()->end()
+                ->end()
+            ->end();
+
+        return $treeBuilder;
+    }
+}
+
 class EnvExtension extends Extension
 {
     private ConfigurationInterface $configuration;
@@ -431,5 +662,18 @@ class EnvExtension extends Extension
     public function getConfig()
     {
         return $this->config;
+    }
+}
+
+class ResolvingEnvExtension extends Extension
+{
+    public function getAlias(): string
+    {
+        return 'resolving_env_extension';
+    }
+
+    public function load(array $configs, ContainerBuilder $container): void
+    {
+        $container->setParameter('resolved_level', $container->resolveEnvPlaceholders($configs[0]['level'], true));
     }
 }

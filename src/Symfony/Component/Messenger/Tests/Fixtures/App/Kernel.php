@@ -24,6 +24,9 @@ use Symfony\Component\Messenger\Middleware\HandleMessageMiddleware;
 use Symfony\Component\Messenger\Middleware\MiddlewareInterface;
 use Symfony\Component\Messenger\Middleware\StackInterface;
 use Symfony\Component\Messenger\RoutableMessageBus;
+use Symfony\Component\Messenger\Stamp\FlushBatchHandlersStamp;
+use Symfony\Component\Messenger\Stamp\TrustStamp;
+use Symfony\Component\Messenger\Tests\Fixtures\ChildDummyMessage;
 use Symfony\Component\Messenger\Tests\Fixtures\DummyMessage;
 use Symfony\Contracts\Service\ContainerProviderInterface;
 
@@ -95,24 +98,35 @@ final class StampingMiddleware implements MiddlewareInterface
 
     public function handle(Envelope $envelope, StackInterface $stack): Envelope
     {
-        return $stack->next()->handle($envelope->with(new HandledByBusStamp($this->busName)), $stack);
+        return $stack->next()->handle($envelope->with(new HandledByBusStamp($this->busName), new SeenByWorkerStamp(array_keys($envelope->all()), $envelope->last(TrustStamp::class)?->isTrusted())), $stack);
     }
 }
 
 final class BatchHandlingMiddleware implements MiddlewareInterface
 {
+    public static array $log = [];
+
     private readonly HandleMessageMiddleware $middleware;
 
     public function __construct()
     {
         $this->middleware = new HandleMessageMiddleware(new HandlersLocator([
             DummyMessage::class => [new HandlerDescriptor(new BatchSizeReportingHandler())],
+            ChildDummyMessage::class => [new HandlerDescriptor(new BatchSizeReportingHandler(), ['alias' => 'second'])],
         ]));
     }
 
     public function handle(Envelope $envelope, StackInterface $stack): Envelope
     {
-        return $this->middleware->handle($envelope, $stack);
+        $message = $envelope->getMessage();
+        $name = $envelope->last(FlushBatchHandlersStamp::class) ? 'flush' : ($message instanceof DummyMessage ? $message->getMessage() : get_debug_type($message));
+        self::$log[] = 'begin '.$name;
+
+        try {
+            return $this->middleware->handle($envelope, $stack);
+        } finally {
+            self::$log[] = 'end '.$name;
+        }
     }
 }
 
@@ -132,6 +146,8 @@ final class BatchSizeReportingHandler implements BatchHandlerInterface
 
     private function process(array $jobs): void
     {
+        BatchHandlingMiddleware::$log[] = 'process '.implode(',', array_map(static fn (array $job) => $job[0]->getMessage(), $jobs));
+
         foreach ($jobs as [$job]) {
             if ('fail' === $job->getMessage()) {
                 throw new \RuntimeException('Parallel handler failed.');

@@ -17,6 +17,7 @@ use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Completion\CompletionInput;
 use Symfony\Component\Console\Completion\CompletionSuggestions;
 use Symfony\Component\Console\Exception\RuntimeException;
+use Symfony\Component\Console\Helper\CommandInvocation;
 use Symfony\Component\Console\Helper\Dumper;
 use Symfony\Component\Console\Input\InputArgument;
 use Symfony\Component\Console\Input\InputInterface;
@@ -58,19 +59,19 @@ class ShowMessagesCommand extends Command
             ->setHelp(<<<'EOF'
                 The <info>%command.name%</info> command shows messages that are pending in a transport:
 
-                    <info>php %command.full_name% <transport></info>
+                    <info>%command.invocation% <transport></info>
 
                 Or look at a specific message by its id:
 
-                    <info>php %command.full_name% <transport> {id}</info>
+                    <info>%command.invocation% <transport> {id}</info>
 
                 The listing can be narrowed down to a specific message class:
 
-                    <info>php %command.full_name% <transport> --class-filter='App\Message\SendEmail'</info>
+                    <info>%command.invocation% <transport> --class-filter='App\Message\SendEmail'</info>
 
                 Use the <info>--stats</info> option to display the message count by class instead:
 
-                    <info>php %command.full_name% <transport> --stats</info>
+                    <info>%command.invocation% <transport> --stats</info>
                 EOF
             )
         ;
@@ -137,7 +138,7 @@ class ShowMessagesCommand extends Command
 
     private function listMessages(ListableReceiverInterface $receiver, string $transportName, SymfonyStyle $io, SymfonyStyle $errorIo, int $max, ?string $classFilter): void
     {
-        $envelopes = $receiver->all($max);
+        $envelopes = $classFilter ? $this->filterByClass($receiver, $classFilter, $max) : $receiver->all($max);
 
         $rows = [];
 
@@ -148,13 +149,7 @@ class ShowMessagesCommand extends Command
         $this->phpSerializer?->acceptPhpIncompleteClass();
         try {
             foreach ($envelopes as $envelope) {
-                $currentClassName = $envelope->getMessage()::class;
-
-                if ($classFilter && $classFilter !== $currentClassName) {
-                    continue;
-                }
-
-                $rows[] = [$this->getMessageId($envelope), $currentClassName];
+                $rows[] = [$this->getMessageId($envelope), $envelope->getMessage()::class];
             }
         } finally {
             $this->phpSerializer?->rejectPhpIncompleteClass();
@@ -176,12 +171,12 @@ class ShowMessagesCommand extends Command
             $errorIo->comment(\sprintf('Showing %d message(s).', $rowsCount));
         }
 
-        $errorIo->comment(\sprintf('Run <comment>messenger:show %s {id} -vv</comment> to see message details.', $transportName));
+        $errorIo->comment(\sprintf('Run <comment>%s %s {id} -vv</comment> to see message details.', CommandInvocation::formatEscaped($this), $transportName));
     }
 
     private function listMessagesPerClass(ListableReceiverInterface $receiver, SymfonyStyle $io, ?int $max, ?string $classFilter): void
     {
-        $envelopes = $receiver->all($max);
+        $envelopes = $classFilter ? $this->filterByClass($receiver, $classFilter, $max) : $receiver->all($max);
 
         $countPerClass = [];
 
@@ -189,10 +184,6 @@ class ShowMessagesCommand extends Command
         try {
             foreach ($envelopes as $envelope) {
                 $c = $envelope->getMessage()::class;
-
-                if ($classFilter && $classFilter !== $c) {
-                    continue;
-                }
 
                 if (!isset($countPerClass[$c])) {
                     $countPerClass[$c] = [$c, 0];
@@ -211,6 +202,27 @@ class ShowMessagesCommand extends Command
         }
 
         $io->table(['Class', 'Count'], $countPerClass);
+    }
+
+    /**
+     * @return \Generator<Envelope>
+     */
+    private function filterByClass(ListableReceiverInterface $receiver, string $class, ?int $max): \Generator
+    {
+        if (null !== $max && 1 > $max) {
+            return;
+        }
+
+        $count = 0;
+        foreach ($receiver->all() as $envelope) {
+            if ($class === $envelope->getMessage()::class) {
+                yield $envelope;
+
+                if (null !== $max && ++$count >= $max) {
+                    return;
+                }
+            }
+        }
     }
 
     private function showMessage(ListableReceiverInterface $receiver, string $id, SymfonyStyle $io, SymfonyStyle $errorIo): void

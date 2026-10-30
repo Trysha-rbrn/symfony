@@ -15,6 +15,7 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\MockObject\MockObject;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\AssetMapper\AssetMapperInterface;
+use Symfony\Component\AssetMapper\Exception\RuntimeException;
 use Symfony\Component\AssetMapper\ImportMap\ImportMapConfigReader;
 use Symfony\Component\AssetMapper\ImportMap\ImportMapEntries;
 use Symfony\Component\AssetMapper\ImportMap\ImportMapEntry;
@@ -237,6 +238,97 @@ class ImportMapManagerTest extends TestCase
         $manager->remove(['cowsay', 'app']);
     }
 
+    public function testRemoveLocalEntryAndTheEntryItImports()
+    {
+        $manager = $this->createImportMapManager();
+        $entries = new ImportMapEntries([
+            self::createLocalEntry('app', './app.js'),
+            self::createRemoteEntry('sortable/sortable.min.css', '1.0.0', '/vendor/sortable.min.css', ImportMapType::CSS),
+        ]);
+        $this->configReader->method('getEntries')->willReturn($entries);
+        $this->assetMapper
+            ->method('getAsset')
+            ->willReturnCallback(static function (string $path) use ($entries) {
+                if ('./app.js' === $path && !$entries->has('sortable/sortable.min.css')) {
+                    throw new RuntimeException('Unable to find asset "sortable/sortable.min.css" imported from "app.js".');
+                }
+
+                return new MappedAsset(basename($path), $path);
+            })
+        ;
+
+        $this->configReader->expects($this->once())
+            ->method('writeEntries')
+            ->with($this->callback(function (ImportMapEntries $entries) {
+                $this->assertCount(0, $entries);
+
+                return true;
+            }))
+        ;
+
+        $manager->remove(['app', 'sortable/sortable.min.css']);
+    }
+
+    #[DataProvider('provideRemovedPackagesNotFound')]
+    public function testRemoveKeepsDownloadedFilesWhenAPackageIsNotFound(array $packages, string $notFoundPackage)
+    {
+        $manager = $this->createImportMapManager();
+        $this->writeFile('assets/vendor/lodash.js', 'lodash contents');
+        $this->assetMapper
+            ->method('getAsset')
+            ->willReturnCallback(static fn (string $path) => new MappedAsset(basename($path), $path))
+        ;
+        $this->mockImportMap([
+            self::createRemoteEntry('lodash', '1.2.3', self::$writableRoot.'/assets/vendor/lodash.js'),
+        ]);
+
+        $this->configReader->expects($this->never())->method('writeEntries');
+
+        try {
+            $manager->remove($packages);
+            $this->fail('An exception should have been thrown.');
+        } catch (\InvalidArgumentException $e) {
+            $this->assertSame(\sprintf('Package "%s" listed for removal was not found in "importmap.php".', $notFoundPackage), $e->getMessage());
+        }
+
+        $this->assertFileExists(self::$writableRoot.'/assets/vendor/lodash.js');
+    }
+
+    public static function provideRemovedPackagesNotFound(): iterable
+    {
+        yield 'unknown package' => [['lodash', 'cowsay'], 'cowsay'];
+        yield 'package listed twice' => [['lodash', 'lodash'], 'lodash'];
+    }
+
+    public function testRemoveOnlyDeletesDownloadedFiles()
+    {
+        $manager = $this->createImportMapManager();
+        $this->writeFile('assets/app.js', 'app contents');
+        $this->writeFile('vendor/symfony/stimulus-bundle/assets/dist/loader.js', 'loader contents');
+        $this->writeFile('assets/vendor/lodash.js', 'lodash contents');
+        $this->assetMapper
+            ->method('getAssetFromSourcePath')
+            ->willReturnCallback(static fn (string $sourcePath) => new MappedAsset(basename($sourcePath), $sourcePath))
+        ;
+        $this->configReader
+            ->method('convertPathToFilesystemPath')
+            ->willReturnCallback(static fn (string $path) => str_starts_with($path, './') ? self::$writableRoot.substr($path, 1) : $path)
+        ;
+        $this->mockImportMap([
+            self::createLocalEntry('app', './assets/app.js'),
+            self::createLocalEntry('@symfony/stimulus-bundle', './vendor/symfony/stimulus-bundle/assets/dist/loader.js'),
+            self::createRemoteEntry('lodash', '1.2.3', self::$writableRoot.'/assets/vendor/lodash.js'),
+        ]);
+
+        $this->configReader->expects($this->once())->method('writeEntries');
+
+        $manager->remove(['app', '@symfony/stimulus-bundle', 'lodash']);
+
+        $this->assertFileExists(self::$writableRoot.'/assets/app.js');
+        $this->assertFileExists(self::$writableRoot.'/vendor/symfony/stimulus-bundle/assets/dist/loader.js');
+        $this->assertFileDoesNotExist(self::$writableRoot.'/assets/vendor/lodash.js');
+    }
+
     public function testUpdateAll()
     {
         $this->packageResolver = $this->createMock(PackageResolverInterface::class);
@@ -281,6 +373,38 @@ class ImportMapManagerTest extends TestCase
         ;
 
         $manager->update();
+    }
+
+    public function testUpdateKeepsDownloadedFilesWhenResolvingFails()
+    {
+        $this->packageResolver = $this->createMock(PackageResolverInterface::class);
+        $manager = $this->createImportMapManager();
+        $this->writeFile('assets/vendor/lodash.js', 'lodash contents');
+        $this->writeFile('assets/vendor/bootstrap.css', 'bootstrap contents');
+        $this->assetMapper
+            ->method('getAsset')
+            ->willReturnCallback(static fn (string $path) => new MappedAsset(basename($path), $path))
+        ;
+        $this->mockImportMap([
+            self::createRemoteEntry('lodash', '1.2.3', self::$writableRoot.'/assets/vendor/lodash.js'),
+            self::createRemoteEntry('bootstrap/bootstrap.css', '5.1.3', self::$writableRoot.'/assets/vendor/bootstrap.css', ImportMapType::CSS),
+        ]);
+
+        $this->packageResolver->expects($this->once())
+            ->method('resolvePackages')
+            ->willThrowException(new RuntimeException('Error 404 requiring packages from jsDelivr for "bootstrap/bootstrap.css".'))
+        ;
+        $this->configReader->expects($this->never())->method('writeEntries');
+
+        try {
+            $manager->update();
+            $this->fail('An exception should have been thrown.');
+        } catch (RuntimeException $e) {
+            $this->assertSame('Error 404 requiring packages from jsDelivr for "bootstrap/bootstrap.css".', $e->getMessage());
+        }
+
+        $this->assertFileExists(self::$writableRoot.'/assets/vendor/lodash.js');
+        $this->assertFileExists(self::$writableRoot.'/assets/vendor/bootstrap.css');
     }
 
     public function testUpdateWithSpecificPackages()

@@ -11,6 +11,8 @@
 
 namespace Symfony\Bundle\FrameworkBundle\Tests\Functional;
 
+use Symfony\Bundle\FrameworkBundle\Console\Application;
+use Symfony\Component\Console\Tester\CommandTester;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Attribute\Cache;
@@ -63,6 +65,24 @@ class CacheAttributeListenerTest extends AbstractWebTestCase
 
         self::assertSame(200, $response->getStatusCode());
         self::assertSame('Hi there!', $response->getContent());
+    }
+
+    public function testWarmUpCompilesTheExpressionsOfControllerAttributes()
+    {
+        $kernel = self::bootKernel(['test_case' => 'CacheAttributeListener']);
+
+        self::getContainer()->get('expression_language.cache_warmer')->warmUp($kernel->getCacheDir(), $kernel->getBuildDir());
+
+        self::assertSame(['post.getEtag()'], array_keys(require $kernel->getBuildDir().'/expression_language/controller.expression_language.php'));
+    }
+
+    public function testLintExpressions()
+    {
+        $kernel = self::bootKernel(['test_case' => 'CacheAttributeListener']);
+        $tester = new CommandTester((new Application($kernel))->find('lint:expressions'));
+
+        self::assertSame(0, $tester->execute([]));
+        self::assertStringContainsString('All 1 expressions are valid.', $tester->getDisplay());
     }
 }
 

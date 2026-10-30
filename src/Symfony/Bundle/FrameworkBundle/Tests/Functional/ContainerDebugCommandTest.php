@@ -11,6 +11,7 @@
 
 namespace Symfony\Bundle\FrameworkBundle\Tests\Functional;
 
+use PHPUnit\Framework\Attributes\BackupGlobals;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Group;
 use Symfony\Bundle\FrameworkBundle\Console\Application;
@@ -38,8 +39,13 @@ class ContainerDebugCommandTest extends AbstractWebTestCase
         $this->assertFileExists(static::getContainer()->getParameter('debug.container.dump'));
     }
 
+    #[BackupGlobals(true)]
     public function testNoDebug()
     {
+        $_SERVER['SCRIPT_FILENAME'] = __FILE__;
+        $_SERVER['SYMFONY_CLI_CONSOLE_COMMAND'] = '["symfony","console"]';
+        $_SERVER['SYMFONY_CLI_CONSOLE_SCRIPT'] = __FILE__;
+
         static::bootKernel(['test_case' => 'ContainerDebug', 'root_config' => 'config.yml', 'debug' => false]);
 
         $application = new Application(static::$kernel);
@@ -49,6 +55,8 @@ class ContainerDebugCommandTest extends AbstractWebTestCase
         $tester->run(['command' => 'debug:container']);
 
         $this->assertStringContainsString('public', $tester->getDisplay());
+        $display = preg_replace('/\s+/', ' ', preg_replace('/^\s*\/\/ ?/m', '', $tester->getDisplay(true)));
+        $this->assertStringContainsString('symfony console debug:container log', $display);
     }
 
     public function testNoDumpedXML()
@@ -273,29 +281,60 @@ class ContainerDebugCommandTest extends AbstractWebTestCase
         try {
             $display = $this->runEnvVarsCommand()->getDisplay(true);
 
-            $this->assertMatchesRegularExpression('/Name\s+Default value\s+Real value\s+Used/', $display);
+            $this->assertMatchesRegularExpression('/Name\s+Default value\s+Real value\s+Used\s+Inlined/', $display);
 
             // APP_FOO has a container default and APP_BAR has nothing, but no service reads either,
             // so both are unused; APP_BAZ is in .env and read by a service, so it is used
-            $this->assertMatchesRegularExpression('/^  APP_BAR\s+n\/a\s+"bar"\s+no\s*$/m', $display);
-            $this->assertMatchesRegularExpression('/^  APP_BAZ\s+n\/a\s+"baz"\s+yes\s*$/m', $display);
-            $this->assertMatchesRegularExpression('/^  APP_FOO\s+"foo"\s+"foo"\s+no\s*$/m', $display);
-            $this->assertMatchesRegularExpression('/^  JSON\s+"\[1, "2.5", 3\]"\s+n\/a\s+yes\s*$/m', $display);
-            $this->assertMatchesRegularExpression('/^  REAL\s+n\/a\s+"value"\s+yes\s*$/m', $display);
-            $this->assertMatchesRegularExpression('/^  UNKNOWN\s+n\/a\s+n\/a\s+yes\s*$/m', $display);
+            $this->assertMatchesRegularExpression('/^  APP_BAR\s+n\/a\s+"bar"\s+no\s+no\s*$/m', $display);
+            $this->assertMatchesRegularExpression('/^  APP_BAZ\s+n\/a\s+"baz"\s+yes\s+no\s*$/m', $display);
+            $this->assertMatchesRegularExpression('/^  APP_FOO\s+"foo"\s+"foo"\s+no\s+no\s*$/m', $display);
+            $this->assertMatchesRegularExpression('/^  JSON\s+"\[1, "2.5", 3\]"\s+n\/a\s+yes\s+no\s*$/m', $display);
+            $this->assertMatchesRegularExpression('/^  REAL\s+n\/a\s+"value"\s+yes\s+no\s*$/m', $display);
+            $this->assertMatchesRegularExpression('/^  UNKNOWN\s+n\/a\s+n\/a\s+yes\s+no\s*$/m', $display);
 
             // variables the framework itself reads are listed, and are not reported as missing
             // because their placeholder carries a "default" fallback
-            $this->assertMatchesRegularExpression('/^  SYMFONY_TRUSTED_HOSTS\s+n\/a\s+\S+\s+yes\s*$/m', $display);
+            $this->assertMatchesRegularExpression('/^  SYMFONY_TRUSTED_HOSTS\s+n\/a\s+\S+\s+yes\s+no\s*$/m', $display);
             $this->assertStringContainsString('The following variables are missing:', $display);
             $this->assertStringContainsString('* UNKNOWN', $display);
             $this->assertStringNotContainsString('* SYMFONY_TRUSTED_HOSTS', $display);
             $this->assertStringNotContainsString('* APP_RUNTIME_ENV', $display);
+
+            // "framework.form.enabled" reads FORM_ENABLED while the container is compiled, even if a service reads it at runtime too
+            $this->assertMatchesRegularExpression('/^  FORM_ENABLED\s+"true"\s+n\/a\s+yes\s+yes\s*$/m', $display);
+            $this->assertStringContainsString('Inlined variables were read in at least one place', $display);
         } finally {
             putenv('REAL');
             putenv('APP_FOO');
             putenv('APP_BAR');
             putenv('APP_BAZ');
+            unset($_SERVER['SYMFONY_DOTENV_VARS']);
+        }
+    }
+
+    public function testDescribeEnvVarsDoesNotReportTheVariablesReadOutsideTheContainerAsUnused()
+    {
+        $_SERVER['SYMFONY_DOTENV_VARS'] = 'APP_ENV,APP_SHARE_DIR,APP_CACHE_DIR,KERNEL_CLASS,APP_FOO';
+        putenv('APP_ENV=test');
+        putenv('APP_SHARE_DIR=var/share');
+        putenv('APP_CACHE_DIR=var/cache');
+        putenv('KERNEL_CLASS=App\Kernel');
+        putenv('APP_FOO=foo');
+
+        try {
+            $display = $this->runEnvVarsCommand()->getDisplay(true);
+
+            $this->assertMatchesRegularExpression('/^  APP_ENV\s+n\/a\s+"test"\s+yes\s+no\s*$/m', $display);
+            $this->assertMatchesRegularExpression('/^  APP_SHARE_DIR\s+n\/a\s+"var\/share"\s+yes\s+no\s*$/m', $display);
+            $this->assertMatchesRegularExpression('/^  APP_CACHE_DIR\s+n\/a\s+"var\/cache"\s+yes\s+no\s*$/m', $display);
+            $this->assertMatchesRegularExpression('/^  KERNEL_CLASS\s+n\/a\s+"App\\\\Kernel"\s+yes\s+no\s*$/m', $display);
+            $this->assertMatchesRegularExpression('/^  APP_FOO\s+"foo"\s+"foo"\s+no\s+no\s*$/m', $display);
+        } finally {
+            putenv('APP_ENV');
+            putenv('APP_SHARE_DIR');
+            putenv('APP_CACHE_DIR');
+            putenv('KERNEL_CLASS');
+            putenv('APP_FOO');
             unset($_SERVER['SYMFONY_DOTENV_VARS']);
         }
     }
@@ -308,9 +347,9 @@ class ContainerDebugCommandTest extends AbstractWebTestCase
             $display = $this->runEnvVarsCommand()->getDisplay(true);
 
             // an absent SYMFONY_DOTENV_VARS used to add a row with no name and a count of its own
-            $this->assertDoesNotMatchRegularExpression('/^\s+n\/a\s+n\/a\s+(yes|no)\s*$/m', $display);
+            $this->assertDoesNotMatchRegularExpression('/^\s+n\/a\s+n\/a\s+(yes|no)\s+(yes|no)\s*$/m', $display);
             $this->assertStringNotContainsString('* '.\PHP_EOL, $display);
-            $this->assertMatchesRegularExpression('/^  REAL\s+n\/a\s+"value"\s+yes\s*$/m', $display);
+            $this->assertMatchesRegularExpression('/^  REAL\s+n\/a\s+"value"\s+yes\s+no\s*$/m', $display);
             $this->assertStringNotContainsString('APP_BAR', $display);
         } finally {
             putenv('REAL');

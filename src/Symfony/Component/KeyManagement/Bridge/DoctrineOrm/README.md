@@ -1,7 +1,8 @@
 Symfony Doctrine ORM Key Management Bridge
 ==========================================
 
-Connects `symfony/key-management` to the Doctrine ORM: a `#[BlindIndexed]` attribute
+Connects `symfony/key-management` to the Doctrine ORM: an `#[Encrypted]` attribute
+that encrypts the column of a property, a `#[BlindIndexed]` attribute
 whose listener fills the blind index of a property on every flush, and a schema
 listener declaring the table the data key store of
 `symfony/doctrine-dbal-key-management` needs.
@@ -10,6 +11,131 @@ listener declaring the table the data key store of
 [Experimental features](https://symfony.com/doc/current/contributing/code/experimental.html)
 are not covered by Symfony's
 [Backward Compatibility Promise](https://symfony.com/doc/current/contributing/code/bc.html).
+
+Encrypted columns
+-----------------
+
+The `#[Encrypted]` attribute encrypts the column of a property at rest:
+
+```php
+use Doctrine\ORM\Mapping as ORM;
+use Symfony\Component\KeyManagement\Bridge\DoctrineOrm\Attribute\Encrypted;
+
+#[ORM\Column(nullable: true)]
+#[Encrypted(key: 'speaker.contact')]
+public ?string $phone = null;
+```
+
+The column keeps the type of its mapping, `string` here.
+That type converts the value first, then the value is encrypted under the key.
+The column is stored as a binary one.
+When the encrypter uses a data key store, the key is the scope of the data key.
+
+Each value is authenticated with the configured key and parent Doctrine type name, `string` here.
+Changing either requires rewriting existing values.
+The PHP implementation behind the parent name can change if the new converter can read the old plaintext.
+The generated encrypted type name can change without rewriting values.
+The parent instance's configuration isn't authenticated.
+Columns with the same key and parent type name can read each other's values.
+Give these columns different keys to keep them apart.
+
+For explicit keys, `EncryptedColumnListener` uses types registered before the first query.
+The listener gets their names by key and by the type they wrap:
+
+```php
+use Doctrine\DBAL\Types\StringType;
+use Doctrine\DBAL\Types\Type;
+use Doctrine\ORM\Events;
+use Symfony\Component\KeyManagement\Bridge\DoctrineDbal\EncryptedType;
+use Symfony\Component\KeyManagement\Bridge\DoctrineOrm\EventListener\EncryptedColumnListener;
+
+Type::getTypeRegistry()->register('app_speaker_contact', new EncryptedType(new StringType(), $encrypter, 'speaker.contact', 'string'));
+
+$eventManager->addEventListener(Events::loadClassMetadata, new EncryptedColumnListener([
+    'speaker.contact' => ['string' => 'app_speaker_contact'],
+]));
+```
+
+Loading the metadata of a class fails when no encrypted type is registered for the key and the type of a column.
+It also fails when the attribute is on a property that is not a mapped column.
+
+With a configured data key store, you can omit the key:
+
+```php
+#[ORM\Column(nullable: true)]
+#[Encrypted]
+public ?string $phone = null;
+```
+
+The store's `key_id` selects the master key.
+The attribute then uses a separate data key scope for each physical column.
+The scope is `'orm:'.hash('sha256', serialize([$schema, $table, $column]))`, using the resolved ORM metadata names.
+Naming strategies, embedded prefixes and the physical owning table of inherited fields are included.
+The framed hash keeps names containing dots distinct and fits the store's scope column.
+The value also authenticates the parent Doctrine type name.
+Values copied to a column with different resolved schema, table or column names are refused.
+Database, connection, application and tenant identifiers aren't part of the automatic scope.
+Identically named columns in separate databases can read each other's values when they use the same data key store.
+Use explicit scopes containing the trusted application or tenant identifier to keep those values apart.
+Renaming the entity or property leaves existing values readable when the physical names stay unchanged.
+Renaming the schema, table or column changes the automatic scope.
+Before such a rename, set the explicit key to the existing generated scope to keep old values readable.
+Choosing a different explicit key requires rewriting values.
+Only a null key selects the automatic scope; explicit `''` and `'0'` remain explicit keys.
+Omitting the key without a store fails, since a self-contained encrypter has no default master key.
+
+With DoctrineBundle, the bundle registers these automatic types after constructing each entity manager, including when metadata is cached.
+To find them, it loads the metadata of every mapped class once, and keeps the types in the `cache.key_management.encrypted_columns` pool, a child of `cache.system`.
+The next entity managers register the types from that pool and load no metadata.
+In debug mode, the bundle doesn't define that pool, so that a change to the mapping is seen without clearing the cache.
+The metadata is loaded with a metadata factory of its own, so the factory of the entity manager stays empty.
+The metadata cache warmer of DoctrineBundle requires this.
+
+The listener runs after the other `loadClassMetadata` listeners, so it computes each scope from the final table and column names.
+When a listener that runs later still renames a table or a column, the types aren't cached.
+Each entity manager then loads all the metadata again, to fix the names in it.
+Applications using only explicit keys keep registration at connection creation.
+The connection's type provider must be a writable `TypeRegistry`.
+Generated automatic type names use an internal namespace, `key_management_auto_v1_<base64-parent>.<64-hex-hash>`.
+Don't use that full name format for your own parent aliases.
+
+Without DoctrineBundle, give the listener a store-backed encrypter and register after constructing the manager:
+
+```php
+$listener = new EncryptedColumnListener($explicitTypes, $storedEnvelopeEncrypter, $cache);
+$eventManager->addEventListener(Events::loadClassMetadata, $listener);
+$entityManager = new EntityManager($connection, $configuration, $eventManager);
+$listener->register($entityManager, 'default');
+```
+
+`register()` loads the metadata of every mapped class to find the types.
+With a cache, it does so once and saves the types under the name of the entity manager, `default` here.
+Clear that cache when the mapping changes, like the metadata cache.
+Add the listener after the listeners that rename tables or columns.
+
+In a Symfony application, the `KeyManagementBundle` registers explicit-key types when DoctrineBundle creates a connection.
+When the container is compiled, the bundle finds the `#[Encrypted]` columns and collects one type per explicit key and type.
+It looks for these columns in the entities, embeddables and mapped superclasses found in the `resource` directories of your services.
+With the default `App\:` resource, this covers `src/Entity/`.
+The types encrypt with the encrypter `EnvelopeEncrypterInterface` resolves to, like the ones of `key_management.doctrine_dbal.types`.
+A type declared there is used for the columns of its key and type, instead of registering another one.
+
+For explicit keys, the column type is read from `#[ORM\Column]` or guessed from the property type, as the ORM does by default.
+The container misses the columns of an entity that your services exclude, or that is mapped in XML.
+It can also guess another type than the ORM when you use a custom typed field mapper.
+Loading the metadata of such an entity fails, `cache:warmup` included.
+You can declare these explicit-key types in `key_management.doctrine_dbal.types`.
+
+```yaml
+key_management:
+    doctrine_dbal:
+        types:
+            speaker_contact: { type: string, key: speaker.contact }
+```
+
+Automatic scopes use the resolved ORM metadata instead of guessing the column type.
+The container must discover an omitted-key attribute to enable automatic registration.
+For excluded entities or a custom entity manager, configure the listener and call `register()` manually as shown above.
 
 Blind indexes
 -------------
@@ -28,9 +154,12 @@ use Symfony\Component\KeyManagement\Bridge\DoctrineOrm\Attribute\BlindIndexed;
 private string $email = '';
 
 #[ORM\Column(length: 64)]
-#[BlindIndexed('email', Email::class)]
+#[BlindIndexed('email', 'user-email')]
 private string $emailIndex = '';
 ```
+
+Its second argument names the index, which is also what the tags are derived
+under, so two columns holding an address have an index each.
 
 The query side is unchanged, since it has no entity to read the attribute on:
 
@@ -38,16 +167,17 @@ The query side is unchanged, since it has no entity to read the attribute on:
 $repository->findOneBy(['emailIndex' => $index->of($email)]);
 ```
 
-The listener is given the blind indexes of the application, keyed by the class
-the attribute names:
+The listener is given the indexes of the application keyed by that same name:
 
 ```php
 use Doctrine\ORM\Events;
 use Symfony\Component\DependencyInjection\ServiceLocator;
+use Symfony\Component\KeyManagement\BlindIndex;
+use Symfony\Component\KeyManagement\BlindIndex\Projection\Email;
 use Symfony\Component\KeyManagement\Bridge\DoctrineOrm\EventListener\BlindIndexListener;
 
 $eventManager->addEventListener(Events::onFlush, new BlindIndexListener(new ServiceLocator([
-    Email::class => static fn (): Email => new Email($kms, $wrappedKey),
+    'user-email' => static fn () => new BlindIndex($kms, $wrappedKey, 'user-email', new Email()),
 ])));
 ```
 
@@ -63,16 +193,29 @@ converts one property into one column and this writes a second one.
 With the FrameworkBundle
 ------------------------
 
-Nothing has to be registered by hand: every `BlindIndex` service is tagged
-`key_management.blind_index` by autoconfiguration, the listener is wired on
-`onFlush` and removed when the application registers no index, and the data key
-table joins the schema `doctrine:schema:update` and the migrations diff against.
+Every index service is tagged `key_management.blind_index` by autoconfiguration,
+the listener is wired on `onFlush` and removed when the application registers no
+index, and the data key table joins the schema `doctrine:schema:update` and the
+migrations diff against. Only the name is left to state, in the tag, which hands
+it to the `$name` argument of the index:
 
 ```yaml
 services:
-    App\Security\Email:
-        arguments: ['@key_management.app', '%env(APP_INDEX_KEY)%']
+    app.index.user_email:
+        class: Symfony\Component\KeyManagement\BlindIndex
+        arguments:
+            $kms: '@key_management.app'
+            $wrappedKey: !service
+                class: Symfony\Component\KeyManagement\Ciphertext
+                arguments: ['%env(base64:APP_INDEX_KEY)%', 'app-key']
+            $projection: !service { class: Symfony\Component\KeyManagement\BlindIndex\Projection\Email }
+        tags:
+            - { name: key_management.blind_index, index: 'user-email' }
 ```
+
+`APP_INDEX_KEY` holds the `wrapped` value `key-management:generate-data-key app-key`
+prints, and the second argument the `key_id` it prints beside it, which a client
+resolving the identifier it was given may spell otherwise.
 
 Resources
 ---------

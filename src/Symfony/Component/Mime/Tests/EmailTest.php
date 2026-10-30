@@ -21,6 +21,7 @@ use Symfony\Component\Mime\Group;
 use Symfony\Component\Mime\Part\DataPart;
 use Symfony\Component\Mime\Part\File;
 use Symfony\Component\Mime\Part\Multipart\AlternativePart;
+use Symfony\Component\Mime\Part\Multipart\FormDataPart;
 use Symfony\Component\Mime\Part\Multipart\MixedPart;
 use Symfony\Component\Mime\Part\Multipart\RelatedPart;
 use Symfony\Component\Mime\Part\TextPart;
@@ -76,6 +77,32 @@ class EmailTest extends TestCase
         // [text, textCharset, html, htmlCharset, attachments, parentData]
         yield 'textCharset' => [1];
         yield 'htmlCharset' => [3];
+    }
+
+    #[DataProvider('provideNonStringCharsets')]
+    public function testUnserializeRejectsNonStringCharset(int $slot, mixed $value)
+    {
+        $email = new Email();
+        $email->text('text body');
+        $email->html('html body');
+        $data = $email->__serialize();
+        $data[$slot] = $value;
+        $payload = \sprintf('O:%d:"%s":%d:{', \strlen(Email::class), Email::class, \count($data));
+        foreach ($data as $key => $v) {
+            $payload .= serialize($key).serialize($v);
+        }
+
+        $this->expectException(\BadMethodCallException::class);
+
+        unserialize($payload.'}');
+    }
+
+    public static function provideNonStringCharsets(): iterable
+    {
+        foreach (['textCharset' => 1, 'htmlCharset' => 3] as $name => $slot) {
+            yield $name.' int' => [$slot, 123];
+            yield $name.' object' => [$slot, new \stdClass()];
+        }
     }
 
     public function testSubject()
@@ -688,7 +715,7 @@ class EmailTest extends TestCase
                         "subtype": "octet-stream",
                         "disposition": "attachment",
                         "name": "test.txt",
-                        "encoding": "base64",
+                        "encoding": null,
                         "headers": [],
                         "class": "Symfony\\\Component\\\Mime\\\Part\\\DataPart"
                     }
@@ -734,6 +761,53 @@ class EmailTest extends TestCase
         $expected->from('fabien@symfony.com');
         $this->assertEquals($expected->getHeaders(), $n->getHeaders());
         $this->assertEquals($expected->getBody(), $n->getBody());
+    }
+
+    public function testSymfonySerializeKeepsDefaultEncodingInForms()
+    {
+        $e = new Email();
+        $e->to('you@example.com');
+        $e->text('Text content');
+        $e->addPart(new DataPart('Some Text file', 'default.txt'));
+        $e->addPart(new DataPart('Some Text file', 'explicit.txt', null, 'base64'));
+
+        $serializer = self::createMimeSerializer();
+        $n = $serializer->deserialize($serializer->serialize($e, 'json'), Email::class, 'json');
+        [$default, $explicit] = (new FormDataPart($n->getAttachments()))->getParts();
+
+        $this->assertSame('8bit', $default->getPreparedHeaders()->getHeaderBody('Content-Transfer-Encoding'));
+        $this->assertSame('base64', $explicit->getPreparedHeaders()->getHeaderBody('Content-Transfer-Encoding'));
+    }
+
+    public function testSymfonyDeserializeKeepsEncodingOfPayloadNormalizedBeforeSymfony82()
+    {
+        $e = new Email();
+        $e->to('you@example.com');
+        $e->text('Text content');
+        $e->addPart(new DataPart('Some Text file', 'default.txt'));
+
+        $serializer = self::createMimeSerializer();
+        // payloads normalized before Symfony 8.2 contain the resolved encoding, which cannot be told apart from an explicit one
+        $json = str_replace('"encoding":null', '"encoding":"base64"', $serializer->serialize($e, 'json'), $count);
+        $this->assertSame(1, $count);
+
+        $n = $serializer->deserialize($json, Email::class, 'json');
+        [$part] = (new FormDataPart($n->getAttachments()))->getParts();
+
+        $this->assertSame('base64', $part->getPreparedHeaders()->getHeaderBody('Content-Transfer-Encoding'));
+    }
+
+    private static function createMimeSerializer(): Serializer
+    {
+        $extractor = new PhpDocExtractor();
+        $propertyNormalizer = new PropertyNormalizer(null, null, $extractor);
+
+        return new Serializer([
+            new ArrayDenormalizer(),
+            new MimeMessageNormalizer($propertyNormalizer),
+            new ObjectNormalizer(null, null, null, $extractor),
+            $propertyNormalizer,
+        ], [new JsonEncoder()]);
     }
 
     public function testMissingHeaderDoesNotThrowError()

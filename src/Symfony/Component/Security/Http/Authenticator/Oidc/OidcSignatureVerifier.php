@@ -15,22 +15,13 @@ use Jose\Component\Checker;
 use Jose\Component\Core\Algorithm;
 use Jose\Component\Core\AlgorithmManager;
 use Jose\Component\Core\JWKSet;
-use Jose\Component\Signature\Algorithm\ES256;
-use Jose\Component\Signature\Algorithm\ES384;
-use Jose\Component\Signature\Algorithm\ES512;
-use Jose\Component\Signature\Algorithm\PS256;
-use Jose\Component\Signature\Algorithm\PS384;
-use Jose\Component\Signature\Algorithm\PS512;
-use Jose\Component\Signature\Algorithm\RS256;
-use Jose\Component\Signature\Algorithm\RS384;
-use Jose\Component\Signature\Algorithm\RS512;
 use Jose\Component\Signature\JWSTokenSupport;
 use Jose\Component\Signature\JWSVerifier;
 use Jose\Component\Signature\Serializer\CompactSerializer;
 use Jose\Component\Signature\Serializer\JWSSerializerManager;
 use Psr\Clock\ClockInterface;
-use Symfony\Component\Clock\Clock;
 use Symfony\Component\Security\Core\Exception\AuthenticationException;
+use Symfony\Component\Security\Http\OAuth2\JwsAlgorithms;
 use Symfony\Component\Security\Http\Oidc\OidcDiscovery;
 use Symfony\Contracts\Cache\CacheInterface;
 use Symfony\Contracts\Cache\ItemInterface;
@@ -50,29 +41,9 @@ use Symfony\Contracts\HttpClient\HttpClientInterface;
 final class OidcSignatureVerifier
 {
     /**
-     * The asymmetric algorithms the "oidc" access token handler supports too.
-     *
-     * No HMAC algorithm is part of them, so a public key published by the provider can never
-     * be turned into the shared secret of an "HS256" token (key confusion).
-     */
-    private const SIGNATURE_ALGORITHMS = [
-        'RS256' => RS256::class,
-        'RS384' => RS384::class,
-        'RS512' => RS512::class,
-        'ES256' => ES256::class,
-        'ES384' => ES384::class,
-        'ES512' => ES512::class,
-        'PS256' => PS256::class,
-        'PS384' => PS384::class,
-        'PS512' => PS512::class,
-    ];
-
-    /**
      * How long a JWKS refetched for an unknown "kid" is kept before another one is allowed.
      */
     private const ROTATION_COOLDOWN = 60;
-
-    private readonly ClockInterface $clock;
 
     /**
      * @param list<string> $algorithms                  The signature algorithms accepted to verify the ID token (e.g. ["RS256"])
@@ -87,13 +58,8 @@ final class OidcSignatureVerifier
         private readonly array $algorithms = ['RS256'],
         private readonly int $jwksCacheTtl = 3600,
         private readonly bool $enforceKeyUsageVerification = true,
-        ?ClockInterface $clock = null,
+        private readonly ?ClockInterface $clock = null,
     ) {
-        if (null === $clock && !class_exists(Clock::class)) {
-            throw new \LogicException(\sprintf('The "symfony/clock" component is required to build "%s" without a clock. Try running "composer require symfony/clock", or pass any PSR-20 clock to the constructor.', self::class));
-        }
-
-        $this->clock = $clock ?? new Clock();
     }
 
     /**
@@ -175,12 +141,14 @@ final class OidcSignatureVerifier
 
     private function createAlgorithmManager(): AlgorithmManager
     {
+        // no MAC algorithm is accepted, so a public key published by the provider can never
+        // be turned into the shared secret of an "HS256" token (key confusion)
         return new AlgorithmManager(array_map(static function (string $name): Algorithm {
-            if (!isset(self::SIGNATURE_ALGORITHMS[$name])) {
-                throw new \LogicException(\sprintf('Unsupported OIDC ID token signature algorithm "%s". Supported algorithms are: "%s".', $name, implode('", "', array_keys(self::SIGNATURE_ALGORITHMS))));
+            if (!isset(JwsAlgorithms::ASYMMETRIC[$name])) {
+                throw new \LogicException(\sprintf('Unsupported OIDC ID token signature algorithm "%s". Supported algorithms are: "%s".', $name, implode('", "', array_keys(JwsAlgorithms::ASYMMETRIC))));
             }
 
-            return new (self::SIGNATURE_ALGORITHMS[$name])();
+            return new (JwsAlgorithms::ASYMMETRIC[$name])();
         }, $this->algorithms));
     }
 
@@ -211,10 +179,10 @@ final class OidcSignatureVerifier
         // marker would collide with the other strictness of the same endpoint
         $cacheKey = 'oidc_jwks.'.($this->enforceKeyUsageVerification ? '' : 'lax.').hash('xxh128', $jwksUri);
         $compute = fn (ItemInterface $item): array => [
-            'keys' => OidcJwks::fetchKeys($this->httpClient, $jwksUri, $item, $this->jwksCacheTtl, $this->enforceKeyUsageVerification),
+            'keys' => OidcJwks::fetchKeys($this->httpClient, $jwksUri, $item, $this->jwksCacheTtl, $this->enforceKeyUsageVerification, $this->clock),
             // the JWKS is stored with the time it was fetched, so that the rotation
             // refetch below can be throttled without a second cache entry
-            'fetched_at' => $this->clock->now()->getTimestamp(),
+            'fetched_at' => $this->clock?->now()->getTimestamp() ?? time(),
         ];
 
         /** @var array{keys: list<array<string, mixed>>, fetched_at: int} $jwks */
@@ -222,7 +190,7 @@ final class OidcSignatureVerifier
 
         if (null !== $kid
             && !$this->hasKey($jwks['keys'], $kid)
-            && ($jwks['fetched_at'] ?? 0) <= $this->clock->now()->getTimestamp() - self::ROTATION_COOLDOWN
+            && ($jwks['fetched_at'] ?? 0) <= ($this->clock?->now()->getTimestamp() ?? time()) - self::ROTATION_COOLDOWN
         ) {
             $jwks = $this->jwksCache->get($cacheKey, $compute, \INF);
         }

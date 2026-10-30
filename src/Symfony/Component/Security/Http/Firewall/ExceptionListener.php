@@ -13,6 +13,7 @@ namespace Symfony\Component\Security\Http\Firewall;
 
 use Psr\Log\LoggerInterface;
 use Symfony\Component\EventDispatcher\EventDispatcherInterface;
+use Symfony\Component\ExpressionLanguage\Expression;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Event\ExceptionEvent;
@@ -22,7 +23,7 @@ use Symfony\Component\HttpKernel\HttpKernelInterface;
 use Symfony\Component\HttpKernel\KernelEvents;
 use Symfony\Component\Security\Core\Authentication\AuthenticationTrustResolverInterface;
 use Symfony\Component\Security\Core\Authentication\Token\Storage\TokenStorageInterface;
-use Symfony\Component\Security\Core\Authorization\Voter\AuthenticatedVoter;
+use Symfony\Component\Security\Core\Authorization\Voter\VoterInterface;
 use Symfony\Component\Security\Core\Exception\AccessDeniedException;
 use Symfony\Component\Security\Core\Exception\AccountStatusException;
 use Symfony\Component\Security\Core\Exception\AuthenticationException;
@@ -138,7 +139,30 @@ class ExceptionListener
         $event->setThrowable(new AccessDeniedHttpException($exception->getMessage(), $exception));
 
         $token = $this->tokenStorage->getToken();
-        if (!$this->authenticationTrustResolver->isFullFledged($token)) {
+        $isFullFledged = $this->authenticationTrustResolver->isFullFledged($token);
+
+        // a firewall entry point that already knows how to force a fresh proof is used
+        // without any configuration; one that only starts an ordinary login cannot be,
+        // which is exactly what implementing the interface asserts
+        $reAuthenticationEntryPoint = $this->reAuthenticationEntryPoint
+            ?? ($this->authenticationEntryPoint instanceof ReAuthenticationEntryPointInterface ? $this->authenticationEntryPoint : null);
+
+        // a remembered user is known too, so a re-authentication is enough when a vote asks for one
+        if (null !== $token && ($isFullFledged || $this->authenticationTrustResolver->isRememberMe($token)) && null !== $reAuthenticationEntryPoint && null !== $attribute = self::getReAuthenticationAttribute($exception)) {
+            $this->logger?->debug('Starting a re-authentication for "{attribute}".', ['attribute' => $attribute, 'entry_point' => $reAuthenticationEntryPoint]);
+
+            if (!$this->stateless) {
+                $this->setTargetPath($event->getRequest());
+            }
+
+            $event->getRequest()->attributes->set(SecurityRequestAttributes::RE_AUTHENTICATION_ATTRIBUTE, $attribute);
+
+            $event->setResponse($reAuthenticationEntryPoint->startReAuthentication($event->getRequest(), $token));
+
+            return;
+        }
+
+        if (!$isFullFledged) {
             $this->logger?->debug('Access denied, the user is not fully authenticated; redirecting to authentication entry point.', ['exception' => $exception]);
 
             try {
@@ -155,34 +179,7 @@ class ExceptionListener
             return;
         }
 
-        // Matching the whole attribute list rather than searching it is deliberate: an
-        // access_control rule is decided on all of its roles at once, so a denial of
-        // [ROLE_ADMIN, IS_AUTHENTICATED_RECENTLY] does not say which one failed, and
-        // re-authenticating would not help a user who simply lacks the role.
-        // a firewall entry point that already knows how to force a fresh proof is used
-        // without any configuration; one that only starts an ordinary login cannot be,
-        // which is exactly what implementing the interface asserts
-        $reAuthenticationEntryPoint = $this->reAuthenticationEntryPoint
-            ?? ($this->authenticationEntryPoint instanceof ReAuthenticationEntryPointInterface ? $this->authenticationEntryPoint : null);
-
-        if (null !== $token
-            && null !== $reAuthenticationEntryPoint
-            && \in_array($exception->getAttributes(), [[AuthenticatedVoter::IS_AUTHENTICATED_RECENTLY], [AuthenticatedVoter::IS_AUTHENTICATED_VERY_RECENTLY]], true)
-        ) {
-            $this->logger?->debug('The authentication is not recent enough, starting re-authentication.', ['entry_point' => $reAuthenticationEntryPoint]);
-
-            if (!$this->stateless) {
-                $this->setTargetPath($event->getRequest());
-            }
-
-            $event->getRequest()->attributes->set(SecurityRequestAttributes::RE_AUTHENTICATION_ATTRIBUTE, $exception->getAttributes()[0]);
-
-            $event->setResponse($reAuthenticationEntryPoint->startReAuthentication($event->getRequest(), $token));
-
-            return;
-        }
-
-        $this->logger?->debug('Access denied, the user is neither anonymous, nor remember-me.', ['exception' => $exception]);
+        $this->logger?->debug('Access denied, the user is neither anonymous, nor remember-me, nor asked to re-authenticate.', ['exception' => $exception]);
 
         try {
             if (null !== $this->accessDeniedHandler) {
@@ -248,6 +245,32 @@ class ExceptionListener
         if ($request->hasSession() && $request->isMethodSafe() && !$request->isXmlHttpRequest()) {
             $this->saveTargetPath($request->getSession(), $this->firewallName, $request->getUri());
         }
+    }
+
+    /**
+     * Returns the attribute a voter that denied the single denied attribute requested a re-authentication for.
+     *
+     * Several attributes are left alone, as deciding them at once is deprecated since Symfony 8.2.
+     * The votes of the checks a voter makes on other attributes land in the same decision, so the request has to name the denied attribute for the denial to be told apart from them.
+     * An expression or a closure decides its checks apart, so the request of its voter names the check a re-authentication could grant.
+     */
+    private static function getReAuthenticationAttribute(AccessDeniedException $exception): ?string
+    {
+        $attributes = $exception->getAttributes();
+
+        if (1 !== \count($attributes)) {
+            return null;
+        }
+
+        $checksApart = $attributes[0] instanceof Expression || $attributes[0] instanceof \Closure;
+
+        foreach ($exception->getAccessDecision()?->votes ?? [] as $vote) {
+            if (VoterInterface::ACCESS_DENIED === $vote->result && null !== $vote->reAuthenticationAttribute && ($checksApart || $attributes[0] === $vote->reAuthenticationAttribute)) {
+                return $vote->reAuthenticationAttribute;
+            }
+        }
+
+        return null;
     }
 
     private function throwUnauthorizedException(AuthenticationException $authException): never

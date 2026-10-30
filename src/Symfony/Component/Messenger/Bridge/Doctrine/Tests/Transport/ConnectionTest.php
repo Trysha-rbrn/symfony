@@ -21,6 +21,7 @@ use Doctrine\DBAL\Platforms\MySQL80Platform;
 use Doctrine\DBAL\Platforms\MySQLPlatform;
 use Doctrine\DBAL\Platforms\OraclePlatform;
 use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
+use Doctrine\DBAL\Platforms\SQLitePlatform;
 use Doctrine\DBAL\Platforms\SQLServerPlatform;
 use Doctrine\DBAL\Query\ForUpdate\ConflictResolutionMode;
 use Doctrine\DBAL\Query\QueryBuilder;
@@ -141,6 +142,65 @@ class ConnectionTest extends TestCase
         $connection = new Connection(['skip_locked' => true], $driverConnection);
         $doctrineEnvelope = $connection->get();
         $this->assertNull($doctrineEnvelope);
+    }
+
+    public function testGetRethrowsTheCommitExceptionWhenTheTransactionIsNoLongerActive()
+    {
+        $queryBuilder = $this->getQueryBuilderStub();
+        $driverConnection = $this->getDBALConnection(true);
+        $stmt = $this->getGetResultMock(false);
+        $exception = $this->createStub(DBALException::class);
+
+        $queryBuilder
+            ->method('getParameters')
+            ->willReturn([]);
+        $queryBuilder
+            ->method('getParameterTypes')
+            ->willReturn([]);
+        $queryBuilder
+            ->method('getSQL')
+            ->willReturn('SELECT FOR UPDATE');
+        $driverConnection
+            ->method('createQueryBuilder')
+            ->willReturn($queryBuilder);
+        $driverConnection
+            ->method('executeQuery')
+            ->willReturn($stmt);
+        $driverConnection
+            ->method('commit')
+            ->willThrowException($exception);
+        $driverConnection
+            ->method('isTransactionActive')
+            ->willReturn(false);
+        $driverConnection->expects($this->never())
+            ->method('rollBack');
+
+        $connection = new Connection([], $driverConnection);
+
+        $this->expectExceptionObject($exception);
+        $connection->get();
+    }
+
+    public function testCloseIfDisconnectedClosesADeadConnection()
+    {
+        $driverConnection = $this->getDBALConnection(true);
+        $driverConnection->method('executeQuery')->willThrowException($this->createStub(DBALException::class));
+        $driverConnection->expects($this->once())->method('close');
+
+        $connection = new Connection([], $driverConnection);
+
+        $this->assertTrue($connection->closeIfDisconnected());
+    }
+
+    public function testCloseIfDisconnectedKeepsAWorkingConnection()
+    {
+        $driverConnection = $this->getDBALConnection(true);
+        $driverConnection->expects($this->once())->method('executeQuery')->willReturn($this->createStub(Result::class));
+        $driverConnection->expects($this->never())->method('close');
+
+        $connection = new Connection([], $driverConnection);
+
+        $this->assertFalse($connection->closeIfDisconnected());
     }
 
     public function testItThrowsATransportExceptionIfItCannotAcknowledgeMessage()
@@ -317,6 +377,45 @@ class ConnectionTest extends TestCase
         $this->expectExceptionMessage('Doctrine redeliver_timeout (30s) cannot be smaller than the keepalive interval (60s).');
 
         $connection->keepalive('1', 60);
+    }
+
+    public function testSendRethrowsTheCommitExceptionWhenTheTransactionIsNoLongerActive()
+    {
+        $queryBuilder = $this->getQueryBuilderStub();
+        $driverConnection = $this->getDBALConnection(true);
+        $exception = $this->createStub(DBALException::class);
+
+        $queryBuilder
+            ->method('insert')
+            ->willReturn($queryBuilder);
+        $queryBuilder
+            ->method('values')
+            ->willReturn($queryBuilder);
+        $queryBuilder
+            ->method('getSQL')
+            ->willReturn('INSERT');
+        $driverConnection
+            ->method('createQueryBuilder')
+            ->willReturn($queryBuilder);
+        $driverConnection
+            ->method('executeStatement')
+            ->willReturn(1);
+        $driverConnection
+            ->method('lastInsertId')
+            ->willReturn('1');
+        $driverConnection
+            ->method('commit')
+            ->willThrowException($exception);
+        $driverConnection
+            ->method('isTransactionActive')
+            ->willReturn(false);
+        $driverConnection->expects($this->never())
+            ->method('rollBack');
+
+        $connection = new Connection([], $driverConnection);
+
+        $this->expectExceptionObject($exception);
+        $connection->send('test', []);
     }
 
     #[DataProvider('provideDelays')]
@@ -807,6 +906,107 @@ class ConnectionTest extends TestCase
         yield 'Oracle' => [
             new OraclePlatform(),
             'SELECT m.id AS "id", m.body AS "body", m.headers AS "headers", m.queue_name AS "queue_name", m.created_at AS "created_at", m.available_at AS "available_at", m.delivered_at AS "delivered_at" FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.delivered_at is null OR m.delivered_at < ?) AND (m.available_at <= ?) FETCH NEXT 50 ROWS ONLY',
+        ];
+    }
+
+    #[DataProvider('provideFindAllInBatchesSqlGeneratedByPlatform')]
+    public function testFindAllInBatchesSqlGenerated(AbstractPlatform $platform, string $neverDeliveredSql, string $sameAvailableAtSql, string $nextAvailableAtSql, string $deliveryTimedOutSql, string $sameDeliveredAtSql, string $nextDeliveredAtSql, string $nextTimedOutAvailableAtSql)
+    {
+        $driverConnection = $this->createStub(DBALConnection::class);
+        $driverConnection->method('getDatabasePlatform')->willReturn($platform);
+        $driverConnection->method('createQueryBuilder')->willReturnCallback(static fn () => new QueryBuilder($driverConnection));
+
+        $result = $this->createStub(Result::class);
+        $neverDelivered = array_map(static fn (int $id) => ['id' => $id, 'body' => '{}', 'headers' => '[]', 'available_at' => '2019-03-15 12:00:00', 'delivered_at' => null], range(1, 100));
+        $deliveryTimedOut = array_map(static fn (int $id) => ['id' => $id, 'body' => '{}', 'headers' => '[]', 'available_at' => '2019-03-15 12:00:00', 'delivered_at' => '2019-03-15 13:00:00'], range(101, 200));
+        $result->method('fetchOne')->willReturn(500);
+        $result->method('fetchAllAssociative')->willReturnOnConsecutiveCalls($neverDelivered, [], [], $deliveryTimedOut, [], [], []);
+
+        $statements = [];
+        $driverConnection->method('executeQuery')->willReturnCallback(static function (string $sql, array $parameters) use (&$statements, $result) {
+            $statements[] = [$sql, $parameters];
+
+            return $result;
+        });
+
+        $connection = new Connection([], $driverConnection);
+
+        $this->assertCount(200, iterator_to_array($connection->findAllInBatches(), false));
+        $this->assertSame(['SELECT MAX(m.id) FROM messenger_messages m', $neverDeliveredSql, $sameAvailableAtSql, $nextAvailableAtSql, $deliveryTimedOutSql, $sameDeliveredAtSql, $nextDeliveredAtSql, $nextTimedOutAvailableAtSql], array_column($statements, 0));
+        $this->assertSame(array_fill(0, 7, 500), array_column(array_column(\array_slice($statements, 1), 1), 2));
+        $this->assertSame(['2019-03-15 12:00:00', 100], \array_slice($statements[2][1], 3));
+        $this->assertSame(['2019-03-15 12:00:00'], \array_slice($statements[3][1], 3));
+        $this->assertSame(['2019-03-15 12:00:00', '2019-03-15 13:00:00', 200], \array_slice($statements[5][1], 4));
+        $this->assertSame(['2019-03-15 12:00:00', '2019-03-15 13:00:00'], \array_slice($statements[6][1], 4));
+        $this->assertSame(['2019-03-15 12:00:00'], \array_slice($statements[7][1], 4));
+    }
+
+    public static function provideFindAllInBatchesSqlGeneratedByPlatform(): iterable
+    {
+        yield 'MySQL' => [
+            new MySQLPlatform(),
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (NOT (m.delivered_at IS NOT NULL)) ORDER BY m.available_at, m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at IS NULL) AND (m.available_at = ?) AND (m.id > ?) ORDER BY m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (NOT (m.delivered_at IS NOT NULL)) AND (m.available_at > ?) ORDER BY m.available_at, m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) ORDER BY m.available_at, m.delivered_at, m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) AND (m.available_at = ?) AND (m.delivered_at = ?) AND (m.id > ?) ORDER BY m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) AND (m.available_at = ?) AND (m.delivered_at > ?) ORDER BY m.delivered_at, m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) AND (m.available_at > ?) ORDER BY m.available_at, m.delivered_at, m.id LIMIT 100',
+        ];
+
+        yield 'MariaDB' => [
+            new MariaDBPlatform(),
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (NOT (m.delivered_at IS NOT NULL)) ORDER BY m.available_at, m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at IS NULL) AND (m.available_at = ?) AND (m.id > ?) ORDER BY m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (NOT (m.delivered_at IS NOT NULL)) AND (m.available_at > ?) ORDER BY m.available_at, m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) ORDER BY m.available_at, m.delivered_at, m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) AND (m.available_at = ?) AND (m.delivered_at = ?) AND (m.id > ?) ORDER BY m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) AND (m.available_at = ?) AND (m.delivered_at > ?) ORDER BY m.delivered_at, m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) AND (m.available_at > ?) ORDER BY m.available_at, m.delivered_at, m.id LIMIT 100',
+        ];
+
+        yield 'PostgreSQL' => [
+            new PostgreSQLPlatform(),
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (NOT (m.delivered_at IS NOT NULL)) ORDER BY m.available_at, m.delivered_at, m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at IS NULL) AND (m.available_at = ?) AND (m.id > ?) ORDER BY m.delivered_at, m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (NOT (m.delivered_at IS NOT NULL)) AND (m.available_at > ?) ORDER BY m.available_at, m.delivered_at, m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) ORDER BY m.available_at, m.delivered_at, m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) AND (m.available_at = ?) AND (m.delivered_at = ?) AND (m.id > ?) ORDER BY m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) AND (m.available_at = ?) AND (m.delivered_at > ?) ORDER BY m.delivered_at, m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) AND (m.available_at > ?) ORDER BY m.available_at, m.delivered_at, m.id LIMIT 100',
+        ];
+
+        yield 'SQLite' => [
+            new SQLitePlatform(),
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (NOT (m.delivered_at IS NOT NULL)) ORDER BY m.available_at, m.delivered_at, m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at IS NULL) AND (m.available_at = ?) AND (m.id > ?) ORDER BY m.delivered_at, m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (NOT (m.delivered_at IS NOT NULL)) AND (m.available_at > ?) ORDER BY m.available_at, m.delivered_at, m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) ORDER BY m.available_at, m.delivered_at, m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) AND (m.available_at = ?) AND (m.delivered_at = ?) AND (m.id > ?) ORDER BY m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) AND (m.available_at = ?) AND (m.delivered_at > ?) ORDER BY m.delivered_at, m.id LIMIT 100',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) AND (m.available_at > ?) ORDER BY m.available_at, m.delivered_at, m.id LIMIT 100',
+        ];
+
+        yield 'SQL Server' => [
+            new SQLServerPlatform(),
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (NOT (m.delivered_at IS NOT NULL)) ORDER BY m.available_at, m.delivered_at, m.id OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at IS NULL) AND (m.available_at = ?) AND (m.id > ?) ORDER BY m.delivered_at, m.id OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (NOT (m.delivered_at IS NOT NULL)) AND (m.available_at > ?) ORDER BY m.available_at, m.delivered_at, m.id OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) ORDER BY m.available_at, m.delivered_at, m.id OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) AND (m.available_at = ?) AND (m.delivered_at = ?) AND (m.id > ?) ORDER BY m.id OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) AND (m.available_at = ?) AND (m.delivered_at > ?) ORDER BY m.delivered_at, m.id OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY',
+            'SELECT m.* FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) AND (m.available_at > ?) ORDER BY m.available_at, m.delivered_at, m.id OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY',
+        ];
+
+        yield 'Oracle' => [
+            new OraclePlatform(),
+            'SELECT m.id AS "id", m.body AS "body", m.headers AS "headers", m.queue_name AS "queue_name", m.created_at AS "created_at", m.available_at AS "available_at", m.delivered_at AS "delivered_at" FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (NOT (m.delivered_at IS NOT NULL)) ORDER BY m.available_at, m.delivered_at, m.id FETCH NEXT 100 ROWS ONLY',
+            'SELECT m.id AS "id", m.body AS "body", m.headers AS "headers", m.queue_name AS "queue_name", m.created_at AS "created_at", m.available_at AS "available_at", m.delivered_at AS "delivered_at" FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at IS NULL) AND (m.available_at = ?) AND (m.id > ?) ORDER BY m.delivered_at, m.id FETCH NEXT 100 ROWS ONLY',
+            'SELECT m.id AS "id", m.body AS "body", m.headers AS "headers", m.queue_name AS "queue_name", m.created_at AS "created_at", m.available_at AS "available_at", m.delivered_at AS "delivered_at" FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (NOT (m.delivered_at IS NOT NULL)) AND (m.available_at > ?) ORDER BY m.available_at, m.delivered_at, m.id FETCH NEXT 100 ROWS ONLY',
+            'SELECT m.id AS "id", m.body AS "body", m.headers AS "headers", m.queue_name AS "queue_name", m.created_at AS "created_at", m.available_at AS "available_at", m.delivered_at AS "delivered_at" FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) ORDER BY m.available_at, m.delivered_at, m.id FETCH NEXT 100 ROWS ONLY',
+            'SELECT m.id AS "id", m.body AS "body", m.headers AS "headers", m.queue_name AS "queue_name", m.created_at AS "created_at", m.available_at AS "available_at", m.delivered_at AS "delivered_at" FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) AND (m.available_at = ?) AND (m.delivered_at = ?) AND (m.id > ?) ORDER BY m.id FETCH NEXT 100 ROWS ONLY',
+            'SELECT m.id AS "id", m.body AS "body", m.headers AS "headers", m.queue_name AS "queue_name", m.created_at AS "created_at", m.available_at AS "available_at", m.delivered_at AS "delivered_at" FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) AND (m.available_at = ?) AND (m.delivered_at > ?) ORDER BY m.delivered_at, m.id FETCH NEXT 100 ROWS ONLY',
+            'SELECT m.id AS "id", m.body AS "body", m.headers AS "headers", m.queue_name AS "queue_name", m.created_at AS "created_at", m.available_at AS "available_at", m.delivered_at AS "delivered_at" FROM messenger_messages m WHERE (m.queue_name = ?) AND (m.available_at <= ?) AND (m.id <= ?) AND (m.delivered_at < ?) AND (m.available_at > ?) ORDER BY m.available_at, m.delivered_at, m.id FETCH NEXT 100 ROWS ONLY',
         ];
     }
 

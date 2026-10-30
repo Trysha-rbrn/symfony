@@ -21,7 +21,6 @@ use Symfony\Component\DependencyInjection\Kernel\RequiredBundle;
 use Symfony\Component\DependencyInjection\Kernel\ServicesBundle;
 use Symfony\Component\DependencyInjection\Loader\Configurator\ContainerConfigurator;
 use Symfony\Component\DependencyInjection\Reference;
-use Symfony\Component\HttpKernel\EventListener\RateLimitAttributeListener;
 use Symfony\Component\Lock\LockInterface;
 use Symfony\Component\RateLimiter\DependencyInjection\DefaultLockFactoryPass;
 use Symfony\Component\RateLimiter\Storage\CacheStorage;
@@ -46,24 +45,7 @@ class RateLimiterBundle extends AbstractBundle
     {
         $definition->rootNode()
             ->canBeDisabled()
-            ->beforeNormalization()
-                ->ifArray()
-                ->then(static function ($v) {
-                    if (!isset($v['limiters']) && !isset($v['limiter'])) {
-                        $v = ['limiters' => $v];
-
-                        // hoist back the keys the shorthand would otherwise read as limiter names
-                        foreach (['enabled', 'builder'] as $key) {
-                            if (\array_key_exists($key, $v['limiters'])) {
-                                $v[$key] = $v['limiters'][$key];
-                                unset($v['limiters'][$key]);
-                            }
-                        }
-                    }
-
-                    return $v;
-                })
-            ->end()
+            ->acceptAndWrap(['array'], 'limiters')
             ->children()
                 ->arrayNode('builder')
                     ->info('Configuration for the RateLimiterBuilder service.')
@@ -177,10 +159,6 @@ class RateLimiterBundle extends AbstractBundle
         }
 
         $configurator->import('Resources/config/rate_limiter.php');
-
-        if (!class_exists(RateLimitAttributeListener::class)) {
-            $container->removeDefinition('rate_limiter.attribute_listener');
-        }
 
         $limiters = [];
         $compoundLimiters = [];

@@ -11,10 +11,15 @@
 
 namespace Symfony\Component\KeyManagement;
 
+use Doctrine\DBAL\Types\Type;
+use Doctrine\ORM\Mapping\Embeddable;
+use Doctrine\ORM\Mapping\Entity;
+use Doctrine\ORM\Mapping\MappedSuperclass;
 use Symfony\Bridge\Doctrine\SchemaListener\AbstractSchemaListener;
 use Symfony\Component\Config\Definition\Configurator\DefinitionConfigurator;
 use Symfony\Component\Console\Application;
 use Symfony\Component\DependencyInjection\Argument\IteratorArgument;
+use Symfony\Component\DependencyInjection\Argument\LazyProxyArgument;
 use Symfony\Component\DependencyInjection\Argument\ServiceLocatorArgument;
 use Symfony\Component\DependencyInjection\Argument\TaggedIteratorArgument;
 use Symfony\Component\DependencyInjection\Compiler\PassConfig;
@@ -27,12 +32,18 @@ use Symfony\Component\DependencyInjection\Kernel\AbstractBundle;
 use Symfony\Component\DependencyInjection\Kernel\RequiredBundle;
 use Symfony\Component\DependencyInjection\Kernel\ServicesBundle;
 use Symfony\Component\DependencyInjection\Loader\Configurator\ContainerConfigurator;
+use Symfony\Component\DependencyInjection\Parameter;
 use Symfony\Component\DependencyInjection\Reference;
+use Symfony\Component\DependencyInjection\ServiceLocator;
 use Symfony\Component\KeyManagement\Bridge\DoctrineDbal\DataKeyStore;
+use Symfony\Component\KeyManagement\Bridge\DoctrineDbal\EncryptedTypes;
 use Symfony\Component\KeyManagement\Bridge\DoctrineOrm\DependencyInjection\RegisterBlindIndexesPass;
+use Symfony\Component\KeyManagement\Bridge\DoctrineOrm\DependencyInjection\RegisterEncryptedColumnsPass;
 use Symfony\Component\KeyManagement\Bridge\DoctrineOrm\SchemaListener\DataKeyStoreSchemaListener;
 use Symfony\Component\KeyManagement\Bridge\Flysystem\DependencyInjection\RegisterFlysystemStoragesPass;
+use Symfony\Component\KeyManagement\DependencyInjection\CheckDataKeyStoreSecretPass;
 use Symfony\Component\KeyManagement\DependencyInjection\KeyManagementPass;
+use Symfony\Component\KeyManagement\DependencyInjection\RegisterDoctrineDbalTypesPass;
 use Symfony\Component\KeyManagement\Factory\KmsFactoryInterface;
 
 /**
@@ -62,10 +73,23 @@ class KeyManagementBundle extends AbstractBundle
         return $this->path ??= __DIR__;
     }
 
+    /**
+     * Declares the encrypted Doctrine DBAL types when no DoctrineBundle connection declares them.
+     *
+     * They must be known before any entry point runs its first query.
+     */
+    public function boot(): void
+    {
+        if ($this->container->has('key_management.doctrine_dbal.encrypted_types')) {
+            $this->container->get('key_management.doctrine_dbal.encrypted_types')->register();
+        }
+    }
+
     public function build(ContainerBuilder $container): void
     {
         // the container can drop the data collector this pass looks for, so run after it
         $container->addCompilerPass(new KeyManagementPass(), PassConfig::TYPE_BEFORE_OPTIMIZATION, -16);
+        $container->addCompilerPass(new CheckDataKeyStoreSecretPass());
 
         if (class_exists(RegisterFlysystemStoragesPass::class)) {
             $container->addCompilerPass(new RegisterFlysystemStoragesPass());
@@ -74,6 +98,13 @@ class KeyManagementBundle extends AbstractBundle
         if (class_exists(RegisterBlindIndexesPass::class)) {
             $container->addCompilerPass(new RegisterBlindIndexesPass());
         }
+
+        if (class_exists(RegisterEncryptedColumnsPass::class)) {
+            $container->addCompilerPass(new RegisterEncryptedColumnsPass());
+        }
+
+        // after RegisterEncryptedColumnsPass, which adds the types of the encrypted columns
+        $container->addCompilerPass(new RegisterDoctrineDbalTypesPass());
     }
 
     public function configure(DefinitionConfigurator $definition): void
@@ -103,6 +134,14 @@ class KeyManagementBundle extends AbstractBundle
                                 if (\array_key_exists($name, $client['members'])) {
                                     throw new InvalidArgumentException(\sprintf('The composite KMS client "%s" cannot be a member of itself.', $name));
                                 }
+                                if (\in_array($name, $client['retired'], true)) {
+                                    throw new InvalidArgumentException(\sprintf('The composite KMS client "%s" cannot be a retired member of itself.', $name));
+                                }
+                                foreach ($client['retired'] as $retired) {
+                                    if (\array_key_exists($retired, $client['members'])) {
+                                        throw new InvalidArgumentException(\sprintf('The KMS client "%s" cannot be both an active and a retired member of the composite KMS client "%s".', $retired, $name));
+                                    }
+                                }
                             }
 
                             return $clients;
@@ -117,13 +156,13 @@ class KeyManagementBundle extends AbstractBundle
                             ->ifTrue(static fn (array $client): bool => isset($client['dsn']) === (bool) $client['members'])
                             ->thenInvalid('A KMS client is either a DSN or the members of a composite client, not both nor neither.')
                         ->end()
+                        ->validate()
+                            ->ifTrue(static fn (array $client): bool => isset($client['dsn']) && (bool) $client['retired'])
+                            ->thenInvalid('A KMS client with a DSN cannot have retired members.')
+                        ->end()
                         ->children()
-                            ->scalarNode('dsn')
+                            ->stringNode('dsn')
                                 ->cannotBeEmpty()
-                                ->validate()
-                                    ->ifTrue(static fn ($dsn): bool => !\is_string($dsn))
-                                    ->thenInvalid('The DSN of a KMS client must be a string, got %s.')
-                                ->end()
                             ->end()
                             ->arrayNode('members', 'member')
                                 ->info('Map of member name to the master key it wraps under, null for the key id given to each call. Everything the composite client encrypts is wrapped by each member and read back through the first one that answers, the first member minting the data keys, so that losing one provider loses nothing. Each member is a full path to the data.')
@@ -131,6 +170,24 @@ class KeyManagementBundle extends AbstractBundle
                                 ->useAttributeAsKey('name')
                                 ->scalarPrototype()
                                     ->defaultNull()
+                                ->end()
+                            ->end()
+                            ->arrayNode('retired')
+                                ->info('Former member names accepted for reads but never used for writes. Each remains a full path to the plaintext.')
+                                ->validate()
+                                    ->ifTrue(static fn (array $retired): bool => !array_is_list($retired))
+                                    ->thenInvalid('The retired members of a composite KMS client are a list of names, got %s.')
+                                ->end()
+                                ->validate()
+                                    ->ifTrue(static fn (array $retired): bool => \count($retired) !== \count(array_unique($retired)))
+                                    ->thenInvalid('The retired members of a composite KMS client are listed once each, got %s.')
+                                ->end()
+                                ->scalarPrototype()
+                                    ->cannotBeEmpty()
+                                    ->validate()
+                                        ->ifTrue(static fn ($name): bool => !\is_string($name) || 0xFF < \strlen($name))
+                                        ->thenInvalid('A retired KMS client name is a string of at most 255 bytes, got %s.')
+                                    ->end()
                                 ->end()
                             ->end()
                         ->end()
@@ -149,22 +206,64 @@ class KeyManagementBundle extends AbstractBundle
                             ->defaultNull()
                             ->cannotBeEmpty()
                         ->end()
+                        ->arrayNode('allowed_clients')
+                            ->info('Additional clients trusted to wrap and unwrap stored data keys. The store client is always trusted.')
+                            ->scalarPrototype()->cannotBeEmpty()->end()
+                            ->defaultValue([])
+                        ->end()
                         ->scalarNode('key_id')
                             ->info('Master key wrapping the data keys this store creates (backend-specific: alias, ARN, key URL, ...).')
                             ->isRequired()
                             ->cannotBeEmpty()
+                        ->end()
+                        ->arrayNode('secret')
+                            ->info('Secret used to authenticate the stored data keys, defaults to the "kernel.secret" parameter. List several to rotate it: the first one signs, all of them verify.')
+                            ->acceptAndWrap(['string'])
+                            ->performNoDeepMerging()
+                            ->scalarPrototype()->cannotBeEmpty()->end()
                         ->end()
                         ->scalarNode('table')
                             ->info('Name of the table holding the wrapped data keys.')
                             ->defaultValue('key_management_data_keys')
                             ->cannotBeEmpty()
                         ->end()
+                        ->booleanNode('read_self_contained')
+                            ->info('Whether a payload carrying its own wrapped data key is still read, through the default client. On while migrating to the stored format, off afterwards: such a payload resolves no row, so nothing the store checks applies to it.')
+                            ->defaultFalse()
+                        ->end()
+                        ->booleanNode('bind_wrapping_context')
+                            ->info('Whether the backend authenticates the reference and the scope of each data key as it wraps it. Off by default: not every backend accepts authenticated data, and turning it on needs the stored keys rewrapped.')
+                            ->defaultFalse()
+                        ->end()
                         ->variableNode('max_age')
-                            ->info('Seconds after which the current data key of a scope is retired in favour of a fresh one; the default of 30 days keeps what one key seals under the collision bound of the random 96-bit IV each payload carries. 0 retires the key on every call, null never retires it.')
+                            ->info('Seconds after which the current data key of a scope is retired; this does not enforce a usage limit. The default is 30 days; 0 forces rotation on every call and null disables retirement.')
                             ->defaultValue(2592000)
                             ->validate()
                                 ->ifTrue(static fn ($maxAge): bool => null !== $maxAge && (!\is_int($maxAge) || $maxAge < 0))
                                 ->thenInvalid('The maximum age of a data key must be null or a positive integer, got %s.')
+                            ->end()
+                        ->end()
+                    ->end()
+                ->end()
+                ->arrayNode('doctrine_dbal')
+                    ->children()
+                        ->arrayNode('types', 'type')
+                            ->info('Encrypted Doctrine DBAL types by name.')
+                            ->normalizeKeys(false)
+                            ->useAttributeAsKey('name')
+                            ->arrayPrototype()
+                                ->children()
+                                    ->stringNode('type')
+                                        ->info('Doctrine type converting the value before it is encrypted.')
+                                        ->isRequired()
+                                        ->cannotBeEmpty()
+                                    ->end()
+                                    ->stringNode('key')
+                                        ->info('Master key encrypting the values, or the scope of their data key when "store" is configured.')
+                                        ->isRequired()
+                                        ->cannotBeEmpty()
+                                    ->end()
+                                ->end()
                             ->end()
                         ->end()
                     ->end()
@@ -177,9 +276,8 @@ class KeyManagementBundle extends AbstractBundle
      * A client the application built itself is named in "clients" through a "service://<id>" DSN.
      *
      * That scheme is resolved here, when the container is built, so it never reaches the factory
-     * registry: an application that hides it behind an environment variable gets an unsupported
-     * scheme at runtime instead, since nothing can be referenced from a value that is unknown until
-     * then.
+     * registry: an application that hides it behind an environment variable gets an exception at
+     * runtime instead, since nothing can be referenced from a value that is unknown until then.
      *
      * What the scheme registers is a definition rather than an alias, and that is the point: the
      * client keeps the tag the console commands look it up by, the profiler decorates it, and it
@@ -196,6 +294,9 @@ class KeyManagementBundle extends AbstractBundle
 
         if ($container->getParameter('kernel.debug')) {
             $configurator->import('Resources/config/key_management_debug.php');
+
+            // so that a change to the mapping is seen without clearing the cache
+            $container->removeDefinition('cache.key_management.encrypted_columns');
         }
 
         if (class_exists(Application::class)) {
@@ -205,8 +306,18 @@ class KeyManagementBundle extends AbstractBundle
         $container->registerForAutoconfiguration(KmsFactoryInterface::class)
             ->addTag('key_management.factory');
 
-        $container->registerForAutoconfiguration(BlindIndex::class)
+        // The tag carries the name the index derives under, which nothing here can guess, so
+        // RegisterBlindIndexesPass refuses one without it. Tagging every index all the same is
+        // what makes that refusal happen: an index nobody tagged would leave the listener removed
+        // and every indexed column silently empty.
+        $container->registerForAutoconfiguration(BlindIndexInterface::class)
             ->addTag('key_management.blind_index');
+
+        if (class_exists(RegisterEncryptedColumnsPass::class)) {
+            foreach ([Entity::class, Embeddable::class, MappedSuperclass::class] as $mapping) {
+                $container->registerAttributeForAutoconfiguration($mapping, RegisterEncryptedColumnsPass::autoconfigure(...));
+            }
+        }
 
         $clients = $config['clients'];
 
@@ -222,7 +333,7 @@ class KeyManagementBundle extends AbstractBundle
                 ->addTag('key_management.client', ['key' => $name]);
 
             if ($client['members']) {
-                $this->configureCompositeClient($definition, $name, $client['members'], $clients);
+                $this->configureCompositeClient($definition, $name, $client['members'], $client['retired'], $clients);
             } elseif (str_starts_with($dsn = $client['dsn'], self::SERVICE_SCHEME)) {
                 if ('' === $referencedId = substr($dsn, \strlen(self::SERVICE_SCHEME))) {
                     throw new InvalidArgumentException(\sprintf('The DSN of the KMS client "%s" must name a service id after "%s".', $name, self::SERVICE_SCHEME));
@@ -258,6 +369,12 @@ class KeyManagementBundle extends AbstractBundle
         if (isset($config['store']['key_id'])) {
             $this->registerStore($config['store'], array_keys($clients), $defaultName, $container);
         }
+
+        $this->registerDoctrineDbalTypes($config['doctrine_dbal']['types'] ?? [], match (true) {
+            isset($config['store']['key_id']) => 'key_management.stored_envelope_encrypter',
+            null !== $defaultName => 'key_management.envelope_encrypter.'.$defaultName,
+            default => null,
+        }, $container);
     }
 
     /**
@@ -266,15 +383,16 @@ class KeyManagementBundle extends AbstractBundle
      * Its members are the configured clients, resolved lazily through the locator of the tagged
      * ones, and they are checked here so that a typo is reported at compile time against a name.
      * A client the application registers itself joins through a "service://" DSN, which makes it
-     * a configured client. A member cannot be composite itself: two of them naming each other
-     * would read in circles.
+     * a configured client. Active and retired members cannot be configured composites themselves:
+     * two of them naming each other would read in circles.
      *
      * @param array<string, string|null>  $members
+     * @param list<string>                $retired
      * @param array<string, array<mixed>> $clients
      */
-    private function configureCompositeClient(Definition $definition, string $name, array $members, array $clients): void
+    private function configureCompositeClient(Definition $definition, string $name, array $members, array $retired, array $clients): void
     {
-        foreach (array_keys($members) as $member) {
+        foreach (array_merge(array_keys($members), $retired) as $member) {
             if (!isset($clients[$member])) {
                 throw new LogicException(\sprintf('The member "%s" of the composite KMS client "%s" is not registered in "key_management.clients".', $member, $name));
             }
@@ -288,6 +406,7 @@ class KeyManagementBundle extends AbstractBundle
             ->setArguments([
                 new ServiceLocatorArgument(new TaggedIteratorArgument('key_management.client', 'key', true)),
                 $members,
+                $retired,
                 new Reference('logger', ContainerInterface::NULL_ON_INVALID_REFERENCE),
             ])
             ->addTag('monolog.logger', ['channel' => 'key_management']);
@@ -297,14 +416,13 @@ class KeyManagementBundle extends AbstractBundle
      * Makes the store-backed encrypter the one the envelope interfaces resolve to.
      *
      * Configuring a store is what an application does to stop carrying a wrapped data key in every
-     * payload. Nothing is lost by that: the encrypter is given the default client's encrypter as a
-     * fallback, so it reads the payloads written before it as well as the ones it writes. The
+     * payload. The payloads written before it are read by turning on "read_self_contained", which is
+     * a statement rather than a consequence of having a default client: that format carries its own
+     * wrapped data key, so it resolves no row and nothing the store checks applies to it. The
      * per-client encrypters stay reachable under their own name for whoever wants the other regime
      * explicitly.
      *
-     * The clients it can rewrap a data key under are the tagged ones rather than the configured
-     * ones, so a client contributed by a bundle is a rewrap target as well. The one it wraps with
-     * is still checked against the configuration, where a typo can be reported against a name.
+     * The store and its rewrap command use only explicitly trusted clients.
      *
      * @param list<string> $clientNames
      */
@@ -323,22 +441,48 @@ class KeyManagementBundle extends AbstractBundle
             throw new LogicException(\sprintf('The KMS client "%s" set on "key_management.store" is not registered in "key_management.clients".', $client));
         }
 
+        if ($config['read_self_contained'] && null === $defaultName) {
+            throw new LogicException('The "key_management.store.read_self_contained" option needs a client to read those payloads with: set "key_management.default_client", or turn the option off.');
+        }
+
+        $allowedClients = [$client => new Reference('key_management.'.$client)];
+        foreach ($config['allowed_clients'] as $name) {
+            if (!\in_array($name, $clientNames, true)) {
+                throw new LogicException(\sprintf('The KMS client "%s" set in "key_management.store.allowed_clients" is not registered in "key_management.clients".', $name));
+            }
+
+            $allowedClients[$name] = new Reference('key_management.'.$name);
+        }
+
+        $container->register('.key_management.store.clients', ServiceLocator::class)
+            ->setArguments([$allowedClients])
+            ->addTag('container.service_locator');
+
         $container->register('key_management.store', DataKeyStore::class)
             ->setArguments([
                 new Reference($config['connection']),
-                new ServiceLocatorArgument(new TaggedIteratorArgument('key_management.client', 'key', true)),
+                new Reference('.key_management.store.clients'),
                 $client,
                 $config['key_id'],
+                $config['secret'] ?: new Parameter('kernel.secret'),
                 $config['table'],
                 32,
                 $config['max_age'],
+                new Reference('clock', ContainerInterface::NULL_ON_INVALID_REFERENCE),
+                $config['bind_wrapping_context'],
             ])
             ->addTag('kernel.reset', ['method' => 'forget']);
+
+        if ($container->hasDefinition('console.command.key_management_rewrap_data_keys')) {
+            $container->getDefinition('console.command.key_management_rewrap_data_keys')
+                ->setArgument(2, $client)
+                ->setArgument(3, $config['key_id']);
+        }
 
         $container->register('key_management.stored_envelope_encrypter', StoredEnvelopeEncrypter::class)
             ->setArguments([
                 new Reference('key_management.store'),
-                null !== $defaultName ? new Reference('key_management.envelope_encrypter.'.$defaultName) : null,
+                $config['read_self_contained'] ? new Reference('key_management.envelope_encrypter.'.$defaultName) : null,
             ]);
 
         $container->setAlias(DataKeyStoreInterface::class, 'key_management.store');
@@ -365,5 +509,41 @@ class KeyManagementBundle extends AbstractBundle
                 ->setArguments([new IteratorArgument([new Reference('key_management.store')])])
                 ->addTag('doctrine.event_listener', ['event' => 'postGenerateSchema']);
         }
+    }
+
+    /**
+     * Registers the service that declares the encrypted Doctrine DBAL types.
+     *
+     * Each DoctrineBundle connection declares the types when it's created, see RegisterDoctrineDbalTypesPass.
+     * Without DoctrineBundle, boot() declares them.
+     * They encrypt with the encrypter the envelope interfaces resolve to: the store-backed one when a store is configured, the default client's otherwise.
+     * They get a lazy proxy of that encrypter, so that declaring the types doesn't create the store and its database connection.
+     *
+     * With the Doctrine ORM bridge, they are registered even when none is configured.
+     * RegisterEncryptedColumnsPass then adds the types of the columns marked with #[Encrypted], and removes the service when there is none.
+     *
+     * @param array<string, array{type: string, key: string}> $types
+     */
+    private function registerDoctrineDbalTypes(array $types, ?string $encrypter, ContainerBuilder $container): void
+    {
+        if ($types) {
+            if (!ContainerBuilder::willBeAvailable('symfony/doctrine-dbal-key-management', EncryptedTypes::class, ['symfony/key-management'])) {
+                throw new LogicException('Configuring "key_management.doctrine_dbal.types" requires the "symfony/doctrine-dbal-key-management" package. Try running "composer require symfony/doctrine-dbal-key-management".');
+            }
+
+            if (!ContainerBuilder::willBeAvailable('doctrine/dbal', Type::class, ['symfony/doctrine-dbal-key-management', 'symfony/key-management'])) {
+                throw new LogicException('Configuring "key_management.doctrine_dbal.types" requires the "doctrine/dbal" package. Try running "composer require doctrine/dbal".');
+            }
+
+            if (null === $encrypter) {
+                throw new LogicException('The "key_management.doctrine_dbal.types" need an envelope encrypter: configure "key_management.store", or set "key_management.default_client".');
+            }
+        } elseif (null === $encrypter || !class_exists(RegisterEncryptedColumnsPass::class)) {
+            return;
+        }
+
+        $container->register('key_management.doctrine_dbal.encrypted_types', EncryptedTypes::class)
+            ->setArguments([new LazyProxyArgument(new Reference($encrypter)), $types])
+            ->setPublic(true);
     }
 }

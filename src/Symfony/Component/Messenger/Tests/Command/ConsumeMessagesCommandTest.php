@@ -12,6 +12,7 @@
 namespace Symfony\Component\Messenger\Tests\Command;
 
 use Amp\Parallel\Worker\ContextWorkerFactory;
+use PHPUnit\Framework\Attributes\BackupGlobals;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\RequiresPhpExtension;
 use PHPUnit\Framework\TestCase;
@@ -28,6 +29,8 @@ use Symfony\Component\DependencyInjection\ServiceLocator;
 use Symfony\Component\DependencyInjection\ServicesResetter;
 use Symfony\Component\EventDispatcher\EventDispatcher;
 use Symfony\Component\Messenger\Command\ConsumeMessagesCommand;
+use Symfony\Component\Messenger\Cooldown\CooldownStatus;
+use Symfony\Component\Messenger\Cooldown\CooldownStrategyInterface;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Event\WorkerRunningEvent;
 use Symfony\Component\Messenger\Event\WorkerStartedEvent;
@@ -53,8 +56,13 @@ class ConsumeMessagesCommandTest extends TestCase
         $this->assertFalse($command->getDefinition()->hasOption('parallel-limit'));
     }
 
+    #[BackupGlobals(true)]
     public function testBasicRun()
     {
+        $_SERVER['SCRIPT_FILENAME'] = __FILE__;
+        $_SERVER['SYMFONY_CLI_CONSOLE_COMMAND'] = '["symfony","console"]';
+        $_SERVER['SYMFONY_CLI_CONSOLE_SCRIPT'] = __FILE__;
+
         $envelope = new Envelope(new \stdClass(), [new BusNameStamp('dummy-bus')]);
 
         $receiver = $this->createMock(ReceiverInterface::class);
@@ -81,6 +89,8 @@ class ConsumeMessagesCommandTest extends TestCase
 
         $tester->assertCommandIsSuccessful();
         $this->assertStringContainsString('[OK] Consuming messages from transport "dummy-receiver"', $tester->getDisplay());
+        $display = preg_replace('/\s+/', ' ', preg_replace('/^\s*\/\/ ?/m', '', $tester->getDisplay(true)));
+        $this->assertStringContainsString('via the symfony console messenger:stop-workers', $display);
     }
 
     public function testRunWithBusOption()
@@ -197,6 +207,45 @@ class ConsumeMessagesCommandTest extends TestCase
         $this->assertSame(3, $handledMessages);
     }
 
+    public function testRunUsesTheCooldownStrategyOfTheReceiver()
+    {
+        $envelope = new Envelope(new \stdClass(), [new BusNameStamp('dummy-bus')]);
+
+        $receiver = $this->createMock(ReceiverInterface::class);
+        $receiver->expects($this->once())->method('get')->willReturn([$envelope]);
+        $receiver->expects($this->once())->method('reject');
+
+        $receiverLocator = new Container();
+        $receiverLocator->set('dummy-receiver', $receiver);
+
+        $exception = new \RuntimeException('Failure.');
+        $bus = $this->createStub(MessageBusInterface::class);
+        $bus->method('dispatch')->willThrowException($exception);
+
+        $busLocator = new Container();
+        $busLocator->set('dummy-bus', $bus);
+
+        $cooldownStrategy = $this->createMock(CooldownStrategyInterface::class);
+        $cooldownStrategy->expects($this->once())->method('checkStatus')->with('dummy-receiver')->willReturn(CooldownStatus::inactive());
+        $cooldownStrategy->expects($this->once())->method('recordFailure')->with('dummy-receiver', $this->isInstanceOf(Envelope::class), $exception);
+        $cooldownStrategy->expects($this->never())->method('recordSuccess');
+
+        $cooldownStrategyLocator = new Container();
+        $cooldownStrategyLocator->set('dummy-receiver', $cooldownStrategy);
+
+        $command = new ConsumeMessagesCommand(new RoutableMessageBus($busLocator), $receiverLocator, new EventDispatcher(), null, [], null, [], null, null, '', $cooldownStrategyLocator);
+
+        $application = new Application();
+        $application->addCommand($command);
+        $tester = new CommandTester($application->get('messenger:consume'));
+        $tester->execute([
+            'receivers' => ['dummy-receiver'],
+            '--limit' => 1,
+        ]);
+
+        $tester->assertCommandIsSuccessful();
+    }
+
     #[DataProvider('getInvalidOptions')]
     public function testRunWithInvalidOption(string $option, string $value, string $expectedMessage)
     {
@@ -231,6 +280,8 @@ class ConsumeMessagesCommandTest extends TestCase
         yield 'Zero fetch size' => ['--fetch-size', '0', 'Option "fetch-size" must be a positive integer, "0" passed.'];
         yield 'Negative fetch size' => ['--fetch-size', '-1', 'Option "fetch-size" must be a positive integer, "-1" passed.'];
         yield 'Non-numeric fetch size' => ['--fetch-size', 'abc', 'Option "fetch-size" must be a positive integer, "abc" passed.'];
+        yield 'Fractional fetch size' => ['--fetch-size', '1.5', 'Option "fetch-size" must be a positive integer, "1.5" passed.'];
+        yield 'Fetch size in scientific notation' => ['--fetch-size', '1e2', 'Option "fetch-size" must be a positive integer, "1e2" passed.'];
     }
 
     public function testParallelExecutionRequiresConfiguredConsoleEntryPoint()
@@ -333,6 +384,35 @@ class ConsumeMessagesCommandTest extends TestCase
         $this->assertStringContainsString('[OK] Consuming messages from transport "dummy-receiver"', $tester->getDisplay());
     }
 
+    public function testRunWithStopWhenEmptyOption()
+    {
+        $receiver = new DummyReceiver([
+            [new Envelope(new \stdClass(), [new BusNameStamp('dummy-bus')])],
+            [new Envelope(new \stdClass(), [new BusNameStamp('dummy-bus')])],
+            [],
+        ]);
+
+        $receiverLocator = new Container();
+        $receiverLocator->set('dummy-receiver', $receiver);
+
+        $busLocator = new Container();
+        $busLocator->set('dummy-bus', new MessageBus());
+
+        $command = new ConsumeMessagesCommand(new RoutableMessageBus($busLocator), $receiverLocator, new EventDispatcher());
+
+        $application = new Application();
+        $application->addCommand($command);
+        $tester = new CommandTester($application->get('messenger:consume'));
+        $tester->execute([
+            'receivers' => ['dummy-receiver'],
+            '--stop-when-empty' => true,
+        ]);
+
+        $tester->assertCommandIsSuccessful();
+        $this->assertSame(2, $receiver->getAcknowledgeCount());
+        $this->assertStringContainsString('exit once it has found no message left in the', $tester->getDisplay());
+    }
+
     public function testRunWithMemoryLimit()
     {
         $envelope = new Envelope(new \stdClass(), [new BusNameStamp('dummy-bus')]);
@@ -372,7 +452,7 @@ class ConsumeMessagesCommandTest extends TestCase
         $this->assertStringContainsString('[OK] Consuming messages from transport "dummy-receiver"', $tester->getDisplay());
         $this->assertStringContainsString('The worker will automatically exit once it has exceeded 1.5M of memory', $tester->getDisplay());
 
-        $this->assertSame(1572864, $logger->logs[1][2]['limit']);
+        $this->assertSame(1572864, $logger->logs[2][2]['limit']);
     }
 
     public function testRunWithAllOption()

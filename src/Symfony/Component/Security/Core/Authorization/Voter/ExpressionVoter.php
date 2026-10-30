@@ -12,11 +12,15 @@
 namespace Symfony\Component\Security\Core\Authorization\Voter;
 
 use Symfony\Component\ExpressionLanguage\Expression;
+use Symfony\Component\ExpressionLanguage\ExpressionLanguage;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\Security\Core\Authentication\AuthenticationTrustResolverInterface;
+use Symfony\Component\Security\Core\Authentication\Token\Storage\TokenStorageInterface;
 use Symfony\Component\Security\Core\Authentication\Token\TokenInterface;
+use Symfony\Component\Security\Core\Authorization\AccessDecisionManagerInterface;
 use Symfony\Component\Security\Core\Authorization\AuthorizationCheckerInterface;
-use Symfony\Component\Security\Core\Authorization\ExpressionLanguage;
+use Symfony\Component\Security\Core\Authorization\NestedAuthorizationChecker;
+use Symfony\Component\Security\Core\Authorization\TokenAuthorizationChecker;
 use Symfony\Component\Security\Core\Role\RoleHierarchyInterface;
 
 /**
@@ -31,6 +35,8 @@ class ExpressionVoter implements CacheableVoterInterface
         private ?AuthenticationTrustResolverInterface $trustResolver,
         private AuthorizationCheckerInterface $authChecker,
         private ?RoleHierarchyInterface $roleHierarchy = null,
+        private ?AccessDecisionManagerInterface $accessDecisionManager = null,
+        private ?TokenStorageInterface $tokenStorage = null,
     ) {
     }
 
@@ -49,26 +55,40 @@ class ExpressionVoter implements CacheableVoterInterface
         $result = VoterInterface::ACCESS_ABSTAIN;
         $variables = null;
         $failingExpressions = [];
+        $reAuthenticationAttribute = null;
         foreach ($attributes as $attribute) {
             if (!$attribute instanceof Expression) {
                 continue;
             }
 
             $variables ??= $this->getVariables($token, $subject);
+            $variables['auth_checker'] = $authChecker = new NestedAuthorizationChecker($this->accessDecisionManager ? new TokenAuthorizationChecker($token, $this->accessDecisionManager, $this->authChecker, $this->tokenStorage) : $this->authChecker);
 
             $result = VoterInterface::ACCESS_DENIED;
 
             if ($this->expressionLanguage->evaluate($attribute, $variables)) {
-                $vote?->addReason(\sprintf('Expression (%s) is true.', $attribute));
+                if ($vote) {
+                    $authChecker->addReasons($vote, true);
+                    $vote->addReason(\sprintf('Expression (%s) is true.', $attribute));
+                }
 
                 return VoterInterface::ACCESS_GRANTED;
             }
 
+            if ($vote) {
+                $authChecker->addReasons($vote, false);
+            }
+
             $failingExpressions[] = $attribute;
+            $reAuthenticationAttribute ??= $authChecker->reAuthenticationAttribute;
         }
 
         if ($failingExpressions) {
             $vote?->addReason(\sprintf('Expression (%s) is false.', implode(') || (', $failingExpressions)));
+        }
+
+        if (null !== $reAuthenticationAttribute) {
+            $vote?->requestReAuthentication($reAuthenticationAttribute);
         }
 
         return $result;

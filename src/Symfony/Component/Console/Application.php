@@ -55,6 +55,7 @@ use Symfony\Component\Console\SignalRegistry\SignalRegistry;
 use Symfony\Component\Console\Style\SymfonyStyle;
 use Symfony\Component\DependencyInjection\ContainerInterface as SymfonyContainerInterface;
 use Symfony\Component\ErrorHandler\ErrorHandler;
+use Symfony\Component\EventDispatcher\EventDispatcherInterface as ComponentEventDispatcherInterface;
 use Symfony\Contracts\EventDispatcher\EventDispatcherInterface;
 use Symfony\Contracts\Service\ResetInterface;
 
@@ -975,6 +976,9 @@ class Application implements ResetInterface
     {
         do {
             $message = trim($e->getMessage());
+            if ('' !== $binary = $_SERVER['SYMFONY_CLI_BINARY_NAME'] ?? '') {
+                $message = str_replace('"composer require ', '"'.$binary.' composer require ', $message);
+            }
             if ('' === $message || OutputInterface::VERBOSITY_VERBOSE <= $output->getVerbosity()) {
                 $class = get_debug_type($e);
                 $title = \sprintf('  [%s%s]  ', $class, 0 !== ($code = $e->getCode()) ? ' ('.$code.')' : '');
@@ -1107,9 +1111,19 @@ class Application implements ResetInterface
             $this->getSignalRegistry()->pushCurrentHandlers();
 
             if ($this->dispatcher) {
+                // Build the lazy listeners before a signal handler needs them: a signal can interrupt the autoloading of a class they use, which cannot be loaded again from the handler
+                if ($this->signalsToDispatchEvent && $this->dispatcher instanceof ComponentEventDispatcherInterface) {
+                    foreach ([ConsoleEvents::SIGNAL, ConsoleAlarmEvent::class, ConsoleEvents::TERMINATE] as $eventName) {
+                        $this->dispatcher->getListeners($eventName);
+                    }
+                }
+
                 // We register application signals, so that we can dispatch the event
                 foreach ($this->signalsToDispatchEvent as $signal) {
-                    $signalEvent = new ConsoleSignalEvent($command, $input, $output, $signal);
+                    // When this application runs inside another application that handles the signal, the outer application decides if the process exits
+                    // Otherwise, exit with 128 + the signal number, the exit code a shell reports for a process killed by the signal
+                    $previousHandler = pcntl_signal_get_handler($signal);
+                    $signalEvent = new ConsoleSignalEvent($command, $input, $output, $signal, \is_array($previousHandler) && $previousHandler[0] instanceof SignalRegistry ? false : 128 + $signal);
                     $alarmEvent = \SIGALRM === $signal ? new ConsoleAlarmEvent($command, $input, $output) : null;
 
                     $signalRegistry->register($signal, function ($signal) use ($signalEvent, $alarmEvent, $command, $commandSignals, $input, $output) {
@@ -1154,7 +1168,7 @@ class Application implements ResetInterface
                         $this->scheduleAlarm();
                     }
 
-                    if (false !== $exitCode = $command->handleSignal($signal)) {
+                    if (false !== $exitCode = $command->handleSignal($signal, 128 + $signal)) {
                         exit($exitCode);
                     }
                 });
@@ -1363,7 +1377,7 @@ class Application implements ResetInterface
         // additionally, array_slice() is not enough as some character has doubled width.
         // we need a function to split string not by character count but by string width
         if (false === $encoding = mb_detect_encoding($string, null, true)) {
-            return str_split($string, $width);
+            return explode("\n", wordwrap($string, $width, "\n", true));
         }
 
         $utf8String = mb_convert_encoding($string, 'utf8', $encoding);
@@ -1374,16 +1388,27 @@ class Application implements ResetInterface
         while (preg_match('/.{1,10000}/u', $utf8String, $m, 0, $offset)) {
             $offset += \strlen($m[0]);
 
-            foreach (preg_split('//u', $m[0]) as $char) {
-                // test if $char could be appended to current line
-                if (Helper::width($line.$char) <= $width) {
+            foreach (preg_split('//u', $m[0], -1, \PREG_SPLIT_NO_EMPTY) as $char) {
+                // spaces that follow a word never start a new line: they are dropped when the line breaks on them
+                if (' ' === $char && strspn($line, ' ') < \strlen($line) || Helper::width($line.$char) <= $width) {
                     $line .= $char;
                     continue;
                 }
-                // if not, push current line to array and make new line
-                $lines[] = str_pad($line, $width);
-                $line = $char;
+
+                if (false !== ($i = strrpos($line, ' ')) && '' !== $head = rtrim(substr($line, 0, $i), ' ')) {
+                    // break the line after its last word
+                    $lines[] = str_pad($head, $width);
+                    $line = substr($line, $i + 1).$char;
+                } else {
+                    // cut a word that is wider than the line
+                    $lines[] = str_pad($line, $width);
+                    $line = $char;
+                }
             }
+        }
+
+        if (Helper::width($line) > $width) {
+            $line = rtrim($line, ' ');
         }
 
         $lines[] = \count($lines) ? str_pad($line, $width) : $line;

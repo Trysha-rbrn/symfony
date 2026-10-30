@@ -34,6 +34,18 @@ use Symfony\Component\Routing\RouteCollection;
  */
 abstract class Descriptor implements DescriptorInterface
 {
+    /**
+     * The env vars that Symfony reads itself, outside the container, and that apps set in their .env files.
+     */
+    private const ENV_VARS_READ_OUTSIDE_THE_CONTAINER = [
+        // the runtime and the kernel
+        'APP_ENV', 'APP_DEBUG', 'APP_RUNTIME', 'APP_RUNTIME_OPTIONS', 'APP_CACHE_DIR', 'APP_BUILD_DIR', 'APP_SHARE_DIR', 'APP_LOG_DIR',
+        // the console, the error handler and the dumper
+        'SHELL_VERBOSITY', 'SYMFONY_IDE', 'VAR_DUMPER_FORMAT', 'VAR_DUMPER_SERVER',
+        // the tests
+        'KERNEL_CLASS', 'SYMFONY_DEPRECATIONS_HELPER', 'SYMFONY_HTTP_RECORDER',
+    ];
+
     protected OutputInterface $output;
 
     public function describe(OutputInterface $output, mixed $object, array $options = []): void
@@ -330,6 +342,11 @@ abstract class Descriptor implements DescriptorInterface
 
             if ($docComment = $r->getDocComment()) {
                 $docComment = preg_split('#\n\s*\*\s*[\n@]#', substr($docComment, 3, -2), 2)[0];
+                $docComment = preg_replace_callback('#\{@(?:see|link)\s++([^\s}]++)\s*+([^}]*)\}#', static fn ($m) => rtrim($m[2]) ?: $m[1], $docComment);
+
+                if (str_starts_with(ltrim($docComment), '@')) {
+                    return '';
+                }
 
                 return trim(preg_replace('#\s*\n\s*\*\s*#', ' ', $docComment));
             }
@@ -362,6 +379,12 @@ abstract class Descriptor implements DescriptorInterface
             }
         }
 
+        foreach (self::ENV_VARS_READ_OUTSIDE_THE_CONTAINER as $name) {
+            $used[$name] = true;
+        }
+
+        $inlined = $container->hasParameter('.debug.container.inlined_env_vars') ? array_flip($container->getParameter('.debug.container.inlined_env_vars')) : [];
+
         $bag = $container->getParameterBag();
         $getDefaultParameter = fn (string $name) => parent::get($name);
         $getDefaultParameter = $getDefaultParameter->bindTo($bag, $bag::class);
@@ -387,6 +410,7 @@ abstract class Descriptor implements DescriptorInterface
                 'runtime_value' => $runtimeValue,
                 'processed_value' => $processedValue,
                 'used' => isset($used[$name]),
+                'inlined' => isset($inlined[$env]),
             ];
         }
         ksort($envs);

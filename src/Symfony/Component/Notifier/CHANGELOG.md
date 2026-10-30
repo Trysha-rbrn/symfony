@@ -4,12 +4,14 @@ CHANGELOG
 8.2
 ---
 
+ * Deprecate the autowiring aliases named after the webhook request parsers, use `#[Target('notifier.<provider>')]` with `RequestParserInterface` instead
  * Add `NotifierBundle`, which provides the `notifier` configuration and the services previously provided by `FrameworkBundle` under `framework.notifier`
- * Add `AdminRecipientsProviderInterface`
+ * Add `AdminRecipientsProviderInterface` and its autowiring alias
  * Deprecate declaring `getAdminRecipients()` without implementing `AdminRecipientsProviderInterface`
  * Deprecate reading a value that is not a boolean with `Dsn::getBooleanOption()`; it will throw in 9.0
- * Add the `ssl` DSN option to send requests over plain HTTP
- * Add `AbstractTransport::setSsl()`, `AbstractTransport::getHttpScheme()`, the `AbstractTransport::SSL` constant and `AbstractTransportFactory::getSsl()`
+ * Add `AbstractTransport::setSsl()`, `AbstractTransport::getHttpScheme()`, the `AbstractTransport::SSL` constant and `AbstractTransportFactory::getSsl()` to support the `ssl` DSN option of the bridges
+ * Use the global clock of symfony/clock, when installed, for the retry period of `RoundRobinTransport` and `FailoverTransport`
+ * Use the global `From` header of the mailer as the sender of the email channel when no envelope sender is configured
 
 8.0
 ---

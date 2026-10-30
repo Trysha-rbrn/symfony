@@ -36,6 +36,7 @@ class OidcUserInfoTokenHandlerFactory implements TokenHandlerFactoryInterface
         }
 
         $tokenHandlerDefinition = $container->setDefinition($id, new ChildDefinition('security.access_token_handler.oidc_user_info'))
+            ->setLazy(true)
             ->replaceArgument(0, $clientDefinition)
             ->replaceArgument(2, $config['claim']);
 
@@ -71,7 +72,7 @@ class OidcUserInfoTokenHandlerFactory implements TokenHandlerFactoryInterface
                 ->end()
                 ->children()
                     ->scalarNode('base_uri')
-                        ->info('Base URI of the userinfo endpoint on the OIDC server, or the OIDC server URI to use the discovery (require "discovery" to be configured).')
+                        ->info('Base URI of the userinfo endpoint on the OIDC server, or the OIDC server URI to use the discovery (require "discovery" to be configured). The latter must end with a slash when it has a path, as the discovery path is resolved against it as a relative URL.')
                         ->isRequired()
                         ->cannotBeEmpty()
                     ->end()
@@ -79,10 +80,11 @@ class OidcUserInfoTokenHandlerFactory implements TokenHandlerFactoryInterface
                         ->info('Enable the OIDC discovery.')
                         ->children()
                             ->arrayNode('cache')
+                                ->addDefaultsIfNotSet()
                                 ->children()
                                     ->scalarNode('id')
                                         ->info('Cache service id to use to cache the OIDC discovery configuration.')
-                                        ->isRequired()
+                                        ->defaultValue('cache.security.discovery')
                                         ->cannotBeEmpty()
                                     ->end()
                                 ->end()

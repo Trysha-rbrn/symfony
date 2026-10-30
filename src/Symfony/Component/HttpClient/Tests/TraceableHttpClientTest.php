@@ -11,11 +11,16 @@
 
 namespace Symfony\Component\HttpClient\Tests;
 
+use PHPUnit\Framework\Attributes\RequiresPhpExtension;
 use PHPUnit\Framework\TestCase;
+use Symfony\Component\HttpClient\CurlHttpClient;
 use Symfony\Component\HttpClient\Exception\ClientException;
 use Symfony\Component\HttpClient\MockHttpClient;
 use Symfony\Component\HttpClient\NativeHttpClient;
 use Symfony\Component\HttpClient\Response\MockResponse;
+use Symfony\Component\HttpClient\Response\TraceableResponse;
+use Symfony\Component\HttpClient\Tests\Fixtures\ResettableClient;
+use Symfony\Component\HttpClient\Tests\Fixtures\ShutdownAwareClient;
 use Symfony\Component\HttpClient\TraceableHttpClient;
 use Symfony\Component\Stopwatch\Stopwatch;
 use Symfony\Contracts\HttpClient\Exception\ClientExceptionInterface;
@@ -112,6 +117,32 @@ class TraceableHttpClientTest extends TestCase
         $this->assertSame($response, $r);
         $this->assertGreaterThan(1, \count($chunks));
         $this->assertSame('Symfony is awesome!', implode('', $chunks));
+    }
+
+    #[RequiresPhpExtension('curl')]
+    public function testToStreamOutlivesTheResponse()
+    {
+        $sut = new TraceableHttpClient(new CurlHttpClient());
+        $stream = $sut->request('GET', 'http://localhost:8057/chunked')->toStream();
+
+        $this->assertSame('Symfony is awesome!', stream_get_contents($stream));
+    }
+
+    public function testDestructLeavesTheWrappedResponseAlone()
+    {
+        $response = new class extends MockResponse {
+            public int $destructCount = 0;
+
+            public function __destruct()
+            {
+                ++$this->destructCount;
+            }
+        };
+        $content = false;
+        $traceableResponse = new TraceableResponse(new MockHttpClient(), $response, $content);
+        unset($traceableResponse);
+
+        $this->assertSame(0, $response->destructCount);
     }
 
     public function testToArrayChecksStatusCodeBeforeDecoding()
@@ -224,5 +255,19 @@ class TraceableHttpClientTest extends TestCase
         $this->assertSame('http://localhost:8057/', $response->getInfo('url'));
 
         $this->assertCount(1, $sut->getTracedRequests());
+    }
+
+    public function testResetForwardsTheShutdownFlagToShutdownAwareClientsOnly()
+    {
+        $client = new TraceableHttpClient($inner = new ShutdownAwareClient());
+        $client->reset();
+        $client->reset(true);
+
+        $this->assertSame([false, true], $inner->resets);
+
+        $client = new TraceableHttpClient($inner = new ResettableClient());
+        $client->reset(true);
+
+        $this->assertSame([[]], $inner->resets);
     }
 }

@@ -1,0 +1,367 @@
+<?php
+
+/*
+ * This file is part of the Symfony package.
+ *
+ * (c) Fabien Potencier <fabien@symfony.com>
+ *
+ * For the full copyright and license information, please view the LICENSE
+ * file that was distributed with this source code.
+ */
+
+namespace Symfony\Component\JsonSchema\Tests;
+
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\TestCase;
+use Symfony\Component\JsonSchema\Dialect;
+use Symfony\Component\JsonSchema\NullSyntax;
+use Symfony\Component\JsonSchema\Schema;
+
+class SchemaTest extends TestCase
+{
+    public function testJsonSchema202012PlacesDefinitionsUnderDefs()
+    {
+        $schema = new Schema(['$ref' => '#/$defs/Foo'], ['Foo' => ['type' => 'object']], Dialect::jsonSchema202012());
+
+        $this->assertSame([
+            '$schema' => 'https://json-schema.org/draft/2020-12/schema',
+            '$ref' => '#/$defs/Foo',
+            '$defs' => ['Foo' => ['type' => 'object']],
+        ], $schema->toArray());
+    }
+
+    public function testOpenApiPlacesDefinitionsUnderComponentsSchemas()
+    {
+        $schema = new Schema(['$ref' => '#/components/schemas/Foo'], ['Foo' => ['type' => 'object']], Dialect::openApi31());
+
+        $this->assertSame([
+            '$ref' => '#/components/schemas/Foo',
+            'components' => ['schemas' => ['Foo' => ['type' => 'object']]],
+        ], $schema->toArray());
+    }
+
+    public function testDefinitionsArePlacedUnderTheReferencePath()
+    {
+        $schema = new Schema(['$ref' => '#/definitions/Foo'], ['Foo' => ['type' => 'object']], new Dialect('#/definitions/', NullSyntax::Unsupported));
+
+        $this->assertSame([
+            '$ref' => '#/definitions/Foo',
+            'definitions' => ['Foo' => ['type' => 'object']],
+        ], $schema->toArray());
+    }
+
+    public function testToArrayOmitsEmptyDefinitions()
+    {
+        $schema = new Schema(['type' => 'string'], [], Dialect::openApi31());
+
+        $this->assertSame(['type' => 'string'], $schema->toArray());
+    }
+
+    public function testFlattenInlinesEveryAcyclicReference()
+    {
+        $schema = new Schema(
+            ['type' => 'array', 'items' => ['$ref' => '#/$defs/Book']],
+            [
+                'Book' => ['type' => 'object', 'properties' => ['author' => ['$ref' => '#/$defs/Author']]],
+                'Author' => ['type' => 'object', 'properties' => ['name' => ['type' => 'string']]],
+            ],
+            Dialect::jsonSchema202012(),
+        );
+
+        $flattened = $schema->flatten();
+
+        $this->assertSame([], $flattened->getDefinitions());
+        $this->assertSame([
+            'type' => 'array',
+            'items' => ['type' => 'object', 'properties' => ['author' => ['type' => 'object', 'properties' => ['name' => ['type' => 'string']]]]],
+        ], $flattened->getRoot());
+    }
+
+    public function testFlattenInlinesPropertiesNamedAfterKeywords()
+    {
+        $kind = ['type' => 'object', 'properties' => ['label' => ['type' => 'string']]];
+        $properties = array_fill_keys(['type', 'enum', 'const', 'default', 'example', 'examples', 'required', 'properties', 'items'], ['$ref' => '#/$defs/Kind']);
+        $schema = new Schema(['type' => 'object', 'properties' => $properties], ['Kind' => $kind], Dialect::jsonSchema202012());
+
+        $flattened = $schema->flatten();
+
+        $this->assertSame([], $flattened->getDefinitions());
+        $this->assertSame(['type' => 'object', 'properties' => array_fill_keys(array_keys($properties), $kind)], $flattened->getRoot());
+    }
+
+    public function testFlattenKeepsTheRequiredPropertiesOfTheDefinitionAndOfTheReference()
+    {
+        $schema = new Schema(
+            ['$ref' => '#/$defs/Circle', 'required' => ['kind']],
+            ['Circle' => ['type' => 'object', 'properties' => ['kind' => ['const' => 'circle'], 'radius' => ['type' => 'number']], 'required' => ['radius']]],
+            Dialect::jsonSchema202012(),
+        );
+
+        $this->assertSame(['radius', 'kind'], $schema->flatten()->getRoot()['required']);
+    }
+
+    public function testFlattenMergesThePropertiesOfTheDefinitionAndOfTheReference()
+    {
+        $schema = new Schema(
+            ['$ref' => '#/$defs/Address', 'properties' => ['zip' => ['type' => 'string']], 'required' => ['zip']],
+            ['Address' => ['type' => 'object', 'properties' => ['street' => ['type' => 'string']], 'required' => ['street']]],
+            Dialect::jsonSchema202012(),
+        );
+
+        $this->assertSame([
+            'type' => 'object',
+            'properties' => ['street' => ['type' => 'string'], 'zip' => ['type' => 'string']],
+            'required' => ['street', 'zip'],
+        ], $schema->flatten()->getRoot());
+    }
+
+    public function testFlattenMergesThePropertiesDescribedByBothTheDefinitionAndTheReference()
+    {
+        $schema = new Schema(
+            ['$ref' => '#/$defs/Person', 'properties' => ['name' => ['minLength' => 1], 'age' => ['type' => 'string'], 'nickname' => ['type' => 'string'], 'secret' => ['type' => 'string'], 'email' => true]],
+            ['Person' => ['properties' => ['name' => ['type' => 'string'], 'age' => ['type' => 'integer'], 'nickname' => true, 'secret' => false, 'email' => ['format' => 'email']]]],
+            Dialect::jsonSchema202012(),
+        );
+
+        $this->assertSame(['properties' => [
+            'name' => ['type' => 'string', 'minLength' => 1],
+            'age' => ['allOf' => [['type' => 'integer']], 'type' => 'string'],
+            'nickname' => ['type' => 'string'],
+            'secret' => false,
+            'email' => ['format' => 'email'],
+        ]], $schema->flatten()->getRoot());
+    }
+
+    public function testFlattenConcatenatesTheAllOfOfTheDefinitionAndOfTheReference()
+    {
+        $schema = new Schema(
+            ['$ref' => '#/$defs/Named', 'allOf' => [['required' => ['id']]]],
+            ['Named' => ['type' => 'object', 'allOf' => [['required' => ['name']]]]],
+            Dialect::jsonSchema202012(),
+        );
+
+        $this->assertSame(['type' => 'object', 'allOf' => [['required' => ['name']], ['required' => ['id']]]], $schema->flatten()->getRoot());
+    }
+
+    public function testFlattenKeepsTheDefinitionInAnAllOfWhenAKeywordConflicts()
+    {
+        $schema = new Schema(
+            ['$ref' => '#/$defs/Pair', 'type' => 'array', 'description' => 'A pair'],
+            ['Pair' => ['type' => 'object', 'minProperties' => 2]],
+            Dialect::jsonSchema202012(),
+        );
+
+        $this->assertSame(['allOf' => [['type' => 'object', 'minProperties' => 2]], 'type' => 'array', 'description' => 'A pair'], $schema->flatten()->getRoot());
+    }
+
+    public function testFlattenKeepsTheDefinitionInAnAllOfWhenMergingChangesWhatAdditionalPropertiesAppliesTo()
+    {
+        $closed = ['type' => 'object', 'properties' => ['id' => ['type' => 'integer']], 'additionalProperties' => false];
+        $schema = new Schema(['$ref' => '#/$defs/Closed', 'properties' => ['name' => ['type' => 'string']]], ['Closed' => $closed], Dialect::jsonSchema202012());
+
+        $this->assertSame(['allOf' => [$closed], 'properties' => ['name' => ['type' => 'string']]], $schema->flatten()->getRoot());
+
+        $schema = new Schema(['$ref' => '#/$defs/Open', 'unevaluatedProperties' => false], ['Open' => ['properties' => ['id' => ['type' => 'integer']]]], Dialect::jsonSchema202012());
+
+        $this->assertSame(['allOf' => [['properties' => ['id' => ['type' => 'integer']]]], 'unevaluatedProperties' => false], $schema->flatten()->getRoot());
+    }
+
+    public function testFlattenLetsTheAnnotationsNextToTheReferenceOverrideTheOnesOfTheDefinition()
+    {
+        $schema = new Schema(
+            ['$ref' => '#/$defs/Author', 'description' => 'The main author', 'readOnly' => true],
+            ['Author' => ['type' => 'object', 'title' => 'Author', 'description' => 'An author']],
+            Dialect::jsonSchema202012(),
+        );
+
+        $this->assertSame(['type' => 'object', 'title' => 'Author', 'description' => 'The main author', 'readOnly' => true], $schema->flatten()->getRoot());
+    }
+
+    public function testFlattenMergesTheDefinitionWithTheReferenceAlongACycle()
+    {
+        $schema = new Schema(
+            ['$ref' => '#/$defs/Node'],
+            [
+                'Node' => ['$ref' => '#/$defs/Base', 'properties' => ['children' => ['type' => 'array', 'items' => ['$ref' => '#/$defs/Node']]]],
+                'Base' => ['type' => 'object', 'properties' => ['name' => ['type' => 'string'], 'children' => ['type' => 'array']]],
+            ],
+            Dialect::jsonSchema202012(),
+        );
+
+        $flattened = $schema->flatten();
+        $expected = ['type' => 'object', 'properties' => ['name' => ['type' => 'string'], 'children' => ['type' => 'array', 'items' => ['$ref' => '#/$defs/Node']]]];
+
+        $this->assertSame($expected, $flattened->getRoot());
+        $this->assertSame(['Node' => $expected], $flattened->getDefinitions());
+    }
+
+    public function testFlattenPutsNoKeywordNextToAReferenceWhenTheDialectIgnoresThem()
+    {
+        $schema = new Schema(
+            ['$ref' => '#/components/schemas/Node'],
+            [
+                'Node' => ['$ref' => '#/components/schemas/Base', 'properties' => ['parent' => ['$ref' => '#/components/schemas/Node']]],
+                'Base' => ['type' => 'object', 'properties' => ['parent' => ['type' => 'object']]],
+            ],
+            Dialect::openApi30(),
+        );
+
+        $this->assertSame(
+            ['type' => 'object', 'properties' => ['parent' => ['allOf' => [['type' => 'object'], ['$ref' => '#/components/schemas/Node']]]]],
+            $schema->flatten()->getRoot(),
+        );
+    }
+
+    public function testFlattenInlinesReferencesBesideAReference()
+    {
+        $schema = new Schema(
+            ['$ref' => '#/$defs/Base', 'allOf' => [['$ref' => '#/$defs/WithId']]],
+            ['Base' => ['type' => 'object'], 'WithId' => ['required' => ['id']]],
+            Dialect::jsonSchema202012(),
+        );
+
+        $flattened = $schema->flatten();
+
+        $this->assertSame(['type' => 'object', 'allOf' => [['required' => ['id']]]], $flattened->getRoot());
+        $this->assertSame([], $flattened->getDefinitions());
+    }
+
+    public function testFlattenDoesNotTreatSiblingReferencesAsCycles()
+    {
+        $schema = new Schema(
+            ['$ref' => '#/$defs/Base', 'properties' => ['child' => ['$ref' => '#/$defs/Base']]],
+            ['Base' => ['type' => 'object']],
+            Dialect::jsonSchema202012(),
+        );
+
+        $flattened = $schema->flatten();
+
+        $this->assertSame(['type' => 'object', 'properties' => ['child' => ['type' => 'object']]], $flattened->getRoot());
+        $this->assertSame([], $flattened->getDefinitions());
+    }
+
+    public function testFlattenInlinesReferencesBesideACyclicReference()
+    {
+        $schema = new Schema(
+            ['$ref' => '#/$defs/Node'],
+            [
+                'Node' => ['type' => 'object', 'properties' => ['child' => ['$ref' => '#/$defs/Node', 'allOf' => [['$ref' => '#/$defs/WithId']]]]],
+                'WithId' => ['required' => ['id']],
+            ],
+            Dialect::jsonSchema202012(),
+        );
+
+        $flattened = $schema->flatten();
+        $expected = ['type' => 'object', 'properties' => ['child' => ['$ref' => '#/$defs/Node', 'allOf' => [['required' => ['id']]]]]];
+
+        $this->assertSame($expected, $flattened->getRoot());
+        $this->assertSame(['Node' => $expected], $flattened->getDefinitions());
+    }
+
+    public function testFlattenKeepsIntegerKeysOfKeywordsThatAreNotSchemas()
+    {
+        $schema = new Schema(['type' => 'object', 'dependentRequired' => ['2' => ['1']]], [], Dialect::jsonSchema202012());
+
+        $this->assertSame(['type' => 'object', 'dependentRequired' => ['2' => ['1']]], $schema->flatten()->getRoot());
+    }
+
+    public function testFlattenKeepsReferencesThatCloseACycle()
+    {
+        $schema = new Schema(
+            ['$ref' => '#/$defs/Employee'],
+            [
+                'Employee' => ['type' => 'object', 'properties' => ['department' => ['$ref' => '#/$defs/Department']]],
+                'Department' => ['type' => 'object', 'properties' => ['manager' => ['$ref' => '#/$defs/Employee']]],
+            ],
+            Dialect::jsonSchema202012(),
+        );
+
+        $flattened = $schema->flatten();
+
+        $this->assertSame([
+            'type' => 'object',
+            'properties' => ['department' => ['type' => 'object', 'properties' => ['manager' => ['$ref' => '#/$defs/Employee']]]],
+        ], $flattened->getRoot());
+        $this->assertSame(['Employee'], array_keys($flattened->getDefinitions()));
+        $this->assertSame(
+            ['type' => 'object', 'properties' => ['department' => ['type' => 'object', 'properties' => ['manager' => ['$ref' => '#/$defs/Employee']]]]],
+            $flattened->getDefinitions()['Employee'],
+        );
+    }
+
+    public function testJsonSerializeMatchesToArray()
+    {
+        $schema = new Schema(['$ref' => '#/$defs/Foo'], ['Foo' => ['type' => 'object', 'properties' => ['any' => []]]], Dialect::jsonSchema202012());
+
+        $this->assertSame(
+            '{"$schema":"https:\/\/json-schema.org\/draft\/2020-12\/schema","$ref":"#\/$defs\/Foo","$defs":{"Foo":{"type":"object","properties":{"any":{}}}}}',
+            json_encode($schema),
+        );
+    }
+
+    #[DataProvider('provideBooleanSubschemas')]
+    public function testBooleanSubschemasArePreservedByEveryAccessor(array $root, string $expectedJson)
+    {
+        $schema = new Schema($root, ['Foo' => $root], Dialect::openApi31());
+
+        $this->assertSame($expectedJson, json_encode($schema->getRoot()));
+        $this->assertSame('{"Foo":'.$expectedJson.'}', json_encode($schema->getDefinitions()));
+
+        $expectedDocument = json_decode($expectedJson, false, 512, \JSON_THROW_ON_ERROR);
+        $expectedDocument->components = ['schemas' => ['Foo' => json_decode($expectedJson, false, 512, \JSON_THROW_ON_ERROR)]];
+
+        $this->assertSame(json_encode($expectedDocument), json_encode($schema->toArray()));
+        $this->assertSame(json_encode($expectedDocument), json_encode($schema));
+    }
+
+    public static function provideBooleanSubschemas(): iterable
+    {
+        yield 'property schemas' => [
+            ['properties' => ['allowed' => true, 'disabled' => false, 'any' => []]],
+            '{"properties":{"allowed":true,"disabled":false,"any":{}}}',
+        ];
+        yield 'schema lists' => [
+            ['allOf' => [true, false, []]],
+            '{"allOf":[true,false,{}]}',
+        ];
+    }
+
+    public function testEmptySchemasAreEncodedAsObjectsByEveryAccessor()
+    {
+        $schema = new Schema(
+            ['type' => 'object', 'properties' => ['any' => []], 'additionalProperties' => []],
+            ['Foo' => ['type' => 'array', 'items' => []]],
+            Dialect::openApi31(),
+        );
+
+        $this->assertSame('{"type":"object","properties":{"any":{}},"additionalProperties":{}}', json_encode($schema->getRoot()));
+        $this->assertSame('{"Foo":{"type":"array","items":{}}}', json_encode($schema->getDefinitions()));
+        $this->assertSame('{"type":"object","properties":{"any":{}},"additionalProperties":{},"components":{"schemas":{"Foo":{"type":"array","items":{}}}}}', json_encode($schema->toArray()));
+        $this->assertSame('{}', json_encode((new Schema([], [], Dialect::openApi31()))->getRoot()));
+    }
+
+    #[DataProvider('provideSchemaMaps')]
+    public function testSchemaMapsAreEncodedAsObjects(array $root, string $expectedJson)
+    {
+        $this->assertSame($expectedJson, json_encode((new Schema($root, [], Dialect::jsonSchema202012()))->getRoot()));
+    }
+
+    public static function provideSchemaMaps(): iterable
+    {
+        yield 'empty maps' => [
+            ['properties' => [], 'patternProperties' => [], '$defs' => [], 'definitions' => [], 'dependentSchemas' => [], 'dependentRequired' => []],
+            '{"properties":{},"patternProperties":{},"$defs":{},"definitions":{},"dependentSchemas":{},"dependentRequired":{}}',
+        ];
+        yield 'maps with list keys' => [
+            ['properties' => ['0' => ['type' => 'string'], '1' => ['type' => 'integer']], 'dependentRequired' => ['0' => ['1']]],
+            '{"properties":{"0":{"type":"string"},"1":{"type":"integer"}},"dependentRequired":{"0":["1"]}}',
+        ];
+    }
+
+    public function testValuesOfKeywordsThatAreNotSchemasAreKeptAsIs()
+    {
+        $schema = new Schema(['dependentRequired' => ['a' => [], 'b' => ['a']], 'x-tags' => [], 'x-meta' => ['ids' => []]], [], Dialect::openApi31());
+
+        $this->assertSame('{"dependentRequired":{"a":[],"b":["a"]},"x-tags":[],"x-meta":{"ids":[]}}', json_encode($schema->getRoot()));
+    }
+}

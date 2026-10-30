@@ -440,6 +440,18 @@ class ClassWithDocCommentWithoutInitialSpace
 {
 }
 
+/**
+ * Decrypts what an {@see EncrypterInterface} produced, as {@link https://example.com/spec the spec} says.
+ */
+class ClassWithDocCommentWithInlineTags
+{
+}
+
+/** @template T of object */
+class ClassWithTagOnlyDocComment
+{
+}
+
 #[AsTaggedItem(priority: 30)]
 class TaggedItemWithPriorityClass
 {

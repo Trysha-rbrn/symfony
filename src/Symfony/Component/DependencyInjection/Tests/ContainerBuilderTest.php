@@ -19,6 +19,7 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\IgnoreDeprecations;
 use PHPUnit\Framework\TestCase;
 use Psr\Container\ContainerInterface as PsrContainerInterface;
+use Symfony\Bridge\PhpUnit\Attribute\TimeSensitive;
 use Symfony\Component\Config\FileLocator;
 use Symfony\Component\Config\Resource\DirectoryResource;
 use Symfony\Component\Config\Resource\FileResource;
@@ -39,6 +40,7 @@ use Symfony\Component\DependencyInjection\Compiler\PassConfig;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\ContainerInterface;
 use Symfony\Component\DependencyInjection\Definition;
+use Symfony\Component\DependencyInjection\EnvVarProcessorInterface;
 use Symfony\Component\DependencyInjection\Exception\BadMethodCallException;
 use Symfony\Component\DependencyInjection\Exception\EnvNotFoundException;
 use Symfony\Component\DependencyInjection\Exception\InvalidArgumentException;
@@ -78,6 +80,33 @@ use Symfony\Component\ExpressionLanguage\Expression;
 
 class ContainerBuilderTest extends TestCase
 {
+    #[DataProvider('provideConditionalReferences')]
+    public function testConditionalReferences(string $method, mixed $value, array $expected)
+    {
+        $this->assertSame($expected, ContainerBuilder::$method($value));
+    }
+
+    public static function provideConditionalReferences(): iterable
+    {
+        foreach ([
+            'getServiceConditionals' => ContainerInterface::IGNORE_ON_INVALID_REFERENCE,
+            'getInitializedConditionals' => ContainerInterface::IGNORE_ON_UNINITIALIZED_REFERENCE,
+        ] as $method => $behavior) {
+            $reference = static fn (string $id) => new Reference($id, $behavior);
+
+            yield $method.' empty' => [$method, [], []];
+            yield $method.' scalar' => [$method, 'ignored', []];
+            yield $method.' reference' => [$method, $reference('a'), ['a']];
+            yield $method.' other behavior' => [$method, new Reference('a'), []];
+            yield $method.' flat duplicates' => [$method, [$reference('a'), $reference('a'), $reference('b')], ['a', 'b']];
+            yield $method.' last child overlap' => [$method, [$reference('a'), [$reference('a'), $reference('b')]], ['a', 'b']];
+            yield $method.' nested overlap' => [$method, [[$reference('a'), $reference('a'), $reference('b')], [$reference('b'), $reference('c')]], ['a', 'b', 'c']];
+            yield $method.' input keys' => [$method, ['first' => $reference('a'), 42 => [$reference('a'), $reference('b')]], ['a', 'b']];
+            yield $method.' numeric strings' => [$method, array_map($reference, ['1', '01', '+1', '1.0', '0', '-0', '', '1']), ['1', '01', '+1', '1.0', '0', '-0', '']];
+            yield $method.' arguments' => [$method, [new ServiceClosureArgument($reference('a')), new IteratorArgument([$reference('b')])], []];
+        }
+    }
+
     public function testDefaultRegisteredDefinitions()
     {
         $builder = new ContainerBuilder();
@@ -1168,6 +1197,27 @@ class ContainerBuilderTest extends TestCase
         $this->assertSame(['FOO' => 2, 'json:BAR' => 2, 'BAZ' => 0], $container->getEnvCounters());
     }
 
+    public function testInlinedEnvVarsAreTheOnesResolvedToTheirValue()
+    {
+        $bag = new EnvPlaceholderParameterBag();
+        $foo = $bag->get('env(INLINED_FOO)');
+        $bar = $bag->get('env(INLINED_BAR)');
+        $extensionContainer = new ContainerBuilder($bag);
+
+        $_ENV['INLINED_FOO'] = 'foo';
+        try {
+            $this->assertSame('foo', $extensionContainer->resolveEnvPlaceholders($foo, true));
+        } finally {
+            unset($_ENV['INLINED_FOO']);
+        }
+        $this->assertSame('%env(INLINED_BAR)%', $extensionContainer->resolveEnvPlaceholders($bar));
+
+        $container = new ContainerBuilder();
+        $container->merge($extensionContainer);
+
+        $this->assertSame(['INLINED_FOO'], $container->getInlinedEnvVars());
+    }
+
     public function testCompileWithResolveEnv()
     {
         putenv('DUMMY_ENV_VAR=du%%y');
@@ -1352,6 +1402,26 @@ class ContainerBuilderTest extends TestCase
         } finally {
             putenv('DUMMY_ENV_VAR');
         }
+    }
+
+    public function testEnvVarProcessorsRegisteredAfterResolvingEnvPlaceholders()
+    {
+        $container = new ContainerBuilder();
+        $container->setParameter('env(FOO)', 'foo');
+        $container->setParameter('bar', '%env(rot13:FOO)%');
+        $container->register('rot13', Rot13EnvVarProcessor::class)->addTag('container.env_var_processor');
+
+        $this->assertSame('foo', $container->resolveEnvPlaceholders('%env(FOO)%', true));
+
+        try {
+            $container->resolveEnvPlaceholders('%env(MISSING_ENV_VAR)%', true);
+            $this->fail('An EnvNotFoundException should have been thrown.');
+        } catch (EnvNotFoundException) {
+        }
+
+        $container->compile(true);
+
+        $this->assertSame('sbb', $container->getParameter('bar'));
     }
 
     public function testMergeLogicException()
@@ -1603,6 +1673,7 @@ class ContainerBuilderTest extends TestCase
         $this->assertEquals([$a, $b, $c], $resources, '->getResources() returns an array of resources read for the current configuration');
     }
 
+    #[TimeSensitive(FileResource::class)]
     public function testVendorPathsAreTrackedByTheInstalledJsonFile()
     {
         $vendorFile = (new \ReflectionClass(PsrContainerInterface::class))->getFileName();
@@ -2672,5 +2743,18 @@ class FailsOnceConfigurator
         if (1 === ++self::$calls) {
             throw new \RuntimeException('First attempt fails.');
         }
+    }
+}
+
+class Rot13EnvVarProcessor implements EnvVarProcessorInterface
+{
+    public function getEnv(string $prefix, string $name, \Closure $getEnv): mixed
+    {
+        return str_rot13($getEnv($name));
+    }
+
+    public static function getProvidedTypes(): array
+    {
+        return ['rot13' => 'string'];
     }
 }

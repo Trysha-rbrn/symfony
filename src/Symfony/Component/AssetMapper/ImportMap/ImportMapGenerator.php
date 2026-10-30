@@ -11,10 +11,12 @@
 
 namespace Symfony\Component\AssetMapper\ImportMap;
 
+use Psr\Log\LoggerInterface;
 use Symfony\Component\AssetMapper\AssetMapperInterface;
 use Symfony\Component\AssetMapper\CompiledAssetMapperConfigReader;
 use Symfony\Component\AssetMapper\Exception\LogicException;
 use Symfony\Component\AssetMapper\MappedAsset;
+use Symfony\Component\Console\Helper\CommandInvocation;
 
 /**
  * Provides data needed to write the importmap & preloads.
@@ -30,6 +32,8 @@ class ImportMapGenerator
 
     private const INTEGRITY_HASH_ALGORITHMS = ['sha256', 'sha384', 'sha512'];
 
+    private array $importMapData = [];
+
     /**
      * @param self::ENTRIES_* $entries
      */
@@ -39,6 +43,7 @@ class ImportMapGenerator
         private readonly ImportMapConfigReader $importMapConfigReader,
         private readonly array $integrityHashAlgorithms = [],
         private readonly string $entries = self::ENTRIES_ALL,
+        private readonly ?LoggerInterface $logger = null,
     ) {
         if ($unsupportedAlgorithms = array_diff($this->integrityHashAlgorithms, self::INTEGRITY_HASH_ALGORITHMS)) {
             throw new LogicException(\sprintf('Unsupported integrity hash algorithm "%s". Supported ones are "%s".', implode('", "', $unsupportedAlgorithms), implode('", "', self::INTEGRITY_HASH_ALGORITHMS)));
@@ -82,12 +87,34 @@ class ImportMapGenerator
      */
     public function getImportMapData(array $entrypointNames, ?string $polyfillImportName = null): array
     {
+        if ($this->logger && !$this->compiledConfigReader->configExists(self::IMPORT_MAP_CACHE_FILENAME)) {
+            $this->logger->warning('The import map is computed on each request because "{file}" was not found. Run "asset-map:compile" when deploying, and deploy the files it generates with the application.', ['file' => self::IMPORT_MAP_CACHE_FILENAME]);
+        }
+
         $rawImportMapData = $this->getRawImportMapData();
+        $eagerImports = [];
+        $reachableImports = [];
+        foreach ($entrypointNames as $i => $entrypointName) {
+            $eagerImports[$i] = $this->findEagerEntrypointImports($entrypointName);
+        }
+        if (self::ENTRIES_REACHABLE === $this->entries) {
+            foreach ($entrypointNames as $entrypointName) {
+                $reachableImports[] = $this->findReachableEntrypointImports($entrypointName);
+            }
+        }
+
+        // with compiled files, the inputs are the same arrays on each call, which makes this comparison cheap
+        $inputs = [$entrypointNames, $polyfillImportName, $rawImportMapData, $eagerImports, $reachableImports];
+        $key = implode("\n", $entrypointNames);
+
+        if (($this->importMapData[$key][0] ?? null) === $inputs) {
+            return $this->importMapData[$key][1];
+        }
+
         $finalImportMapData = [];
-        foreach ($entrypointNames as $entrypointName) {
-            $entrypointImports = $this->findEagerEntrypointImports($entrypointName);
+        foreach ($entrypointNames as $i => $entrypointName) {
             // Entrypoint modules must be preloaded before their dependencies
-            foreach ([$entrypointName, ...$entrypointImports] as $import) {
+            foreach ([$entrypointName, ...$eagerImports[$i]] as $import) {
                 if (isset($finalImportMapData[$import])) {
                     continue;
                 }
@@ -104,17 +131,20 @@ class ImportMapGenerator
         }
 
         if (self::ENTRIES_REACHABLE === $this->entries) {
-            $reachableImports = null === $polyfillImportName ? [] : [$polyfillImportName => true];
-            foreach ($entrypointNames as $entrypointName) {
-                foreach ($this->findReachableEntrypointImports($entrypointName) as $import) {
-                    $reachableImports[$import] = true;
+            $reachable = null === $polyfillImportName ? [] : [$polyfillImportName => true];
+            foreach ($reachableImports as $imports) {
+                foreach ($imports as $import) {
+                    $reachable[$import] = true;
                 }
             }
 
-            $rawImportMapData = array_intersect_key($rawImportMapData, $reachableImports);
+            $rawImportMapData = array_intersect_key($rawImportMapData, $reachable);
         }
 
-        return array_merge($finalImportMapData, $rawImportMapData);
+        $finalImportMapData = array_merge($finalImportMapData, $rawImportMapData);
+        $this->importMapData[$key] = [$inputs, $finalImportMapData];
+
+        return $finalImportMapData;
     }
 
     /**
@@ -321,7 +351,9 @@ class ImportMapGenerator
     {
         if ($entry->isRemotePackage()) {
             if (!is_file($entry->path)) {
-                throw new LogicException(\sprintf('The "%s" vendor asset is missing. Try running the "importmap:install" command.', $entry->importName));
+                $command = class_exists(CommandInvocation::class) ? CommandInvocation::format('importmap:install', 'bin/console') : 'importmap:install';
+
+                throw new LogicException(\sprintf('The "%s" vendor asset is missing. Try running the "%s" command.', $entry->importName, $command));
             }
 
             throw new LogicException(\sprintf('The "%s" vendor file exists locally (%s), but cannot be found in any asset map paths. Be sure the assets vendor directory is an asset mapper path.', $entry->importName, $entry->path));

@@ -17,6 +17,7 @@ use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\RequiresPhpExtension;
 use PHPUnit\Framework\Attributes\TestWith;
 use PHPUnit\Framework\TestCase;
+use Symfony\Bridge\PhpUnit\ClockMock;
 use Symfony\Component\Uid\Exception\InvalidArgumentException;
 use Symfony\Component\Uid\MaxUuid;
 use Symfony\Component\Uid\NilUuid;
@@ -108,7 +109,7 @@ class UuidTest extends TestCase
 
         $uuid = new UuidV1(self::A_UUID_V1);
 
-        $this->assertEquals(\DateTimeImmutable::createFromFormat('U.u', '1583245966.746458'), $uuid->getDateTime());
+        $this->assertEquals(\DateTimeImmutable::createFromTimestamp(1583245966.746458), $uuid->getDateTime());
         $this->assertSame('3499710062d0', $uuid->getNode());
     }
 
@@ -591,8 +592,21 @@ class UuidTest extends TestCase
         $this->assertEquals(new \DateTimeImmutable('@0'), (new UuidV1('13814001-1dd2-11b2-a456-426655440000'))->getDateTime());
         $this->assertEquals(new \DateTimeImmutable('@0'), (new UuidV1('13814000-1dd2-11b2-a456-426655440000'))->getDateTime());
         $this->assertEquals(new \DateTimeImmutable('@0'), (new UuidV1('13813fff-1dd2-11b2-a456-426655440000'))->getDateTime());
-        $this->assertEquals(\DateTimeImmutable::createFromFormat('U.u', '-0.000001'), (new UuidV1('13813ff6-1dd2-11b2-a456-426655440000'))->getDateTime());
+        $this->assertEquals(new \DateTimeImmutable('1969-12-31 23:59:59.999999 UTC'), (new UuidV1('13813ff6-1dd2-11b2-a456-426655440000'))->getDateTime());
+        $this->assertEquals(new \DateTimeImmutable('1969-12-31 23:59:59.999999 UTC'), (new UuidV1('13813ff5-1dd2-11b2-a456-426655440000'))->getDateTime());
+        $this->assertEquals(new \DateTimeImmutable('1969-12-31 23:59:58.500000 UTC'), (new UuidV1('129c5e40-1dd2-11b2-a456-426655440000'))->getDateTime());
+        $this->assertEquals(new \DateTimeImmutable('1582-10-15 00:00:00.500000 UTC'), (new UuidV1('004c4b40-0000-1000-a456-426655440000'))->getDateTime());
         $this->assertEquals(new \DateTimeImmutable('@-12219292800'), (new UuidV1('00000000-0000-1000-a456-426655440000'))->getDateTime());
+    }
+
+    public function testGenerateBeforeUnixEpoch()
+    {
+        $node = new UuidV1('00000000-0000-1000-a456-426655440000');
+
+        $this->assertSame('13813ff6-1dd2-11b2-a456-426655440000', UuidV1::generate(new \DateTimeImmutable('1969-12-31 23:59:59.999999 UTC'), $node));
+        $this->assertSame('129c5e40-1dd2-11b2-a456-426655440000', UuidV1::generate(new \DateTimeImmutable('1969-12-31 23:59:58.500000 UTC'), $node));
+        $this->assertSame('004c4b40-0000-1000-a456-426655440000', UuidV1::generate(new \DateTimeImmutable('1582-10-15 00:00:00.500000 UTC'), $node));
+        $this->assertSame('1b21dd21-29c5-6e40-a456-426655440000', UuidV6::generate(new \DateTimeImmutable('1969-12-31 23:59:58.500000 UTC'), $node));
     }
 
     public function testFromStringBase58Padding()
@@ -654,7 +668,7 @@ class UuidTest extends TestCase
     #[TestWith(['1645557742.999999'])]
     public function testV7MicrosecondPrecision(string $time)
     {
-        $uuid = UuidV7::fromString(UuidV7::generate(\DateTimeImmutable::createFromFormat('U.u', $time)));
+        $uuid = UuidV7::fromString(UuidV7::generate(\DateTimeImmutable::createFromTimestamp((float) $time)));
 
         $this->assertSame($time, $uuid->getDateTime()->format('U.u'));
     }
@@ -662,7 +676,7 @@ class UuidTest extends TestCase
     public function testUuidV7Boundaries()
     {
         // 0x017F22E279B0 is the RFC 9562 example timestamp for UUIDv7
-        $time = \DateTimeImmutable::createFromFormat('U.v', '1645557742.000');
+        $time = \DateTimeImmutable::createFromTimestamp(1645557742);
         [$min, $max] = UuidV7::createBoundaries($time);
 
         $this->assertSame('017f22e2-79b0-7000-8000-000000000000', (string) $min);
@@ -686,6 +700,17 @@ class UuidTest extends TestCase
         $this->assertLessThan(0, $min->compare($inside));
         $this->assertGreaterThan(0, $max->compare($inside));
         $this->assertSame($time->format('Uv'), $min->getDateTime()->format('Uv'));
+    }
+
+    #[Group('time-sensitive')]
+    public function testUuidV6BoundariesDefaultToNow()
+    {
+        ClockMock::withClockMock(1776072600.123456);
+
+        [$min, $max] = UuidV6::createBoundaries();
+
+        $this->assertSame('1f1371b5-7c2f-6280-8000-000000000000', (string) $min);
+        $this->assertSame('1f1371b5-7c2f-6280-bfff-ffffffffffff', (string) $max);
     }
 
     public function testCreateBoundariesLeavesTheGeneratorClockAlone()

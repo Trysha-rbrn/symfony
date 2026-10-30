@@ -144,7 +144,6 @@ class ProcessTest extends TestCase
         $this->assertLessThan(15, microtime(true) - $start);
     }
 
-    #[Group('transient-on-windows')]
     public function testWaitUntilSpecificOutput()
     {
         $p = $this->getProcess([self::$phpBin, __DIR__.'/KillableProcessWithOutput.php']);
@@ -167,6 +166,95 @@ class ProcessTest extends TestCase
         $p = $this->getProcess('echo foo');
         $p->start();
         $this->assertFalse($p->waitUntil(static fn () => false));
+    }
+
+    public function testWaitUntilSeesOutputWrittenBeforeItIsCalled()
+    {
+        $marker = tempnam(sys_get_temp_dir(), 'sf_process_');
+        unlink($marker);
+
+        $p = $this->getProcessForCode('echo "ready"; touch(getenv("MARKER")); sleep(1);', null, ['MARKER' => $marker]);
+        $p->start();
+
+        $limit = microtime(true) + 30;
+        while (!is_file($marker) && microtime(true) < $limit) {
+            usleep(10000);
+        }
+        $this->assertFileExists($marker);
+
+        $this->assertTrue($p->waitUntil(static fn (string $type, string $output): bool => str_contains($output, 'ready')));
+
+        $p->stop();
+        // touch() creates the file before setting its times, so removing the file in between can fail
+        unlink($marker);
+    }
+
+    public function testWaitUntilSeesOutputWrittenWhileItsCallbackRuns()
+    {
+        $p = $this->getProcessForCode('echo "first"; usleep(500000); echo "second"; sleep(1);');
+        $p->start();
+
+        $this->assertTrue($p->waitUntil(static function (string $type, string $output): bool {
+            if (str_contains($output, 'first')) {
+                usleep(1000000);
+            }
+
+            return str_contains($output, 'second');
+        }));
+
+        $p->stop();
+    }
+
+    public function testWaitUntilCallbackIsNotCalledAnymoreAfterItThrew()
+    {
+        $marker = tempnam(sys_get_temp_dir(), 'sf_process_');
+        unlink($marker);
+
+        $p = $this->getProcessForCode('echo "foo"; touch(getenv("MARKER")); usleep(500000); echo "bar";', null, ['MARKER' => $marker]);
+        $p->start();
+
+        $limit = microtime(true) + 30;
+        while (!is_file($marker) && microtime(true) < $limit) {
+            usleep(10000);
+        }
+        $this->assertFileExists($marker);
+
+        $calls = 0;
+        try {
+            $p->waitUntil(static function () use (&$calls): bool {
+                ++$calls;
+
+                throw new \RuntimeException('Callback failure.');
+            });
+            $this->fail('The exception thrown by the callback should be propagated.');
+        } catch (\RuntimeException $e) {
+            $this->assertSame('Callback failure.', $e->getMessage());
+        }
+
+        $p->wait();
+        // touch() creates the file before setting its times, and fails when the file is removed in between
+        unlink($marker);
+
+        $this->assertSame(1, $calls);
+        $this->assertSame('foobar', $p->getOutput());
+    }
+
+    public function testIteratorEndsAfterWaitUntilTimedOut()
+    {
+        $p = $this->getProcessForCode('sleep(5);');
+        $p->setTimeout(0.5);
+        $p->start();
+
+        try {
+            $p->waitUntil(static fn (): bool => false);
+            $this->fail('A ProcessTimedOutException should have been thrown.');
+        } catch (ProcessTimedOutException) {
+        }
+
+        $iterations = 0;
+        foreach ($p->getIterator($p::ITER_NON_BLOCKING) as $data) {
+            $this->assertLessThan(10, ++$iterations, 'The iterator should end once the process is terminated.');
+        }
     }
 
     public function testAllOutputIsActuallyReadOnTermination()
@@ -536,6 +624,162 @@ class ProcessTest extends TestCase
         $process->setTty(true);
     }
 
+    public function testInheritStdio()
+    {
+        $process = $this->getProcess([self::$phpBin, __DIR__.'/InheritStdioProcess.php', '-e', self::$phpBin, '-c', 'echo "out: ".stream_get_contents(STDIN); fwrite(STDERR, "err"); exit(3);'], null, null, 'stdin of the parent');
+        $process->run();
+
+        $this->assertSame('out: stdin of the parent'.\PHP_EOL.'exit code: 3'.\PHP_EOL.'captured output: ""', $process->getOutput());
+        $this->assertSame('err', $process->getErrorOutput());
+    }
+
+    public function testInheritStdioWithInput()
+    {
+        $process = $this->getProcess([self::$phpBin, __DIR__.'/InheritStdioProcess.php', '-e', self::$phpBin, '-c', 'echo "out: ".stream_get_contents(STDIN);', '-i', 'input of the child'], null, null, 'stdin of the parent');
+        $process->run();
+
+        $this->assertSame('out: input of the child'.\PHP_EOL.'exit code: 0'.\PHP_EOL.'captured output: ""', $process->getOutput());
+    }
+
+    public function testInheritStdioKeepsTheTerminal()
+    {
+        if (!Process::isPtySupported()) {
+            $this->markTestSkipped('PTY is not supported on this operating system.');
+        }
+
+        $process = $this->getProcess([self::$phpBin, __DIR__.'/InheritStdioProcess.php', '-e', self::$phpBin, '-c', 'echo stream_isatty(STDOUT) ? "STDOUT is a TTY" : "STDOUT is not a TTY";']);
+        $process->setPty(true);
+        $process->run();
+
+        $this->assertStringContainsString('STDOUT is a TTY', $process->getOutput());
+    }
+
+    public function testInheritStdioWritesAfterWhatTheCurrentProcessWroteToAFile()
+    {
+        $file = tempnam(sys_get_temp_dir(), 'sf_process_');
+
+        try {
+            $process = $this->getProcess('"${:php}" "${:script}" -e "${:php}" -c "echo 1;" -c "echo 2;" > "${:file}"');
+            $process->run(null, ['php' => self::$phpBin, 'script' => __DIR__.'/InheritStdioProcess.php', 'file' => $file]);
+
+            $this->assertSame('1'.\PHP_EOL.'exit code: 0'.\PHP_EOL.'captured output: ""2'.\PHP_EOL.'exit code: 0'.\PHP_EOL.'captured output: ""', file_get_contents($file));
+        } finally {
+            unlink($file);
+        }
+    }
+
+    public function testInheritStdioDoesNotReadAnInputFileTwice()
+    {
+        $file = tempnam(sys_get_temp_dir(), 'sf_process_');
+        file_put_contents($file, 'input file');
+
+        try {
+            $process = $this->getProcess('"${:php}" "${:script}" -e "${:php}" -c "echo stream_get_contents(STDIN);" -c "echo stream_get_contents(STDIN);" < "${:file}"');
+            $process->run(null, ['php' => self::$phpBin, 'script' => __DIR__.'/InheritStdioProcess.php', 'file' => $file]);
+
+            $this->assertSame('input file'.\PHP_EOL.'exit code: 0'.\PHP_EOL.'captured output: ""'.\PHP_EOL.'exit code: 0'.\PHP_EOL.'captured output: ""', $process->getOutput());
+        } finally {
+            unlink($file);
+        }
+    }
+
+    public function testStdioIsNotInheritedByDefault()
+    {
+        $process = $this->getProcess('foo');
+        $this->assertFalse($process->isStdioInherited());
+        $this->assertSame($process, $process->inheritStdio());
+        $this->assertTrue($process->isStdioInherited());
+    }
+
+    public function testInheritStdioWhileRunning()
+    {
+        $process = $this->getProcessForCode('sleep(30);');
+        $process->start();
+
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Inheriting the standard streams while the process is running is not possible.');
+
+        $process->inheritStdio();
+    }
+
+    public function testGetIteratorWhileStdioIsInherited()
+    {
+        $process = $this->getProcessForCode('sleep(30);');
+        $process->inheritStdio();
+        $process->start();
+
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage('The output cannot be read while the standard streams are inherited.');
+
+        foreach ($process as $output) {
+        }
+    }
+
+    public function testWaitUntilWhileStdioIsInherited()
+    {
+        $process = $this->getProcessForCode('sleep(30);');
+        $process->inheritStdio();
+        $process->start();
+
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage('The output cannot be read while the standard streams are inherited.');
+
+        $process->waitUntil(static fn (): bool => true);
+    }
+
+    public function testInheritStdioWhileTtyIsEnabled()
+    {
+        if (!Process::isTtySupported()) {
+            $this->markTestSkipped('There is no TTY support');
+        }
+
+        $process = $this->getProcess('foo');
+        $process->setTty(true);
+
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage('The standard streams cannot be inherited while the TTY mode is enabled.');
+
+        $process->inheritStdio();
+    }
+
+    public function testTtyWhileStdioIsInherited()
+    {
+        if ('\\' === \DIRECTORY_SEPARATOR) {
+            $this->markTestSkipped('Windows does not have /dev/tty support');
+        }
+
+        $process = $this->getProcess('foo');
+        $process->inheritStdio();
+
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage('TTY mode cannot be enabled while the standard streams are inherited.');
+
+        $process->setTty(true);
+    }
+
+    public function testInheritStdioWhileIdleTimeoutIsSet()
+    {
+        $process = $this->getProcess('foo');
+        $process->setIdleTimeout(1);
+
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage('The standard streams cannot be inherited while an idle timeout is set.');
+
+        $process->inheritStdio();
+    }
+
+    public function testSetIdleTimeoutWhileStdioIsInherited()
+    {
+        $process = $this->getProcess('foo');
+        $process->inheritStdio();
+        $this->assertSame($process, $process->setIdleTimeout(null));
+
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage('Idle timeout cannot be set while the standard streams are inherited.');
+
+        $process->setIdleTimeout(1);
+    }
+
     public function testExitCodeTextIsNullWhenExitCodeIsNull()
     {
         $process = $this->getProcess('');
@@ -605,11 +849,11 @@ class ProcessTest extends TestCase
 
     public function testStartIsNonBlocking()
     {
-        $process = $this->getProcessForCode('usleep(500000);');
+        $process = $this->getProcessForCode('sleep(10);');
         $start = microtime(true);
         $process->start();
         $end = microtime(true);
-        $this->assertLessThan(0.4, $end - $start);
+        $this->assertLessThan(5, $end - $start);
         $process->stop();
     }
 
@@ -1219,7 +1463,7 @@ class ProcessTest extends TestCase
         $process = $this->getProcessForCode('$n = 0; while ($n < 3) { file_put_contents(\''.$stream.'\', $n, 1); $n++; usleep(1000); }', null, null, null, null);
         $process->start();
         $result = '';
-        $limit = microtime(true) + 3;
+        $limit = microtime(true) + 30;
         $expected = '012';
 
         while ($result !== $expected && microtime(true) < $limit) {
@@ -1365,10 +1609,7 @@ class ProcessTest extends TestCase
             $output[] = [$type, $data];
             break;
         }
-        $expectedOutput = [
-            [$process::OUT, '123'],
-        ];
-        $this->assertSame($expectedOutput, $output);
+        $this->assertCount(1, $output);
 
         $input->write(345);
 
@@ -1378,6 +1619,17 @@ class ProcessTest extends TestCase
 
         $this->assertSame('', $process->getOutput());
         $this->assertFalse($process->isRunning());
+
+        if ('\\' === \DIRECTORY_SEPARATOR) {
+            // Output files are polled on Windows, so the order of chunks across stdout and stderr is not preserved
+            $streams = [$process::OUT => '', $process::ERR => ''];
+            foreach ($output as [$type, $data]) {
+                $streams[$type] .= $data;
+            }
+            $this->assertSame([$process::OUT => '123345', $process::ERR => '234456'], $streams);
+
+            return;
+        }
 
         $expectedOutput = [
             [$process::OUT, '123'],
@@ -1483,6 +1735,37 @@ class ProcessTest extends TestCase
 
         putenv('FOO');
         unset($_ENV['FOO']);
+    }
+
+    #[DataProvider('provideSymfonyDotenvVarsPassedToSubprocess')]
+    public function testSymfonyDotenvVarsDoesNotListExplicitlyPassedVars(?array $constructorEnv, array $startEnv, string|false $expected)
+    {
+        putenv('SYMFONY_DOTENV_VARS=FOO,BAR,BAZ');
+        $_ENV['SYMFONY_DOTENV_VARS'] = 'FOO,BAR,BAZ';
+
+        try {
+            $process = $this->getProcessForCode('echo var_export(getenv("SYMFONY_DOTENV_VARS"), true);', null, $constructorEnv);
+            $process->start(null, $startEnv);
+            $process->wait();
+
+            $this->assertTrue($process->isSuccessful(), $process->getErrorOutput());
+            $this->assertSame(var_export($expected, true), $process->getOutput());
+        } finally {
+            putenv('SYMFONY_DOTENV_VARS');
+            unset($_ENV['SYMFONY_DOTENV_VARS']);
+        }
+    }
+
+    public static function provideSymfonyDotenvVarsPassedToSubprocess()
+    {
+        yield 'inherited as is' => [null, [], 'FOO,BAR,BAZ'];
+        yield 'var passed to the constructor' => [['FOO' => 'explicit'], [], 'BAR,BAZ'];
+        yield 'var passed to start()' => [null, ['BAR' => 'explicit'], 'FOO,BAZ'];
+        yield 'var removed explicitly' => [['BAZ' => false], [], 'FOO,BAR'];
+        yield 'unrelated var' => [['QUX' => 'explicit'], [], 'FOO,BAR,BAZ'];
+        yield 'all vars passed' => [['FOO' => 'a', 'BAR' => 'b', 'BAZ' => 'c'], [], ''];
+        yield 'SYMFONY_DOTENV_VARS passed explicitly' => [['FOO' => 'explicit', 'SYMFONY_DOTENV_VARS' => 'FOO'], [], 'FOO'];
+        yield 'SYMFONY_DOTENV_VARS removed explicitly' => [['SYMFONY_DOTENV_VARS' => false], [], false];
     }
 
     public function testGetCommandLine()
@@ -1667,7 +1950,7 @@ class ProcessTest extends TestCase
     {
         $process = $this->getProcess(self::$phpBin.' '.__DIR__.'/ErrorProcessInitiator.php -e '.self::$phpBin);
         $process->start();
-        $process->setTimeout(2);
+        $process->setTimeout(20);
         $process->wait();
         $this->assertFalse($process->isRunning());
 

@@ -23,6 +23,8 @@ use Symfony\Component\HttpClient\Response\MockResponse;
 use Symfony\Component\HttpClient\Retry\GenericRetryStrategy;
 use Symfony\Component\HttpClient\Retry\RetryStrategyInterface;
 use Symfony\Component\HttpClient\RetryableHttpClient;
+use Symfony\Component\HttpClient\Tests\Fixtures\ResettableClient;
+use Symfony\Component\HttpClient\Tests\Fixtures\ShutdownAwareClient;
 use Symfony\Contracts\HttpClient\Exception\TransportExceptionInterface;
 use Symfony\Contracts\HttpClient\HttpClientInterface;
 use Symfony\Contracts\HttpClient\ResponseInterface;
@@ -284,6 +286,79 @@ class RetryableHttpClientTest extends TestCase
         $this->assertTrue($strategy->isCalled, 'The HTTP retry strategy should be called');
     }
 
+    public function testRetryDelayLongerThanTimeout()
+    {
+        TestHttpServer::start();
+
+        $client = new RetryableHttpClient(HttpClient::create(), new GenericRetryStrategy([404], 1000, 1.0, 0, 0.0), 1);
+        $response = $client->request('GET', 'http://localhost:8057/404', ['timeout' => 0.5]);
+
+        $time = hrtime(true);
+        $this->assertSame(404, $response->getStatusCode());
+        $this->assertSame(1, $response->getInfo('retry_count'));
+        $this->assertGreaterThanOrEqual(0.9, (hrtime(true) - $time) / 1E9);
+    }
+
+    public function testRetryAfterLongerThanMaxDuration()
+    {
+        TestHttpServer::start();
+
+        $client = new RetryableHttpClient(HttpClient::create());
+        $response = $client->request('GET', 'http://localhost:8057/custom?status=503&headers[]=Retry-After:10', ['max_duration' => 1, 'timeout' => 0.5]);
+
+        $time = hrtime(true);
+
+        try {
+            $response->getStatusCode();
+            $this->fail(TransportException::class.' expected');
+        } catch (TransportException $e) {
+            $this->assertStringStartsWith('Max duration was reached for "http://localhost:8057/custom', $e->getMessage());
+        }
+
+        $this->assertLessThan(5, (hrtime(true) - $time) / 1E9);
+    }
+
+    public function testMaxDurationCountsAllRetriesAndDelays()
+    {
+        TestHttpServer::start();
+
+        $client = new RetryableHttpClient(HttpClient::create(), new GenericRetryStrategy([404], 400, 1.0, 0, 0.0), 5);
+        $response = $client->request('GET', 'http://localhost:8057/404', ['max_duration' => 1]);
+
+        $time = hrtime(true);
+
+        try {
+            $response->getStatusCode();
+            $this->fail(TransportException::class.' expected');
+        } catch (TransportException $e) {
+            $this->assertSame('Max duration was reached for "http://localhost:8057/404".', $e->getMessage());
+        }
+
+        $this->assertLessThan(5, $response->getInfo('retry_count'));
+        $this->assertLessThan(1.5, (hrtime(true) - $time) / 1E9);
+    }
+
+    public function testRetryAfterLongerThanMaxDurationWithMockResponses()
+    {
+        $client = new RetryableHttpClient(new MockHttpClient([
+            new MockResponse('', ['http_code' => 503, 'response_headers' => ['Retry-After' => '3']]),
+            new MockResponse('', ['http_code' => 200]),
+        ]), null, 1);
+
+        $time = hrtime(true);
+        $response = $client->request('GET', 'http://example.com/foo-bar', ['max_duration' => 0.5]);
+
+        try {
+            $response->getStatusCode();
+            $this->fail(TransportException::class.' expected');
+        } catch (TransportException $e) {
+            $this->assertSame('Max duration was reached for "http://example.com/foo-bar".', $e->getMessage());
+        }
+
+        $this->assertGreaterThanOrEqual(0.4, (hrtime(true) - $time) / 1E9);
+        $this->assertLessThan(2, (hrtime(true) - $time) / 1E9);
+    }
+
     public function testRetryWithMultipleBaseUris()
     {
         $client = new RetryableHttpClient(
@@ -328,6 +403,22 @@ class RetryableHttpClientTest extends TestCase
 
         self::assertSame(200, $response->getStatusCode());
         self::assertSame('http://example.com/b/foo-bar', $response->getInfo('url'));
+    }
+
+    public function testWithOptionsKeepsTheBaseUrisOfTheOriginalClient()
+    {
+        $client = new RetryableHttpClient(new MockHttpClient(), new GenericRetryStrategy([500], 0), 1);
+        $client = $client->withOptions(['base_uri' => ['http://example.com/a/', 'http://example.com/b/']]);
+
+        $clone = $client->withOptions(['base_uri' => 'http://example.com/c/']);
+
+        self::assertSame('http://example.com/c/foo-bar', $clone->request('GET', 'foo-bar')->getInfo('url'));
+        self::assertSame('http://example.com/a/foo-bar', $client->request('GET', 'foo-bar')->getInfo('url'));
+
+        $clone = $client->withOptions(['base_uri' => ['http://example.com/d/', 'http://example.com/e/']]);
+
+        self::assertSame('http://example.com/d/foo-bar', $clone->request('GET', 'foo-bar')->getInfo('url'));
+        self::assertSame('http://example.com/a/foo-bar', $client->request('GET', 'foo-bar')->getInfo('url'));
     }
 
     public function testRetryWithMultipleBaseUrisShufflesNestedArray()
@@ -593,5 +684,19 @@ class RetryableHttpClientTest extends TestCase
         }
 
         $this->assertSame(2, $retryCount, 'The request should have been retried once');
+    }
+
+    public function testResetForwardsTheShutdownFlagToShutdownAwareClientsOnly()
+    {
+        $client = new RetryableHttpClient($inner = new ShutdownAwareClient());
+        $client->reset();
+        $client->reset(true);
+
+        $this->assertSame([false, true], $inner->resets);
+
+        $client = new RetryableHttpClient($inner = new ResettableClient());
+        $client->reset(true);
+
+        $this->assertSame([[]], $inner->resets);
     }
 }

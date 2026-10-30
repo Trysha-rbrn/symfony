@@ -98,6 +98,12 @@ class ContainerBuilder extends Container implements TaggedContainerInterface
      */
     private array $extensionConfigs = [];
 
+    /**
+     * @var array<string, list<int>> The rank of each extension config in the load order, negative when prepended
+     */
+    private array $extensionConfigRanks = [];
+    private int $lastExtensionConfigRank = 0;
+
     private Compiler $compiler;
     private bool $trackResources;
     private InstantiatorInterface $proxyInstantiator;
@@ -122,6 +128,11 @@ class ContainerBuilder extends Container implements TaggedContainerInterface
      * @var int[] a map of env vars to their resolution counter
      */
     private array $envCounters = [];
+
+    /**
+     * @var array<string, true> the env vars resolved to their value
+     */
+    private array $inlinedEnvVars = [];
 
     /**
      * @var string[] the list of vendor directories
@@ -499,6 +510,7 @@ class ContainerBuilder extends Container implements TaggedContainerInterface
         $namespace = $this->getExtension($extension)->getAlias();
 
         $this->extensionConfigs[$namespace][] = $values ?? [];
+        $this->extensionConfigRanks[$namespace][] = ++$this->lastExtensionConfigRank;
 
         return $this;
     }
@@ -705,7 +717,10 @@ class ContainerBuilder extends Container implements TaggedContainerInterface
                 $this->extensionConfigs[$name] = [];
             }
 
-            $this->extensionConfigs[$name] = array_merge($this->extensionConfigs[$name], $container->getExtensionConfig($name));
+            foreach ($container->getExtensionConfig($name) as $config) {
+                $this->extensionConfigs[$name][] = $config;
+                $this->extensionConfigRanks[$name][] = ++$this->lastExtensionConfigRank;
+            }
         }
 
         if ($parameterBag instanceof EnvPlaceholderParameterBag && $otherBag instanceof EnvPlaceholderParameterBag) {
@@ -725,6 +740,8 @@ class ContainerBuilder extends Container implements TaggedContainerInterface
                 $this->envCounters[$env] += $count;
             }
         }
+
+        $this->inlinedEnvVars += $container->inlinedEnvVars;
 
         foreach ($container->getAutoconfiguredInstanceof() as $interface => $childDefinition) {
             if (isset($this->autoconfiguredInstanceof[$interface])) {
@@ -771,6 +788,8 @@ class ContainerBuilder extends Container implements TaggedContainerInterface
         }
 
         array_unshift($this->extensionConfigs[$name], $config);
+        $this->extensionConfigRanks[$name] ??= [];
+        array_unshift($this->extensionConfigRanks[$name], -++$this->lastExtensionConfigRank);
     }
 
     /**
@@ -779,11 +798,41 @@ class ContainerBuilder extends Container implements TaggedContainerInterface
      * An element is usually an array, but it can hold any value the configuration
      * tree of the extension accepts at its root.
      *
+     * The config at each index is considered loaded where the previous config at that index was.
+     *
      * @param list<mixed> $configs
      */
     public function setExtensionConfig(string $name, array $configs): void
     {
         $this->extensionConfigs[$name] = array_values($configs);
+        $ranks = \array_slice($this->extensionConfigRanks[$name] ?? [], 0, \count($configs));
+
+        while (\count($ranks) < \count($configs)) {
+            $ranks[] = ++$this->lastExtensionConfigRank;
+        }
+
+        $this->extensionConfigRanks[$name] = $ranks;
+    }
+
+    /**
+     * Adds a config to the configs of an extension, at the place of a config of another extension in the load order.
+     *
+     * @internal
+     */
+    public function forwardExtensionConfig(string $from, int $index, string $to, mixed $config): void
+    {
+        $rank = $this->extensionConfigRanks[$from][$index] ?? ++$this->lastExtensionConfigRank;
+        $ranks = $this->extensionConfigRanks[$to] ?? [];
+        $i = \count($ranks);
+
+        while ($i && $ranks[$i - 1] > $rank) {
+            --$i;
+        }
+
+        $this->extensionConfigs[$to] ??= [];
+        array_splice($this->extensionConfigs[$to], $i, 0, [$config]);
+        array_splice($ranks, $i, 0, [$rank]);
+        $this->extensionConfigRanks[$to] = $ranks;
     }
 
     /**
@@ -853,6 +902,7 @@ class ContainerBuilder extends Container implements TaggedContainerInterface
         }
 
         $this->extensionConfigs = [];
+        $this->extensionConfigRanks = [];
 
         if ($bag instanceof EnvPlaceholderParameterBag) {
             if ($resolveEnvPlaceholders) {
@@ -1620,6 +1670,7 @@ class ContainerBuilder extends Container implements TaggedContainerInterface
                 if (isset($usedPlaceholders[$placeholder])) {
                     if (true === $format) {
                         $resolved = $bag->escapeValue($this->getEnv($env));
+                        $this->inlinedEnvVars[$env] = true;
                     } else {
                         $resolved = \sprintf($format, $env);
                     }
@@ -1671,6 +1722,18 @@ class ContainerBuilder extends Container implements TaggedContainerInterface
         }
 
         return $this->envCounters;
+    }
+
+    /**
+     * Returns the env vars resolved to their value while building the container.
+     *
+     * @return string[]
+     *
+     * @internal
+     */
+    public function getInlinedEnvVars(): array
+    {
+        return array_keys($this->inlinedEnvVars);
     }
 
     /**
@@ -1758,8 +1821,12 @@ class ContainerBuilder extends Container implements TaggedContainerInterface
 
         if (\is_array($value)) {
             foreach ($value as $v) {
-                $services = array_unique(array_merge($services, self::getServiceConditionals($v)));
+                foreach (self::getServiceConditionals($v) as $service) {
+                    $services[$service] = $service;
+                }
             }
+
+            return array_values($services);
         } elseif ($value instanceof Reference && ContainerInterface::IGNORE_ON_INVALID_REFERENCE === $value->getInvalidBehavior()) {
             $services[] = (string) $value;
         }
@@ -1778,8 +1845,12 @@ class ContainerBuilder extends Container implements TaggedContainerInterface
 
         if (\is_array($value)) {
             foreach ($value as $v) {
-                $services = array_unique(array_merge($services, self::getInitializedConditionals($v)));
+                foreach (self::getInitializedConditionals($v) as $service) {
+                    $services[$service] = $service;
+                }
             }
+
+            return array_values($services);
         } elseif ($value instanceof Reference && ContainerInterface::IGNORE_ON_UNINITIALIZED_REFERENCE === $value->getInvalidBehavior()) {
             $services[] = (string) $value;
         }
@@ -1799,7 +1870,17 @@ class ContainerBuilder extends Container implements TaggedContainerInterface
 
     protected function getEnv(string $name): mixed
     {
-        $value = parent::getEnv($name);
+        // the empty locator that the parent sets when none is defined would hide the env var processors registered later
+        $removeFallbackLocator = !$this->has($id = 'container.env_var_processors_locator');
+
+        try {
+            $value = parent::getEnv($name);
+        } finally {
+            if ($removeFallbackLocator) {
+                unset($this->services[$id]);
+            }
+        }
+
         $bag = $this->getParameterBag();
 
         if (!\is_string($value) || !$bag instanceof EnvPlaceholderParameterBag) {

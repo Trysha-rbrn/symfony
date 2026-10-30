@@ -53,6 +53,7 @@ use Symfony\Component\DependencyInjection\ParameterBag\ParameterBag;
 use Symfony\Component\DependencyInjection\Reference;
 use Symfony\Component\DependencyInjection\ServiceLocator;
 use Symfony\Component\DependencyInjection\Tests\Compiler\AAndIInterfaceConsumer;
+use Symfony\Component\DependencyInjection\Tests\Compiler\AAndIInterfaceImplementation;
 use Symfony\Component\DependencyInjection\Tests\Compiler\AInterface;
 use Symfony\Component\DependencyInjection\Tests\Compiler\EInterface;
 use Symfony\Component\DependencyInjection\Tests\Compiler\EnvAutowireWithMissingArgument;
@@ -68,6 +69,7 @@ use Symfony\Component\DependencyInjection\Tests\Compiler\ListenerResolver;
 use Symfony\Component\DependencyInjection\Tests\Compiler\MyCallable;
 use Symfony\Component\DependencyInjection\Tests\Compiler\MyFactory;
 use Symfony\Component\DependencyInjection\Tests\Compiler\MyInlineService;
+use Symfony\Component\DependencyInjection\Tests\Compiler\NullableIntersectionLazyConsumer;
 use Symfony\Component\DependencyInjection\Tests\Compiler\SingleMethodInterface;
 use Symfony\Component\DependencyInjection\Tests\Compiler\Wither;
 use Symfony\Component\DependencyInjection\Tests\Fixtures\Bar;
@@ -1720,6 +1722,42 @@ class PhpDumperTest extends TestCase
         $this->assertSame('foo', $container->getParameter('BAR'));
     }
 
+    public function testPercentSpansWithWhitespaceAreNotParameters()
+    {
+        $container = new ContainerBuilder();
+        $container->setParameter('foo', 'bar');
+        $container->register('foo', \ArrayObject::class)
+            ->setPublic(true)
+            ->addArgument([
+                '50% of 100%',
+                '%a b%',
+                "%a\tb%",
+                "%a\nb%",
+                "x%a\fb%y",
+                "50%\n%%x",
+                '%foo% is 50% of 100%% and %%foo%%',
+            ]);
+        $container->compile();
+
+        $expected = [
+            '50% of 100%',
+            '%a b%',
+            "%a\tb%",
+            "%a\nb%",
+            "x%a\fb%y",
+            "50%\n%x",
+            'bar is 50% of 100% and %foo%',
+        ];
+        $this->assertSame($expected, $container->get('foo')->getArrayCopy());
+
+        $dumper = new PhpDumper($container);
+        eval('?>'.$dumper->dump(['class' => 'Symfony_DI_PhpDumper_Test_Percent_Spans_With_Whitespace']));
+
+        $container = new \Symfony_DI_PhpDumper_Test_Percent_Spans_With_Whitespace();
+
+        $this->assertSame($expected, $container->get('foo')->getArrayCopy());
+    }
+
     public function testErroredDefinition()
     {
         $this->expectException(RuntimeException::class);
@@ -2196,6 +2234,23 @@ class PhpDumperTest extends TestCase
         $this->assertStringEqualsGeneratedFile('closure.php', $dumper->dump());
     }
 
+    public function testClosureOfStaticMethodString()
+    {
+        $container = new ContainerBuilder();
+        $container->register('closure', 'Closure')
+            ->setPublic(true)
+            ->setFactory(['Closure', 'fromCallable'])
+            ->setArguments([BarTagClass::class.'::getDefaultFooName']);
+        $container->compile();
+        $dumper = new PhpDumper($container);
+
+        eval('?>'.$dumper->dump(['class' => 'Symfony_DI_PhpDumper_Test_Closure_Of_Static_Method_String']));
+
+        $container = new \Symfony_DI_PhpDumper_Test_Closure_Of_Static_Method_String();
+
+        $this->assertSame('bar_tag_class', $container->get('closure')());
+    }
+
     public function testAutowireClosure()
     {
         $container = new ContainerBuilder();
@@ -2282,6 +2337,66 @@ class PhpDumperTest extends TestCase
         $this->assertSame(1, (new \ReflectionFunction($container->get('closure2')))->getNumberOfParameters());
     }
 
+    public function testLazyClosureInCircularReference()
+    {
+        $container = new ContainerBuilder();
+        $container->register('foo', \ArrayObject::class)
+            ->setPublic(true)
+            ->addArgument([new ServiceClosureArgument(new Reference('bar'))]);
+        $container->register('bar', \ArrayObject::class)
+            ->setPublic(true)
+            ->addArgument([(new Definition('Closure'))
+                ->setFactory(['Closure', 'fromCallable'])
+                ->setLazy(true)
+                ->setArguments([[new Reference('foo'), 'count']]),
+            ]);
+        $container->compile();
+        $dumper = new PhpDumper($container);
+
+        eval('?>'.$dumper->dump(['class' => 'Symfony_DI_PhpDumper_Test_Lazy_Closure_In_Circular_Reference']));
+
+        $container->get('bar');
+        $this->assertFalse($container->initialized('foo'));
+
+        $container = new \Symfony_DI_PhpDumper_Test_Lazy_Closure_In_Circular_Reference();
+
+        $bar = $container->get('bar');
+        $this->assertFalse($container->initialized('foo'));
+        $this->assertSame(1, $bar[0]());
+        $this->assertTrue($container->initialized('foo'));
+    }
+
+    public function testLazyClosureInConstructorCircularReference()
+    {
+        $container = new ContainerBuilder();
+        $container->register('foo', \ArrayObject::class)
+            ->setPublic(true)
+            ->addArgument([(new Definition('Closure'))
+                ->setFactory(['Closure', 'fromCallable'])
+                ->setLazy(true)
+                ->setArguments([[new Reference('bar'), 'count']]),
+            ]);
+        $container->register('bar', \ArrayObject::class)
+            ->setPublic(true)
+            ->addArgument([new Reference('foo')]);
+        $container->compile();
+        $dumper = new PhpDumper($container);
+
+        eval('?>'.$dumper->dump(['class' => 'Symfony_DI_PhpDumper_Test_Lazy_Closure_In_Constructor_Circular_Reference']));
+
+        $foo = $container->get('foo');
+        $this->assertFalse($container->initialized('bar'));
+        $this->assertSame(1, $foo[0]());
+        $this->assertSame($foo, $container->get('bar')[0]);
+
+        $container = new \Symfony_DI_PhpDumper_Test_Lazy_Closure_In_Constructor_Circular_Reference();
+
+        $foo = $container->get('foo');
+        $this->assertFalse($container->initialized('bar'));
+        $this->assertSame(1, $foo[0]());
+        $this->assertSame($foo, $container->get('bar')[0]);
+    }
+
     public function testLazyAutowireAttribute()
     {
         $container = new ContainerBuilder();
@@ -2352,7 +2467,8 @@ class PhpDumperTest extends TestCase
 
         $dumper = new PhpDumper($container);
 
-        $this->assertStringEqualsGeneratedFile('lazy_autowire_attribute_with_intersection.php', $dumper->dump());
+        // The proxy trait depends on the installed VarExporter version.
+        $this->assertStringEqualsGeneratedFile('lazy_autowire_attribute_with_intersection.php', str_replace('LazyInterfaceProxyTrait;', 'LazyDecoratorTrait;', $dumper->dump()));
     }
 
     public function testLazyProxyArgument()
@@ -2447,6 +2563,54 @@ class PhpDumperTest extends TestCase
         $this->expectExceptionMessage('Cannot dump an unresolved lazy proxy argument for service "foo"; run the "ResolveLazyProxyPass" compiler pass first.');
 
         $dumper->dump();
+    }
+
+    public function testLazyAutowireAttributeWithMissingNullableService()
+    {
+        $container = new ContainerBuilder();
+        $container->register('bar', NullableLazyServiceConsumer::class)
+            ->setPublic(true)
+            ->setAutowired(true);
+        $container->compile();
+
+        $this->assertNull($container->get('bar')->foo);
+        $this->assertNull($container->get('bar')->bar);
+        $this->assertNull($container->get('bar')->baz);
+
+        $dumper = new PhpDumper($container);
+        eval('?>'.$dumper->dump(['class' => 'Symfony_DI_PhpDumper_Test_Lazy_Autowire_Attribute_With_Missing_Nullable_Service']));
+
+        $container = new \Symfony_DI_PhpDumper_Test_Lazy_Autowire_Attribute_With_Missing_Nullable_Service();
+
+        $this->assertNull($container->get('bar')->foo);
+        $this->assertNull($container->get('bar')->bar);
+        $this->assertNull($container->get('bar')->baz);
+    }
+
+    public function testLazyAutowireAttributeWithNullableIntersection()
+    {
+        $container = new ContainerBuilder();
+        $container->register('foo', AAndIInterfaceImplementation::class)
+            ->setPublic(true);
+        $container->setAlias(AInterface::class, 'foo');
+        $container->setAlias(IInterface::class, 'foo');
+        $container->register('bar', NullableIntersectionLazyConsumer::class)
+            ->setPublic(true)
+            ->setAutowired(true);
+        $container->compile();
+
+        $this->assertInstanceOf(AInterface::class, $container->get('bar')->foo);
+        $this->assertInstanceOf(IInterface::class, $container->get('bar')->foo);
+        $this->assertNotSame($container->get('foo'), $container->get('bar')->foo);
+
+        $dumper = new PhpDumper($container);
+        eval('?>'.$dumper->dump(['class' => 'Symfony_DI_PhpDumper_Test_Lazy_Autowire_Attribute_With_Nullable_Intersection']));
+
+        $container = new \Symfony_DI_PhpDumper_Test_Lazy_Autowire_Attribute_With_Nullable_Intersection();
+
+        $this->assertInstanceOf(AInterface::class, $container->get('bar')->foo);
+        $this->assertInstanceOf(IInterface::class, $container->get('bar')->foo);
+        $this->assertNotSame($container->get('foo'), $container->get('bar')->foo);
     }
 
     public function testCallableAdapterConsumer()
@@ -3012,6 +3176,19 @@ class LazyProxyInterfaceArgumentConsumer
 {
     public function __construct(
         public LazyProxyTestInterface $foo,
+    ) {
+    }
+}
+
+class NullableLazyServiceConsumer
+{
+    public function __construct(
+        #[Autowire(lazy: true)]
+        public ?Foo $foo,
+        #[Autowire(service: 'missing', lazy: true)]
+        public ?Foo $bar,
+        #[Autowire(lazy: true)]
+        public ?Foo $baz = null,
     ) {
     }
 }

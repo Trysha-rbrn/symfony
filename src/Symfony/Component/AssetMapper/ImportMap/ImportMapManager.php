@@ -16,6 +16,8 @@ use Symfony\Component\AssetMapper\ImportMap\Resolver\PackageResolverInterface;
 use Symfony\Component\AssetMapper\MappedAsset;
 
 /**
+ * Adds, updates and removes the JavaScript packages of the importmap.
+ *
  * @author Kévin Dunglas <kevin@dunglas.dev>
  * @author Ryan Weaver <ryan@symfonycasts.com>
  *
@@ -92,15 +94,22 @@ class ImportMapManager
     private function updateImportMapConfig(bool $update, array $packagesToRequire, array $packagesToRemove, array $packagesToUpdate): array
     {
         $currentEntries = $this->importMapConfigReader->getEntries();
+        $entriesToRemove = [];
 
         foreach ($packagesToRemove as $packageName) {
-            if (!$currentEntries->has($packageName)) {
+            if (!$currentEntries->has($packageName) || isset($entriesToRemove[$packageName])) {
                 throw new \InvalidArgumentException(\sprintf('Package "%s" listed for removal was not found in "importmap.php".', $packageName));
             }
 
-            $this->cleanupPackageFiles($currentEntries->get($packageName));
-            $currentEntries->remove($packageName);
+            $entriesToRemove[$packageName] = $currentEntries->get($packageName);
         }
+
+        foreach ($entriesToRemove as $entry) {
+            $this->cleanupPackageFiles($entry);
+            $currentEntries->remove($entry->importName);
+        }
+
+        $removedEntries = [];
 
         if ($update) {
             // Only consult the update checker when a minimum release age is configured;
@@ -133,12 +142,17 @@ class ImportMapManager
                 );
 
                 // remove it: then it will be re-added
-                $this->cleanupPackageFiles($entry);
+                $removedEntries[] = $entry;
                 $currentEntries->remove($importName);
             }
         }
 
         $newEntries = $this->requirePackages($packagesToRequire, $currentEntries);
+
+        foreach ($removedEntries as $entry) {
+            $this->cleanupPackageFiles($entry);
+        }
+
         $this->importMapConfigReader->writeEntries($currentEntries);
         $this->packageDownloader->downloadPackages();
 
@@ -212,6 +226,10 @@ class ImportMapManager
 
     private function cleanupPackageFiles(ImportMapEntry $entry): void
     {
+        if (!$entry->isRemotePackage()) {
+            return;
+        }
+
         $asset = $this->findAsset($entry->path);
 
         if ($asset && is_file($asset->sourcePath)) {

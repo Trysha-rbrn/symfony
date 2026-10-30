@@ -18,6 +18,7 @@ use Symfony\Component\Serializer\Attribute\SerializedName;
 use Symfony\Component\Serializer\Attribute\SerializedPath;
 use Symfony\Component\Serializer\Exception\LogicException;
 use Symfony\Component\Serializer\Mapping\Factory\ClassMetadataFactory;
+use Symfony\Component\Serializer\Mapping\Factory\ClassMetadataFactoryInterface;
 use Symfony\Component\Serializer\Mapping\Loader\AttributeLoader;
 use Symfony\Component\Serializer\Mapping\Loader\YamlFileLoader;
 use Symfony\Component\Serializer\NameConverter\MetadataAwareNameConverter;
@@ -242,6 +243,14 @@ final class MetadataAwareNameConverterTest extends TestCase
             ['classGroup', 'renamedClassGroup', ['groups' => ['custom'], 'enable_default_groups' => true]],
             ['noGroup', 'renamedNoGroup', ['groups' => ['custom'], 'enable_default_groups' => true]],
             ['customGroup', 'renamedCustomGroup', ['groups' => ['custom'], 'enable_default_groups' => true]],
+            ['noGroupRenamedInClassGroup', 'NOGROUPRENAMEDINCLASSGROUP', ['groups' => ['custom'], 'enable_default_groups' => true]],
+
+            ['defaultGroup', 'renamedDefaultGroup', ['groups' => ['Default', 'custom'], 'enable_default_groups' => true]],
+            ['classGroup', 'renamedClassGroup', ['groups' => ['Default', 'custom'], 'enable_default_groups' => true]],
+            ['noGroup', 'renamedNoGroup', ['groups' => ['Default', 'custom'], 'enable_default_groups' => true]],
+            ['customGroup', 'renamedCustomGroup', ['groups' => ['Default', 'custom'], 'enable_default_groups' => true]],
+            ['noGroupRenamedInClassGroup', 'renamedInClassGroup', ['groups' => ['Default', 'custom'], 'enable_default_groups' => true]],
+            ['noGroupRenamedInClassGroup', 'renamedInClassGroup', ['groups' => ['Default'], 'enable_default_groups' => true]],
         ];
     }
 
@@ -267,6 +276,7 @@ final class MetadataAwareNameConverterTest extends TestCase
             ['classGroup', 'renamedClassGroup', ['groups' => [], 'enable_default_groups' => true]],
             ['noGroup', 'renamedNoGroup', ['groups' => [], 'enable_default_groups' => true]],
             ['customgroup', 'customGroup', ['groups' => [], 'enable_default_groups' => true]],
+            ['customGroup', 'renamedCustomGroup', ['groups' => [], 'enable_default_groups' => true]],
 
             ['defaultGroup', 'renamedDefaultGroup', ['groups' => ['*'], 'enable_default_groups' => true]],
             ['classGroup', 'renamedClassGroup', ['groups' => ['*'], 'enable_default_groups' => true]],
@@ -287,6 +297,19 @@ final class MetadataAwareNameConverterTest extends TestCase
             ['classgroup', 'classGroup', ['groups' => ['custom'], 'enable_default_groups' => true]],
             ['nogroup', 'noGroup', ['groups' => ['custom'], 'enable_default_groups' => true]],
             ['customGroup', 'renamedCustomGroup', ['groups' => ['custom'], 'enable_default_groups' => true]],
+            ['renamedinclassgroup', 'renamedInClassGroup', ['groups' => ['custom'], 'enable_default_groups' => true]],
+
+            ['defaultGroup', 'renamedDefaultGroup', ['groups' => ['Default', 'custom'], 'enable_default_groups' => true]],
+            ['classGroup', 'renamedClassGroup', ['groups' => ['Default', 'custom'], 'enable_default_groups' => true]],
+            ['noGroup', 'renamedNoGroup', ['groups' => ['Default', 'custom'], 'enable_default_groups' => true]],
+            ['customGroup', 'renamedCustomGroup', ['groups' => ['Default', 'custom'], 'enable_default_groups' => true]],
+            ['noGroupRenamedInClassGroup', 'renamedInClassGroup', ['groups' => ['Default', 'custom'], 'enable_default_groups' => true]],
+            ['noGroupRenamedInClassGroup', 'renamedInClassGroup', ['groups' => ['Default'], 'enable_default_groups' => true]],
+
+            ['defaultGroup', 'renamedDefaultGroup', ['groups' => ['OtherSerializedNameDummy', 'custom'], 'enable_default_groups' => true]],
+            ['classGroup', 'renamedClassGroup', ['groups' => ['OtherSerializedNameDummy', 'custom'], 'enable_default_groups' => true]],
+            ['noGroup', 'renamedNoGroup', ['groups' => ['OtherSerializedNameDummy', 'custom'], 'enable_default_groups' => true]],
+            ['customGroup', 'renamedCustomGroup', ['groups' => ['OtherSerializedNameDummy', 'custom'], 'enable_default_groups' => true]],
         ];
     }
 
@@ -411,6 +434,57 @@ final class MetadataAwareNameConverterTest extends TestCase
 
         $this->assertSame('foo', $attributes->normalize('foo', ScalarDummy::class));
         $this->assertSame('yaml_foo', $attributes->denormalize('yaml_foo', ScalarDummy::class));
+    }
+
+    public function testConvertersCreatedWithTheSameSharedCacheKeyShareTheNamesTheyResolve()
+    {
+        $nameConverter = new MetadataAwareNameConverter($this->createYamlMetadataFactory(), null, __METHOD__);
+        $nameConverter->normalize('foo', ScalarDummy::class);
+        $nameConverter->denormalize('yaml_foo', ScalarDummy::class);
+
+        $metadataFactory = $this->createMock(ClassMetadataFactoryInterface::class);
+        $metadataFactory->expects($this->never())->method('hasMetadataFor');
+        $nameConverter = new MetadataAwareNameConverter($metadataFactory, null, __METHOD__);
+
+        $this->assertSame('yaml_foo', $nameConverter->normalize('foo', ScalarDummy::class));
+        $this->assertSame('foo', $nameConverter->denormalize('yaml_foo', ScalarDummy::class));
+    }
+
+    public function testConvertersCreatedWithDifferentSharedCacheKeysDoNotShare()
+    {
+        (new MetadataAwareNameConverter($this->createYamlMetadataFactory(), null, __METHOD__.'1'))->normalize('foo', ScalarDummy::class);
+
+        $nameConverter = new MetadataAwareNameConverter(new ClassMetadataFactory(new AttributeLoader()), null, __METHOD__.'2');
+
+        $this->assertSame('foo', $nameConverter->normalize('foo', ScalarDummy::class));
+        $this->assertSame('yaml_foo', $nameConverter->denormalize('yaml_foo', ScalarDummy::class));
+    }
+
+    public function testConvertersCreatedWithoutSharedCacheKeyDoNotShare()
+    {
+        (new MetadataAwareNameConverter($this->createYamlMetadataFactory()))->normalize('foo', ScalarDummy::class);
+
+        $nameConverter = new MetadataAwareNameConverter(new ClassMetadataFactory(new AttributeLoader()));
+
+        $this->assertSame('foo', $nameConverter->normalize('foo', ScalarDummy::class));
+        $this->assertSame('yaml_foo', $nameConverter->denormalize('yaml_foo', ScalarDummy::class));
+    }
+
+    public function testCloningAConverterCreatedWithASharedCacheKey()
+    {
+        $nameConverter = new MetadataAwareNameConverter($this->createYamlMetadataFactory(), null, __METHOD__);
+        $nameConverter->normalize('foo', ScalarDummy::class);
+        $clone = clone $nameConverter;
+
+        $this->assertSame('yaml_foo', $clone->normalize('foo', ScalarDummy::class));
+        $this->assertSame('foo', $clone->denormalize('yaml_foo', ScalarDummy::class));
+        $this->assertSame('yaml_foo', $nameConverter->normalize('foo', ScalarDummy::class));
+        $this->assertSame('foo', $nameConverter->denormalize('yaml_foo', ScalarDummy::class));
+    }
+
+    private function createYamlMetadataFactory(): ClassMetadataFactory
+    {
+        return new ClassMetadataFactory(new YamlFileLoader(__DIR__.'/../Fixtures/serialized-name-mapping.yml'));
     }
 }
 

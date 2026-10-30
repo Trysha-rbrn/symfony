@@ -104,15 +104,40 @@ class LocalesTest extends ResourceBundleTestCase
 
     public function testGetNameWithAliasLocale()
     {
-        $this->assertSame(Locales::getName('tl_PH'), Locales::getName('fil_PH'));
+        $this->assertSame('Tagalog (Philippines)', Locales::getName('tl_PH'));
+        $this->assertSame('Filipino (Philippines)', Locales::getName('fil_PH'));
+    }
+
+    public function testGetNameWithScriptAndRegion()
+    {
+        $this->assertSame('serbe (latin, Serbie)', Locales::getName('sr_Latn_RS', 'fr'));
+        $this->assertSame('中文（简体，中国）', Locales::getName('zh_Hans_CN', 'zh'));
+    }
+
+    public function testGetNameWithRegionThatIsNotACountry()
+    {
+        $this->assertSame('espagnol (Amérique latine)', Locales::getName('es_419', 'fr'));
+        $this->assertSame('anglais (Europe)', Locales::getName('en_150', 'fr'));
+    }
+
+    public function testGetNameInDefaultLocaleWhenNotFullyTranslated()
+    {
+        $this->assertSame('Buriat (Russia)', Locales::getName('bua_RU', 'af'));
+    }
+
+    public function testGetNameUsesTheNamesOfParentLocales()
+    {
+        $this->assertSame('bosnio (Bosnia y Herzegovina)', Locales::getName('bs_BA', 'es_MX'));
     }
 
     public function testExists()
     {
         $this->assertTrue(Locales::exists('nl_NL'));
         $this->assertTrue(Locales::exists('tl_PH'));
-        $this->assertTrue(Locales::exists('fil_PH')); // alias for "tl_PH"
+        $this->assertTrue(Locales::exists('fil_PH'));
         $this->assertTrue(Locales::exists('es_419'));
+        $this->assertTrue(Locales::exists('ckb'));
+        $this->assertTrue(Locales::exists('yue_Hant_HK'));
         $this->assertFalse(Locales::exists('zxx_ZZ'));
     }
 }

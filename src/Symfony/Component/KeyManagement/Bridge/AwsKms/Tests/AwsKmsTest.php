@@ -34,7 +34,6 @@ use Symfony\Component\KeyManagement\Exception\DecryptionFailedException;
 use Symfony\Component\KeyManagement\Exception\InvalidArgumentException;
 use Symfony\Component\KeyManagement\Exception\KeyNotFoundException;
 use Symfony\Component\KeyManagement\Exception\RuntimeException;
-use Symfony\Component\KeyManagement\Exception\UnsupportedOperationException;
 
 class AwsKmsTest extends TestCase
 {
@@ -264,12 +263,27 @@ class AwsKmsTest extends TestCase
         (new AwsKms($client))->generateDataKey('alias/missing');
     }
 
-    public function testDeterministicModeIsRejected()
+    public function testWrapDataKeyRoutesThroughEncrypt()
     {
+        $captured = null;
         $client = $this->createStub(KmsClient::class);
+        $client->method('encrypt')
+            ->willReturnCallback(static function (EncryptRequest $request) use (&$captured): EncryptResponse {
+                $captured = $request;
 
-        $this->expectException(UnsupportedOperationException::class);
-        (new AwsKms($client))->encrypt('alias/app-key', 'hello', deterministic: true);
+                return ResultMockFactory::create(EncryptResponse::class, [
+                    'CiphertextBlob' => 'wrapped-dek',
+                    'KeyId' => 'arn:aws:kms:eu-west-1:111:key/abc',
+                ]);
+            });
+
+        $wrapped = (new AwsKms($client))->wrapDataKey('alias/app-key', str_repeat("\xAA", 32), 'opaque-aad');
+
+        $this->assertSame('alias/app-key', $captured->getKeyId());
+        $this->assertSame(str_repeat("\xAA", 32), $captured->getPlaintext());
+        $this->assertSame(['aad' => base64_encode('opaque-aad')], $captured->getEncryptionContext());
+        $this->assertSame('arn:aws:kms:eu-west-1:111:key/abc', $wrapped->keyId);
+        $this->assertSame('wrapped-dek', $wrapped->blob);
     }
 
     public function testUnwrapDataKeyRoutesThroughDecrypt()

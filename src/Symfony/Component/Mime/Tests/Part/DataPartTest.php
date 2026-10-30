@@ -131,6 +131,25 @@ class DataPartTest extends TestCase
         ), $p->getPreparedHeaders());
     }
 
+    public function testFromPathWithEncoding()
+    {
+        $p = DataPart::fromPath($file = __DIR__.'/../Fixtures/mimetypes/test.gif', null, null, '8bit');
+        $content = file_get_contents($file);
+        $this->assertSame($content, $p->bodyToString());
+        $this->assertEquals(new Headers(
+            new ParameterizedHeader('Content-Type', 'image/gif', ['name' => 'test.gif']),
+            new UnstructuredHeader('Content-Transfer-Encoding', '8bit'),
+            new ParameterizedHeader('Content-Disposition', 'attachment', ['name' => 'test.gif', 'filename' => 'test.gif'])
+        ), $p->getPreparedHeaders());
+    }
+
+    public function testFromPathWithInvalidEncoding()
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('("foo" given)');
+        DataPart::fromPath(__DIR__.'/../Fixtures/mimetypes/test.gif', null, null, 'foo');
+    }
+
     public function testFromPathWithNotAFile()
     {
         $this->expectException(InvalidArgumentException::class);
@@ -249,6 +268,25 @@ class DataPartTest extends TestCase
         $this->assertSame($cid, $unserialized->getContentId());
     }
 
+    public function testUnserializeNativePayloadWithContentId()
+    {
+        $data = [
+            "\0*\0_headers" => new Headers(),
+            "\0*\0_parent" => ['body' => 'content', 'charset' => null, 'subtype' => 'pdf', 'disposition' => 'attachment', 'name' => 'file.pdf', 'encoding' => 'base64'],
+            "\0".DataPart::class."\0filename" => 'file.pdf',
+            "\0".DataPart::class."\0mediaType" => 'application',
+            "\0".DataPart::class."\0cid" => 'foo@example.com',
+        ];
+        $payload = \sprintf('O:%d:"%s":%d:{', \strlen(DataPart::class), DataPart::class, \count($data));
+        foreach ($data as $key => $value) {
+            $payload .= serialize($key).serialize($value);
+        }
+
+        $part = unserialize($payload.'}');
+
+        $this->assertSame((new DataPart('content', 'file.pdf', 'application/pdf'))->setContentId('foo@example.com')->toString(), $part->toString());
+    }
+
     #[DataProvider('provideTrampolineKeys')]
     public function testUnserializeRejectsObjectInTypedStringProperty(string $key)
     {
@@ -275,6 +313,31 @@ class DataPartTest extends TestCase
         yield ['filename'];
         yield ['mediaType'];
         yield ['cid'];
+    }
+
+    #[DataProvider('provideNonStringValues')]
+    public function testUnserializeRejectsNonStringValue(string $key, mixed $value)
+    {
+        $template = (new DataPart('content'))->__serialize();
+        $template[$key] = $value;
+        $payload = \sprintf('O:%d:"%s":%d:{', \strlen(DataPart::class), DataPart::class, \count($template));
+        foreach ($template as $k => $v) {
+            $payload .= serialize($k).serialize($v);
+        }
+
+        $this->expectException(\BadMethodCallException::class);
+
+        unserialize($payload.'}');
+    }
+
+    public static function provideNonStringValues(): iterable
+    {
+        foreach (['filename', 'mediaType', 'cid'] as $key) {
+            yield $key.' int' => [$key, 123];
+            yield $key.' object' => [$key, new \stdClass()];
+        }
+
+        yield 'mediaType null' => ['mediaType', null];
     }
 }
 

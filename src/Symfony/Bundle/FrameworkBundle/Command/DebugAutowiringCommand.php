@@ -20,6 +20,7 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Style\SymfonyStyle;
+use Symfony\Component\DependencyInjection\Exception\ServiceNotFoundException;
 use Symfony\Component\ErrorHandler\ErrorRenderer\FileLinkFormatter;
 
 /**
@@ -44,17 +45,17 @@ class DebugAutowiringCommand extends ContainerDebugCommand
         $this
             ->setDefinition([
                 new InputArgument('search', InputArgument::OPTIONAL, 'A search filter'),
-                new InputOption('all', null, InputOption::VALUE_NONE, 'Show also services that are not aliased'),
+                new InputOption('all', null, InputOption::VALUE_NONE, 'Show also services that are not aliased, and deprecated aliases'),
             ])
             ->setHelp(<<<'EOF'
                 The <info>%command.name%</info> command displays the classes and interfaces that
                 you can use as type-hints for autowiring:
 
-                  <info>php %command.full_name%</info>
+                  <info>%command.invocation%</info>
 
                 You can also pass a search term to filter the list:
 
-                  <info>php %command.full_name% log</info>
+                  <info>%command.invocation% log</info>
 
                 EOF
             )
@@ -102,8 +103,20 @@ class DebugAutowiringCommand extends ContainerDebugCommand
         $all = $input->getOption('all');
         $previousId = '-';
         $serviceIdsNb = 0;
+        $deprecatedAliasesNb = 0;
         foreach ($serviceIds as $serviceId) {
             if ($container->hasDefinition($serviceId) && $container->getDefinition($serviceId)->hasTag('container.excluded')) {
+                continue;
+            }
+            try {
+                if ($container->findDefinition($serviceId)->isAbstract()) {
+                    continue;
+                }
+            } catch (ServiceNotFoundException) {
+                // the alias targets a service that was removed, it is listed as is
+            }
+            if (!$all && $container->hasAlias($serviceId) && $container->getAlias($serviceId)->isDeprecated()) {
+                ++$deprecatedAliasesNb;
                 continue;
             }
             $text = [];
@@ -212,8 +225,15 @@ class DebugAutowiringCommand extends ContainerDebugCommand
 
         $io->newLine();
 
+        $hidden = [];
         if (0 < $serviceIdsNb) {
-            $io->text(\sprintf('%s more concrete service%s would be displayed when adding the "--all" option.', $serviceIdsNb, $serviceIdsNb > 1 ? 's' : ''));
+            $hidden[] = \sprintf('%s more concrete service%s', $serviceIdsNb, $serviceIdsNb > 1 ? 's' : '');
+        }
+        if (0 < $deprecatedAliasesNb) {
+            $hidden[] = \sprintf('%s deprecated alias%s', $deprecatedAliasesNb, $deprecatedAliasesNb > 1 ? 'es' : '');
+        }
+        if ($hidden) {
+            $io->text(\sprintf('%s would be displayed when adding the "--all" option.', implode(' and ', $hidden)));
         }
         if ($all) {
             $io->text('Pro-tip: use interfaces in your type-hints instead of classes to benefit from the dependency inversion principle.');

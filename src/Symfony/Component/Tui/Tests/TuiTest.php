@@ -58,6 +58,33 @@ class TuiTest extends TestCase
         $this->assertStringContainsString('Hello World', $output);
     }
 
+    public function testGetWidgetRectReturnsWhereAWidgetWasDrawn()
+    {
+        $terminal = new VirtualTerminal(40, 10);
+        $tui = new Tui(terminal: $terminal);
+        $tui->add($first = new TextWidget("First\nSecond"));
+        $tui->add($third = new TextWidget('Third'));
+
+        $tui->start();
+        $tui->processRender();
+
+        $this->assertSame(0, $tui->getWidgetRect($first)?->row);
+        $this->assertSame(2, $tui->getWidgetRect($first)?->rows);
+        $this->assertSame(2, $tui->getWidgetRect($third)?->row, 'A widget starts where the one above it ends.');
+    }
+
+    public function testGetWidgetRectReturnsNullForAWidgetThatWasNotDrawn()
+    {
+        $terminal = new VirtualTerminal(40, 10);
+        $tui = new Tui(terminal: $terminal);
+        $tui->add(new TextWidget('Drawn'));
+
+        $tui->start();
+        $tui->processRender();
+
+        $this->assertNull($tui->getWidgetRect(new TextWidget('Never added')));
+    }
+
     public function testMultipleComponents()
     {
         $terminal = new VirtualTerminal(40, 10);
@@ -708,5 +735,50 @@ class TuiTest extends TestCase
         } finally {
             $tui->stop();
         }
+    }
+
+    #[DataProvider('termuxResizeProvider')]
+    public function testResizeRepaintsTheWholeScreenUnlessOnlyTheHeightChangedInTermux(?string $termuxVersion, ?string $multiplexer, int $columns, int $rows, bool $repaints)
+    {
+        $previous = [];
+        foreach (['TERMUX_VERSION', 'TMUX', 'STY', 'ZELLIJ'] as $name) {
+            $previous[$name] = getenv($name);
+            putenv($name);
+        }
+        if (null !== $termuxVersion) {
+            putenv('TERMUX_VERSION='.$termuxVersion);
+        }
+        if (null !== $multiplexer) {
+            putenv($multiplexer);
+        }
+
+        try {
+            $terminal = new VirtualTerminal(40, 20);
+            $tui = new Tui(null, $terminal);
+            $tui->add(new TextWidget(implode("\n", range(1, 30))));
+            $tui->start();
+            $tui->processRender();
+            $terminal->clearOutput();
+
+            $terminal->simulateResize($columns, $rows);
+            $tui->processRender();
+
+            $this->assertSame($repaints, str_contains($terminal->getOutput(), "\x1b[2J"));
+        } finally {
+            foreach ($previous as $name => $value) {
+                putenv(false === $value ? $name : $name.'='.$value);
+            }
+        }
+    }
+
+    public static function termuxResizeProvider(): iterable
+    {
+        yield 'height change in Termux' => ['0.118', null, 40, 12, false];
+        yield 'width change in Termux' => ['0.118', null, 30, 20, true];
+        yield 'same size in Termux' => ['0.118', null, 40, 20, true];
+        yield 'height change in tmux in Termux' => ['0.118', 'TMUX=/tmp/tmux-10123/default,1234,0', 40, 12, true];
+        yield 'height change in GNU screen in Termux' => ['0.118', 'STY=1234.pts-0.localhost', 40, 12, true];
+        yield 'height change in zellij in Termux' => ['0.118', 'ZELLIJ=0', 40, 12, true];
+        yield 'height change elsewhere' => [null, null, 40, 12, true];
     }
 }

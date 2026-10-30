@@ -11,17 +11,28 @@
 
 namespace Symfony\Component\Serializer\Tests;
 
+use Doctrine\Common\Collections\ArrayCollection;
+use PHPUnit\Framework\Attributes\RunInSeparateProcess;
 use PHPUnit\Framework\TestCase;
+use Symfony\Bridge\Doctrine\Serializer\Normalizer\CollectionDenormalizer;
+use Symfony\Bridge\PhpUnit\ClassExistsMock;
 use Symfony\Component\Config\Definition\Exception\InvalidConfigurationException;
 use Symfony\Component\Config\Resource\FileResource;
+use Symfony\Component\DependencyInjection\Compiler\DecoratorServicePass;
 use Symfony\Component\DependencyInjection\Compiler\MergeExtensionConfigurationPass;
 use Symfony\Component\DependencyInjection\Compiler\RemoveMissingDependenciesPass as ContainerRemoveMissingDependenciesPass;
 use Symfony\Component\DependencyInjection\Compiler\ResolveBindingsPass;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Definition;
+use Symfony\Component\DependencyInjection\Kernel\AbstractKernel;
+use Symfony\Component\DependencyInjection\Kernel\KernelTrait;
+use Symfony\Component\DependencyInjection\Loader\Configurator\ContainerConfigurator;
+use Symfony\Component\DependencyInjection\Parameter;
 use Symfony\Component\DependencyInjection\ParameterBag\EnvPlaceholderParameterBag;
 use Symfony\Component\DependencyInjection\Reference;
+use Symfony\Component\Filesystem\Filesystem;
 use Symfony\Component\Serializer\DependencyInjection\RemoveMissingDependenciesPass;
+use Symfony\Component\Serializer\Mapping\Factory\SharedClassMetadataFactory;
 use Symfony\Component\Serializer\DependencyInjection\SerializerPass;
 use Symfony\Component\Serializer\Encoder\JsonDecode;
 use Symfony\Component\Serializer\Mapping\Loader\YamlFileLoader;
@@ -152,6 +163,23 @@ class SerializerBundleTest extends TestCase
         $this->assertEquals(new Reference('cache.serializer'), $cache);
     }
 
+    public function testTheMetadataIsSharedByTheContainersOfTheSameBuildOutsideDebugMode()
+    {
+        $container = $this->load(['enabled' => true]);
+        new DecoratorServicePass()->process($container);
+        $definition = $container->findDefinition('serializer.mapping.class_metadata_factory');
+
+        $this->assertSame(SharedClassMetadataFactory::class, $definition->getClass());
+        $this->assertEquals(new Parameter('container.build_id'), $definition->getArgument(1));
+        $this->assertFalse($this->load(['enabled' => true], debug: true)->hasDefinition('serializer.mapping.shared_class_metadata_factory'));
+    }
+
+    public function testTheSerializerSharesWhichNormalizersSupportWhichTypesOutsideDebugMode()
+    {
+        $this->assertEquals(new Parameter('container.build_id'), $this->load(['enabled' => true])->getDefinition('serializer')->getArgument('$sharedCacheKey'));
+        $this->assertArrayNotHasKey('$sharedCacheKey', $this->load(['enabled' => true], debug: true)->getDefinition('serializer')->getArguments());
+    }
+
     public function testSerializerMappingFilesAreTrackedWhenCacheIsUsed()
     {
         $container = $this->load(['enable_attributes' => false, 'mapping' => ['paths' => [__DIR__.'/Fixtures/serialization.yml']]], debug: true);
@@ -207,6 +235,26 @@ class SerializerBundleTest extends TestCase
         $container = $this->load(['enabled' => true]);
 
         $this->assertTrue($container->hasDefinition('serializer'));
+        $this->assertSame([['method' => 'shutdown', 'on_invalid' => 'ignore', 'on_shutdown' => 'only']], $container->getDefinition('serializer')->getTag('kernel.reset'));
+    }
+
+    public function testTheSerializersAreFreedWhenTheKernelShutsDown()
+    {
+        $kernel = new TestShutdownSerializerKernel(sys_get_temp_dir().'/sf_serializer_bundle_shutdown');
+
+        try {
+            $kernel->boot();
+            $container = $kernel->getContainer();
+            $serializers = [\WeakReference::create($container->get('test.serializer')), \WeakReference::create($container->get('test.serializer.api'))];
+
+            $kernel->shutdown();
+
+            foreach ($serializers as $serializer) {
+                $this->assertNull($serializer->get());
+            }
+        } finally {
+            new Filesystem()->remove($kernel->getProjectDir());
+        }
     }
 
     public function testSerializerServiceIsNotRegisteredWhenDisabled()
@@ -330,6 +378,22 @@ class SerializerBundleTest extends TestCase
         $this->assertSame(-915, $tag[0]['priority']);
     }
 
+    public function testCollectionDenormalizerFollowsTheDoctrineBridge()
+    {
+        $container = $this->load(['enabled' => true]);
+
+        $this->assertSame(class_exists(CollectionDenormalizer::class), $container->hasDefinition('serializer.denormalizer.doctrine_collection'));
+    }
+
+    #[RunInSeparateProcess]
+    public function testCollectionDenormalizerNeedsDoctrineCollections()
+    {
+        ClassExistsMock::register(ContainerRemoveMissingDependenciesPass::class);
+        ClassExistsMock::withMockedClasses([ArrayCollection::class => false]);
+
+        $this->assertFalse($this->load(['enabled' => true])->hasDefinition('serializer.denormalizer.doctrine_collection'));
+    }
+
     public function testCachePoolIsRegisteredAlongsideTheSerializer()
     {
         $this->assertTrue($this->load(['enabled' => true])->has('cache.serializer'));
@@ -365,6 +429,12 @@ class SerializerBundleTest extends TestCase
         $container = $this->load(['default_context' => ['foo' => 'bar']]);
 
         $this->assertSame(['foo' => 'bar'], $container->getParameter('serializer.default_context'));
+    }
+
+    public function testTheMetadataAwareNameConverterSharesTheNamesItResolvesOutsideDebugMode()
+    {
+        $this->assertEquals(new Parameter('container.build_id'), $this->load(['enabled' => true])->getDefinition('serializer.name_converter.metadata_aware')->getArgument('$sharedCacheKey'));
+        $this->assertArrayNotHasKey('$sharedCacheKey', $this->load(['enabled' => true], debug: true)->getDefinition('serializer.name_converter.metadata_aware')->getArguments());
     }
 
     public function testNamedSerializersReservedName()
@@ -420,5 +490,37 @@ class SerializerBundleTest extends TestCase
         new RemoveMissingDependenciesPass()->process($container);
 
         return $container;
+    }
+}
+
+class TestShutdownSerializerKernel extends AbstractKernel
+{
+    use KernelTrait;
+
+    public function __construct(private string $dir)
+    {
+        parent::__construct('test', false);
+    }
+
+    public function getProjectDir(): string
+    {
+        return $this->dir;
+    }
+
+    public function registerBundles(): iterable
+    {
+        yield new SerializerBundle();
+    }
+
+    private function configureContainer(ContainerConfigurator $container): void
+    {
+        $container->extension('serializer', [
+            'named_serializers' => ['api' => ['include_built_in_normalizers' => true, 'include_built_in_encoders' => true]],
+        ]);
+
+        $container->services()
+            ->alias('test.serializer', 'serializer')->public()
+            ->alias('test.serializer.api', 'serializer.api')->public()
+        ;
     }
 }

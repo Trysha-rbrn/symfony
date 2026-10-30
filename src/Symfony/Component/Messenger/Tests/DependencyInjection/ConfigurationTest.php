@@ -26,6 +26,7 @@ class ConfigurationTest extends TestCase
             'routing' => [],
             'serializer' => [
                 'default_serializer' => 'messenger.transport.native_php_serializer',
+                'signing_secret' => [],
                 'symfony_serializer' => [
                     'service' => null,
                     'format' => 'json',
@@ -36,8 +37,10 @@ class ConfigurationTest extends TestCase
             'failure_transport' => null,
             'stop_worker_on_signals' => [],
             'reject_redelivered_messages' => true,
+            'deduplication' => ['lock_factory' => null],
+            'identity_stamps' => false,
             'default_bus' => null,
-            'buses' => ['messenger.bus.default' => ['default_middleware' => ['enabled' => true, 'allow_no_handlers' => false, 'allow_no_senders' => true], 'middleware' => []]],
+            'buses' => ['messenger.bus.default' => ['default_middleware' => ['enabled' => true, 'allow_no_handlers' => false, 'allow_no_senders' => true], 'middleware' => [], 'messages' => [], 'unwrap_exceptions' => false]],
         ], $this->process([]));
     }
 
@@ -87,6 +90,22 @@ class ConfigurationTest extends TestCase
             'cache_pool' => 'app.claim_check_pool',
             'max_size' => 200000,
         ], $config['transports']['async']['claim_check']);
+    }
+
+    public function testSignConfiguration()
+    {
+        $config = $this->process([
+            'transports' => [
+                'async' => [
+                    'dsn' => 'in-memory:///',
+                    'sign' => true,
+                ],
+                'sync' => 'sync://',
+            ],
+        ]);
+
+        $this->assertTrue($config['transports']['async']['sign']);
+        $this->assertFalse($config['transports']['sync']['sign']);
     }
 
     public function testOutboxConfiguration()
@@ -139,22 +158,45 @@ class ConfigurationTest extends TestCase
                     'middleware' => [
                         ['id' => 'existing_bus.middleware', 'arguments' => []],
                     ],
+                    'messages' => [],
+                    'unwrap_exceptions' => false,
                 ],
                 'common_bus' => [
                     'default_middleware' => ['enabled' => false, 'allow_no_handlers' => false, 'allow_no_senders' => true],
                     'middleware' => [
                         ['id' => 'common_bus.new_middleware', 'arguments' => []],
                     ],
+                    'messages' => [],
+                    'unwrap_exceptions' => false,
                 ],
                 'new_bus' => [
                     'default_middleware' => ['enabled' => true, 'allow_no_handlers' => false, 'allow_no_senders' => true],
                     'middleware' => [
                         ['id' => 'new_bus.middleware', 'arguments' => []],
                     ],
+                    'messages' => [],
+                    'unwrap_exceptions' => false,
                 ],
             ],
             $config['buses']
         );
+    }
+
+    public function testSigningSecretAcceptsASingleSecret()
+    {
+        $config = $this->process(['serializer' => ['signing_secret' => 's3cr3t']]);
+
+        $this->assertSame(['s3cr3t'], $config['serializer']['signing_secret']);
+    }
+
+    public function testSigningSecretIsOverriddenAcrossFiles()
+    {
+        $config = new Processor()->processConfiguration($this->configuration(), [
+            ['serializer' => ['signing_secret' => 'old']],
+            ['serializer' => ['signing_secret' => ['new', 'old']]],
+        ]);
+
+        $this->assertSame(['new', 'old'], $config['serializer']['signing_secret']);
     }
 
     private function process(mixed $config): array

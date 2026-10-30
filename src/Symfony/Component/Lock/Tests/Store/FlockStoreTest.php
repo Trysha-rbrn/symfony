@@ -12,6 +12,7 @@
 namespace Symfony\Component\Lock\Tests\Store;
 
 use Symfony\Component\Lock\Exception\InvalidArgumentException;
+use Symfony\Component\Lock\Exception\LockConflictedException;
 use Symfony\Component\Lock\Key;
 use Symfony\Component\Lock\PersistingStoreInterface;
 use Symfony\Component\Lock\Store\FlockStore;
@@ -34,7 +35,7 @@ class FlockStoreTest extends AbstractStoreTestCase
     public function testConstructWhenRepositoryCannotBeCreated()
     {
         $this->expectException(InvalidArgumentException::class);
-        $this->expectExceptionMessage('The FlockStore directory "/a/b/c/d/e" does not exists and cannot be created.');
+        $this->expectExceptionMessage('The FlockStore directory "/a/b/c/d/e" does not exist and cannot be created.');
         if (!getenv('USER') || 'root' === getenv('USER')) {
             $this->markTestSkipped('This test will fail if run under superuser');
         }
@@ -59,6 +60,35 @@ class FlockStoreTest extends AbstractStoreTestCase
         $this->assertDirectoryExists($dir);
         // cleanup
         @rmdir($dir);
+    }
+
+    public function testFailedPromotionReleasesTheReadLock()
+    {
+        $store = $this->getStore();
+
+        $resource = __METHOD__;
+        $key1 = new Key($resource);
+        $key2 = new Key($resource);
+
+        $store->saveRead($key1);
+        $store->saveRead($key2);
+
+        try {
+            $store->save($key1);
+            $this->fail('The store shouldn\'t promote a read lock shared with another key');
+        } catch (LockConflictedException) {
+        }
+
+        $this->assertFalse($store->exists($key1));
+        $this->assertTrue($store->exists($key2));
+
+        $store->delete($key1);
+        $store->delete($key2);
+
+        $store->save($key1);
+        $this->assertTrue($store->exists($key1));
+
+        $store->delete($key1);
     }
 
     public function testSaveSanitizeName()

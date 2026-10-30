@@ -12,6 +12,7 @@
 namespace Symfony\Component\HttpKernel\Attribute;
 
 use Symfony\Component\ExpressionLanguage\Expression;
+use Symfony\Component\RateLimiter\Exception\RateLimitExceededException;
 
 /**
  * Rate limits the controller.
@@ -20,11 +21,15 @@ use Symfony\Component\ExpressionLanguage\Expression;
  * rejecting, out of those with $exposeHeaders enabled. A rejecting limiter always wins; when it
  * does not expose its state, the response carries no `X-RateLimit-*` headers at all.
  *
+ * Tokens are consumed as soon as the controller is known, before its arguments are resolved,
+ * unless $key or $if reads them: a Closure, or an Expression that uses `args`.
+ *
  * @see https://symfony.com/doc/current/rate_limiter.html
  *
  * @author Ayyoub AFW-ALLAH <ayyoub.afwallah@gmail.com>
  */
 #[\Attribute(\Attribute::IS_REPEATABLE | \Attribute::TARGET_CLASS | \Attribute::TARGET_METHOD | \Attribute::TARGET_FUNCTION)]
+#[RecoverableAttribute(RateLimitExceededException::class)]
 final class RateLimit
 {
     /** @var string[] */
@@ -32,10 +37,11 @@ final class RateLimit
 
     /**
      * @param string                          $limiter       The configured limiter name
-     * @param string|Expression|\Closure|null $key           A literal string key, an Expression, or a Closure (defaults to client IP + method + path)
+     * @param string|Expression|\Closure|null $key           A string where {name} is replaced by the "name" request attribute, such as a route parameter, or an Expression or a Closure evaluating to a string; null means client IP + path
      * @param int                             $tokens        The number of tokens to consume
      * @param string[]|string                 $methods       HTTP methods to rate limit; empty means all methods
      * @param bool                            $exposeHeaders Whether this limiter's state may be exposed via the `X-RateLimit-*` response headers, opt-in
+     * @param bool|Expression|\Closure        $if            Whether the rate limit applies: a boolean, or an Expression or a Closure evaluating to one
      */
     public function __construct(
         public readonly string $limiter,
@@ -43,6 +49,7 @@ final class RateLimit
         public readonly int $tokens = 1,
         array|string $methods = [],
         public readonly bool $exposeHeaders = false,
+        public readonly bool|Expression|\Closure $if = true,
     ) {
         if ($this->tokens < 1) {
             throw new \InvalidArgumentException(\sprintf('The "$tokens" argument of "%s" must be greater than 0, "%d" given.', self::class, $this->tokens));

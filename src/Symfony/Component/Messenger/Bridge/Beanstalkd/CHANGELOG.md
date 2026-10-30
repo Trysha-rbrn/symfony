@@ -1,6 +1,12 @@
 CHANGELOG
 =========
 
+8.2
+---
+
+ * Add `BeanstalkdTubeStamp` to put a message in another tube than the one of the transport
+ * Implement the `CloseableTransportInterface` to allow closing the Beanstalkd connection
+
 7.3
 ---
 

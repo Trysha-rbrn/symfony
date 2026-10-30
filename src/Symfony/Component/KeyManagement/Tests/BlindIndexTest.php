@@ -11,20 +11,25 @@
 
 namespace Symfony\Component\KeyManagement\Tests;
 
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\RequiresPhpExtension;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\KeyManagement\BlindIndex;
 use Symfony\Component\KeyManagement\BlindIndex\AlgorithmInterface;
 use Symfony\Component\KeyManagement\BlindIndex\Blake2b;
-use Symfony\Component\KeyManagement\BlindIndex\Email;
-use Symfony\Component\KeyManagement\BlindIndex\EmailDomain;
+use Symfony\Component\KeyManagement\BlindIndex\CoveringProjectionInterface;
 use Symfony\Component\KeyManagement\BlindIndex\HmacSha256;
+use Symfony\Component\KeyManagement\BlindIndex\Projection\Email;
+use Symfony\Component\KeyManagement\BlindIndex\Projection\EmailDomain;
+use Symfony\Component\KeyManagement\BlindIndex\Projection\Verbatim;
+use Symfony\Component\KeyManagement\BlindIndex\ProjectionInterface;
 use Symfony\Component\KeyManagement\Ciphertext;
-use Symfony\Component\KeyManagement\DataKey;
-use Symfony\Component\KeyManagement\DataKeyGeneratorInterface;
 use Symfony\Component\KeyManagement\Exception\DecryptionFailedException;
+use Symfony\Component\KeyManagement\Exception\InvalidArgumentException;
+use Symfony\Component\KeyManagement\Exception\LogicException;
 use Symfony\Component\KeyManagement\KeyLoader\InMemoryKeyLoader;
 use Symfony\Component\KeyManagement\Local\OpenSslKms;
+use Symfony\Component\KeyManagement\Tests\Fixtures\CountingKms;
 use Symfony\Component\KeyManagement\Tests\Fixtures\RedactedTraceAssertionsTrait;
 
 #[RequiresPhpExtension('openssl')]
@@ -32,7 +37,7 @@ class BlindIndexTest extends TestCase
 {
     use RedactedTraceAssertionsTrait;
 
-    private DataKeyGeneratorInterface $kms;
+    private OpenSslKms $kms;
     private Ciphertext $wrappedKey;
 
     protected function setUp(): void
@@ -43,7 +48,7 @@ class BlindIndexTest extends TestCase
 
     public function testEqualValuesGiveEqualTags()
     {
-        $index = new BlindIndex($this->kms, $this->wrappedKey);
+        $index = new BlindIndex($this->kms, $this->wrappedKey, 'email', new Verbatim());
 
         $this->assertSame($index->of('ada@example.org'), $index->of('ada@example.org'));
         $this->assertNotSame($index->of('ada@example.org'), $index->of('bob@example.org'));
@@ -51,7 +56,7 @@ class BlindIndexTest extends TestCase
 
     public function testTheTagIsAlwaysTheSameWidth()
     {
-        $index = new BlindIndex($this->kms, $this->wrappedKey);
+        $index = new BlindIndex($this->kms, $this->wrappedKey, 'email', new Verbatim());
 
         $this->assertMatchesRegularExpression('/^[0-9a-f]{64}$/', $index->of(''));
         $this->assertMatchesRegularExpression('/^[0-9a-f]{64}$/', $index->of(str_repeat('x', 10_000)));
@@ -59,18 +64,53 @@ class BlindIndexTest extends TestCase
 
     public function testTheTagCannotBeReproducedWithoutTheKey()
     {
-        $tag = (new BlindIndex($this->kms, $this->wrappedKey))->of('ada@example.org');
+        $tag = (new BlindIndex($this->kms, $this->wrappedKey, 'email', new Verbatim()))->of('ada@example.org');
 
         $this->assertNotSame(hash('sha256', 'ada@example.org'), $tag);
         $this->assertNotSame(bin2hex(hash_hmac('sha256', 'ada@example.org', 'app', true)), $tag);
 
-        $another = new BlindIndex($this->kms, $this->kms->generateDataKey('app')->wrapped);
+        $another = new BlindIndex($this->kms, $this->kms->generateDataKey('app')->wrapped, 'email', new Verbatim());
         $this->assertNotSame($tag, $another->of('ada@example.org'), 'another index key gives another tag');
     }
 
-    public function testTheBaseClassIndexesTheValueVerbatim()
+    public function testTheNameSeparatesTwoIndexesOverOneKey()
     {
-        $index = new BlindIndex($this->kms, $this->wrappedKey);
+        $user = new BlindIndex($this->kms, $this->wrappedKey, 'user-email', new Verbatim());
+        $contact = new BlindIndex($this->kms, $this->wrappedKey, 'contact-email', new Verbatim());
+
+        $this->assertNotSame($user->of('ada@example.org'), $contact->of('ada@example.org'), 'two columns over one key must not tell each other which rows hold a value of the other');
+        $this->assertSame($user->of('ada@example.org'), $user->of('ada@example.org'));
+    }
+
+    /**
+     * The tag is part of the stored format, so the derivation is pinned rather than left to drift.
+     *
+     * Changing the info string, the hash or the subkey width means every tag already written stops
+     * matching, which is a reindex of every row and not a refactoring.
+     */
+    public function testTheTagsAreDerivedUnderASubkeyAndNotUnderTheDataKey()
+    {
+        $indexKey = $this->kms->unwrapDataKey($this->wrappedKey)->use(static fn (#[\SensitiveParameter] string $key): string => $key);
+        $tag = (new BlindIndex($this->kms, $this->wrappedKey, 'user-email', new Verbatim()))->of('ada@example.org');
+
+        $this->assertNotSame(bin2hex(hash_hmac('sha256', 'ada@example.org', $indexKey, true)), $tag, 'the data key itself keys nothing');
+        $this->assertSame(
+            bin2hex(hash_hmac('sha256', 'ada@example.org', hash_hkdf('sha256', $indexKey, 32, 'symfony/key-management/blind-index/v1/user-email'), true)),
+            $tag,
+        );
+    }
+
+    public function testAnIndexWithoutANameIsRefused()
+    {
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('A blind index must be named');
+
+        new BlindIndex($this->kms, $this->wrappedKey, '', new Verbatim());
+    }
+
+    public function testTheVerbatimProjectionFoldsNothing()
+    {
+        $index = new BlindIndex($this->kms, $this->wrappedKey, 'email', new Verbatim());
 
         $this->assertNotSame($index->of('Ada'), $index->of('ada'));
         $this->assertNotSame($index->of(' ada'), $index->of('ada'));
@@ -78,7 +118,7 @@ class BlindIndexTest extends TestCase
 
     public function testAnEmailIsFoldedTheWayTheStandardSaysAndNoFurther()
     {
-        $index = new Email($this->kms, $this->wrappedKey);
+        $index = new BlindIndex($this->kms, $this->wrappedKey, 'email', new Email());
 
         $this->assertSame($index->of('ada@example.org'), $index->of('  ada@Example.ORG '));
         $this->assertNotSame($index->of('ada@example.org'), $index->of('Ada@example.org'));
@@ -87,16 +127,16 @@ class BlindIndexTest extends TestCase
 
     public function testSomethingThatIsNotAnAddressIsIndexedTrimmedAndWhole()
     {
-        $index = new Email($this->kms, $this->wrappedKey);
+        $index = new BlindIndex($this->kms, $this->wrappedKey, 'email', new Email());
 
         $this->assertSame($index->of('not-an-address'), $index->of('  not-an-address '));
         $this->assertNotSame($index->of('not-an-address'), $index->of('NOT-AN-ADDRESS'));
     }
 
-    public function testTheDomainIndexGroupsAddressesOfOneCompany()
+    public function testTheDomainProjectionGroupsAddressesOfOneCompany()
     {
-        $domain = new EmailDomain($this->kms, $this->wrappedKey);
-        $address = new Email($this->kms, $this->wrappedKey);
+        $domain = new BlindIndex($this->kms, $this->wrappedKey, 'email-domain', new EmailDomain());
+        $address = new BlindIndex($this->kms, $this->wrappedKey, 'email', new Email());
 
         $this->assertSame($domain->of('ada@example.org'), $domain->of('BOB@Example.org'));
         $this->assertNotSame($domain->of('ada@example.org'), $domain->of('ada@other.org'));
@@ -105,7 +145,7 @@ class BlindIndexTest extends TestCase
 
     public function testTheDomainIsIndexedFromAnAddressOrFromItself()
     {
-        $domain = new EmailDomain($this->kms, $this->wrappedKey);
+        $domain = new BlindIndex($this->kms, $this->wrappedKey, 'email-domain', new EmailDomain());
 
         $this->assertSame($domain->of('ada@example.org'), $domain->of('example.org'));
         $this->assertSame($domain->of('ada@example.org'), $domain->of('  Example.ORG '));
@@ -113,53 +153,155 @@ class BlindIndexTest extends TestCase
         $this->assertSame($domain->of('a@b@example.org'), $domain->of('example.org'), 'the last @ is the separator');
     }
 
+    public function testAnInternationalizedDomainHasOneTagHoweverItIsSpelled()
+    {
+        $domain = new BlindIndex($this->kms, $this->wrappedKey, 'email-domain', new EmailDomain());
+        $address = new BlindIndex($this->kms, $this->wrappedKey, 'email', new Email());
+
+        $this->assertSame($domain->of("caf\u{E9}.example"), $domain->of("cafe\u{301}.example"), 'precomposed and decomposed');
+        $this->assertSame($domain->of("caf\u{E9}.example"), $domain->of("CAF\u{C9}.example"));
+        $this->assertSame($domain->of("caf\u{E9}.example"), $domain->of('XN--CAF-DMA.example'));
+        $this->assertSame($address->of("ada@caf\u{E9}.example"), $address->of("ada@cafe\u{301}.example"));
+        $this->assertSame($address->of("ada@caf\u{E9}.example"), $address->of('ada@xn--caf-dma.example'));
+        $this->assertNotSame($address->of("ada@caf\u{E9}.example"), $address->of("Ada@caf\u{E9}.example"));
+        $this->assertNotSame($domain->of("stra\u{DF}e.de"), $domain->of('strasse.de'), 'non-transitional');
+    }
+
+    public function testADomainThatIsNotAValidInternationalizedOneIsLowercased()
+    {
+        $domain = new BlindIndex($this->kms, $this->wrappedKey, 'email-domain', new EmailDomain());
+        $address = new BlindIndex($this->kms, $this->wrappedKey, 'email', new Email());
+
+        $this->assertSame($domain->of('under_score.example'), $domain->of('Under_Score.EXAMPLE'));
+        $this->assertNotSame($domain->of('under_score.example'), $domain->of('other_score.example'));
+        $this->assertSame($address->of('ada@'), $address->of(' ada@ '));
+        $this->assertSame($domain->of(''), $domain->of('ada@'));
+    }
+
     public function testAnApplicationIndexesItsOwnProjection()
     {
-        $index = new class($this->kms, $this->wrappedKey) extends BlindIndex {
-            protected function project(string $value): string
+        $index = new BlindIndex($this->kms, $this->wrappedKey, 'email', new class implements ProjectionInterface {
+            public function project(string $value): string
             {
                 return substr(preg_replace('/\D+/', '', $value), -4);
             }
-        };
+        });
 
         $this->assertSame($index->of('+33 6 12 34 56 78'), $index->of('5678'));
         $this->assertNotSame($index->of('+33 6 12 34 56 78'), $index->of('1234'));
     }
 
+    public function testAValueCoveredBySeveralFormsIsTaggedOncePerForm()
+    {
+        $index = new BlindIndex($this->kms, $this->wrappedKey, 'name-prefix', new Prefixes());
+
+        $tags = $index->allOf('ada');
+
+        $this->assertCount(3, $tags, 'one tag per prefix of the value.');
+        $this->assertSame($tags, array_values(array_unique($tags)), 'two forms of one value do not tag alike.');
+        foreach ($tags as $tag) {
+            $this->assertMatchesRegularExpression('/^[0-9a-f]{64}$/', $tag);
+        }
+    }
+
+    /**
+     * Every form is tagged under the subkey of the index, and not under one of its own.
+     */
+    public function testAFormIsTaggedAsTheWholeValueWouldBeUnderTheSameIndex()
+    {
+        $prefixes = new BlindIndex($this->kms, $this->wrappedKey, 'name', new Prefixes());
+        $verbatim = new BlindIndex($this->kms, $this->wrappedKey, 'name', new Verbatim());
+
+        $this->assertSame([$verbatim->of('a'), $verbatim->of('ad'), $verbatim->of('ada')], $prefixes->allOf('ada'));
+    }
+
+    public function testAValueCoveredByOneFormGivesThatOneTagEitherWay()
+    {
+        $index = new BlindIndex($this->kms, $this->wrappedKey, 'email', new Email());
+
+        $this->assertSame([$index->of('  Ada@Example.ORG ')], $index->allOf('Ada@example.org'), 'the projection folds the same way on either path.');
+    }
+
+    /**
+     * Whatever the value: a covering projection is refused by its type, so a flush behind
+     * "#[BlindIndexed]" fails on every row rather than on the rows of more than one form.
+     */
+    #[DataProvider('provideValuesOfAnyLength')]
+    public function testAnIndexCoveringSeveralFormsHasNoSingleTag(string $value)
+    {
+        $index = new BlindIndex($this->kms, $this->wrappedKey, 'name-prefix', new Prefixes());
+
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage('The projection "Symfony\\Component\\KeyManagement\\Tests\\Prefixes" covers several forms of a value, which "Symfony\\Component\\KeyManagement\\BlindIndex::of()" cannot answer with one tag: read them with "allOf()"');
+
+        $index->of($value);
+    }
+
+    public static function provideValuesOfAnyLength(): iterable
+    {
+        yield 'one form' => ['a'];
+        yield 'several forms' => ['ada'];
+        yield 'none at all' => [''];
+    }
+
+    public function testTheFormsOfAValueCostOneOpeningOfTheKey()
+    {
+        $counting = new CountingKms($this->kms);
+        $index = new BlindIndex($counting, $this->wrappedKey, 'name-prefix', new Prefixes());
+
+        $index->allOf('ada');
+
+        $this->assertSame(1, $counting->unwrapped, 'the forms of a value are tagged under one opening of the index key.');
+    }
+
     #[RequiresPhpExtension('sodium')]
     public function testTheAlgorithmChangesTheTagAndIsThereforePartOfTheFormat()
     {
-        $hmac = new BlindIndex($this->kms, $this->wrappedKey, new HmacSha256());
-        $blake = new BlindIndex($this->kms, $this->wrappedKey, new Blake2b());
+        $hmac = new BlindIndex($this->kms, $this->wrappedKey, 'email', new Verbatim(), new HmacSha256());
+        $blake = new BlindIndex($this->kms, $this->wrappedKey, 'email', new Verbatim(), new Blake2b());
 
         $this->assertNotSame($hmac->of('ada@example.org'), $blake->of('ada@example.org'));
         $this->assertSame($blake->of('ada@example.org'), $blake->of('ada@example.org'));
         $this->assertMatchesRegularExpression('/^[0-9a-f]{64}$/', $blake->of('ada@example.org'));
     }
 
+    public function testTheDefaultAlgorithmIsTheKeyedHmac()
+    {
+        $given = new BlindIndex($this->kms, $this->wrappedKey, 'email', new Verbatim(), new HmacSha256());
+        $omitted = new BlindIndex($this->kms, $this->wrappedKey, 'email', new Verbatim());
+
+        $this->assertSame($given->of('ada@example.org'), $omitted->of('ada@example.org'));
+    }
+
+    public function testTheShippedAlgorithmsAgreeOnTheTagWidth()
+    {
+        $this->assertSame(AlgorithmInterface::TAG_BYTES, \strlen(new HmacSha256()->tag('ada@example.org', str_repeat('k', 32))));
+
+        if (\function_exists('sodium_crypto_generichash')) {
+            $this->assertSame(AlgorithmInterface::TAG_BYTES, \strlen(new Blake2b()->tag('ada@example.org', str_repeat('k', 32))));
+        }
+    }
+
+    public function testAnAlgorithmReturningAnotherWidthIsRefused()
+    {
+        $index = new BlindIndex($this->kms, $this->wrappedKey, 'email', new Verbatim(), new class implements AlgorithmInterface {
+            public function tag(#[\SensitiveParameter] string $value, #[\SensitiveParameter] string $key): string
+            {
+                return hash_hmac('sha512', $value, $key, true);
+            }
+        });
+
+        $this->expectException(LogicException::class);
+        $this->expectExceptionMessage(\sprintf('returned a 64-byte tag instead of %d.', AlgorithmInterface::TAG_BYTES));
+
+        $index->of('ada@example.org');
+    }
+
     public function testTheKeyIsUnwrappedOnceWhateverTheNumberOfValues()
     {
-        $counting = new class($this->kms) implements DataKeyGeneratorInterface {
-            public int $unwrapped = 0;
+        $counting = new CountingKms($this->kms);
 
-            public function __construct(private readonly DataKeyGeneratorInterface $inner)
-            {
-            }
-
-            public function generateDataKey(string $keyId, int $length = 32, string $aad = ''): DataKey
-            {
-                return $this->inner->generateDataKey($keyId, $length, $aad);
-            }
-
-            public function unwrapDataKey(Ciphertext $wrapped, string $aad = ''): DataKey
-            {
-                ++$this->unwrapped;
-
-                return $this->inner->unwrapDataKey($wrapped, $aad);
-            }
-        };
-
-        $index = new BlindIndex($counting, $this->wrappedKey);
+        $index = new BlindIndex($counting, $this->wrappedKey, 'email', new Verbatim());
         for ($i = 0; $i < 50; ++$i) {
             $index->of('value-'.$i);
         }
@@ -167,10 +309,20 @@ class BlindIndexTest extends TestCase
         $this->assertSame(1, $counting->unwrapped);
     }
 
+    public function testTwoIndexesOverOneWrappedKeyEachOpenItOnTheirOwn()
+    {
+        $counting = new CountingKms($this->kms);
+
+        (new BlindIndex($counting, $this->wrappedKey, 'email', new Verbatim()))->of('ada@example.org');
+        (new BlindIndex($counting, $this->wrappedKey, 'email-address', new Email()))->of('ada@example.org');
+
+        $this->assertSame(2, $counting->unwrapped, 'a wrapped key leaves every index to unwrap it for itself');
+    }
+
     public function testTheIndexKeyDoesNotReachStackTraces()
     {
         $indexKey = $this->kms->unwrapDataKey($this->wrappedKey)->use(static fn (string $key): string => $key);
-        $index = new BlindIndex($this->kms, $this->wrappedKey, new class implements AlgorithmInterface {
+        $index = new BlindIndex($this->kms, $this->wrappedKey, 'email', new Verbatim(), new class implements AlgorithmInterface {
             public function tag(#[\SensitiveParameter] string $value, #[\SensitiveParameter] string $key): string
             {
                 throw new \RuntimeException('The algorithm is unavailable.');
@@ -184,9 +336,28 @@ class BlindIndexTest extends TestCase
 
     public function testAnIndexKeyThatCannotBeUnwrappedIsReported()
     {
-        $index = new BlindIndex($this->kms, new Ciphertext('not a wrapped key', 'app'));
+        $index = new BlindIndex($this->kms, new Ciphertext('not a wrapped key', 'app'), 'email', new Verbatim());
 
         $this->expectException(DecryptionFailedException::class);
         $index->of('ada@example.org');
+    }
+}
+
+/**
+ * Every prefix of a value, the shape a "starts with" search is made of.
+ */
+final class Prefixes implements CoveringProjectionInterface
+{
+    /**
+     * @return list<string>
+     */
+    public function cover(#[\SensitiveParameter] string $value): array
+    {
+        $forms = [];
+        for ($length = 1; $length <= \strlen($value); ++$length) {
+            $forms[] = substr($value, 0, $length);
+        }
+
+        return $forms;
     }
 }

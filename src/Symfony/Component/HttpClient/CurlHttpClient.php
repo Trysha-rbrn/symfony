@@ -22,7 +22,7 @@ use Symfony\Component\HttpClient\Response\ResponseStream;
 use Symfony\Contracts\HttpClient\HttpClientInterface;
 use Symfony\Contracts\HttpClient\ResponseInterface;
 use Symfony\Contracts\HttpClient\ResponseStreamInterface;
-use Symfony\Contracts\Service\ResetInterface;
+use Symfony\Contracts\Service\ShutdownInterface;
 
 /**
  * A performant implementation of the HttpClientInterface contracts based on the curl extension.
@@ -32,7 +32,7 @@ use Symfony\Contracts\Service\ResetInterface;
  *
  * @author Nicolas Grekas <p@tchwork.com>
  */
-final class CurlHttpClient implements HttpClientInterface, LoggerAwareInterface, ResetInterface
+final class CurlHttpClient implements HttpClientInterface, LoggerAwareInterface, ShutdownInterface
 {
     use HttpClientTrait;
 
@@ -138,10 +138,11 @@ final class CurlHttpClient implements HttpClientInterface, LoggerAwareInterface,
             $curlopts[\CURLOPT_HTTP_VERSION] = \CURL_HTTP_VERSION_1_0;
         } elseif (1.1 === (float) $options['http_version']) {
             $curlopts[\CURLOPT_HTTP_VERSION] = \CURL_HTTP_VERSION_1_1;
-        } elseif (\defined('CURL_VERSION_HTTP2') && (\CURL_VERSION_HTTP2 & CurlClientState::$curlVersion['features']) && ('https:' === $scheme || 2.0 === (float) $options['http_version'])) {
-            $curlopts[\CURLOPT_HTTP_VERSION] = \CURL_HTTP_VERSION_2_0;
-        } elseif (\defined('CURL_VERSION_HTTP3') && (\CURL_VERSION_HTTP3 & CurlClientState::$curlVersion['features']) && 3.0 === (float) $options['http_version'] && !self::willUseProxy($proxy, $curlopts[\CURLOPT_NOPROXY], $host)) {
+        } elseif (3.0 === (float) $options['http_version'] && 'https:' === $scheme && \defined('CURL_HTTP_VERSION_3ONLY') && (\CURL_VERSION_HTTP3 & CurlClientState::$curlVersion['features']) && !self::willUseProxy($proxy, $curlopts[\CURLOPT_NOPROXY], $host)) {
+            // CURL_HTTP_VERSION_3 falls back to older versions since curl 7.88, which added CURL_HTTP_VERSION_3ONLY
             $curlopts[\CURLOPT_HTTP_VERSION] = \CURL_HTTP_VERSION_3;
+        } elseif (\defined('CURL_VERSION_HTTP2') && (\CURL_VERSION_HTTP2 & CurlClientState::$curlVersion['features']) && ('https:' === $scheme || 2.0 === (float) $options['http_version'])) {
+            $curlopts[\CURLOPT_HTTP_VERSION] = 2.0 === (float) $options['http_version'] ? \CURL_HTTP_VERSION_2_PRIOR_KNOWLEDGE : \CURL_HTTP_VERSION_2_0;
         }
 
         $ntlmOriginKey = null;
@@ -349,18 +350,25 @@ final class CurlHttpClient implements HttpClientInterface, LoggerAwareInterface,
             $responses = [$responses];
         }
 
-        if ($this->multi->handle instanceof \CurlMultiHandle) {
+        if ($this->multi->handle instanceof \CurlMultiHandle && !$this->multi->performing) {
             $active = 0;
-            while (\CURLM_CALL_MULTI_PERFORM === curl_multi_exec($this->multi->handle, $active)) {
+            // curl forbids removing handles from its callbacks, which closing a response would do otherwise
+            $this->multi->performing = true;
+
+            try {
+                while (\CURLM_CALL_MULTI_PERFORM === curl_multi_exec($this->multi->handle, $active)) {
+                }
+            } finally {
+                $this->multi->performing = false;
             }
         }
 
         return new ResponseStream(CurlResponse::stream($responses, $timeout));
     }
 
-    public function reset(): void
+    public function reset(bool $shutdown = false): void
     {
-        $this->multi->reset();
+        $this->multi->reset($shutdown);
     }
 
     /**

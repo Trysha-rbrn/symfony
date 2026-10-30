@@ -69,6 +69,7 @@ class PostgreSqlStore implements BlockingSharedLockStoreInterface, BlockingStore
     public function save(Key $key): void
     {
         // prevent concurrency within the same connection
+        $isPromotion = $this->getInternalStore()->exists($key);
         $this->getInternalStore()->save($key);
 
         $lockAcquired = false;
@@ -91,7 +92,11 @@ class PostgreSqlStore implements BlockingSharedLockStoreInterface, BlockingStore
             }
         } finally {
             if (!$lockAcquired) {
-                $this->getInternalStore()->delete($key);
+                if ($isPromotion) {
+                    $this->getInternalStore()->saveRead($key);
+                } else {
+                    $this->getInternalStore()->delete($key);
+                }
             }
         }
 
@@ -101,6 +106,7 @@ class PostgreSqlStore implements BlockingSharedLockStoreInterface, BlockingStore
     public function saveRead(Key $key): void
     {
         // prevent concurrency within the same connection
+        $isDemotion = $this->getInternalStore()->exists($key);
         $this->getInternalStore()->saveRead($key);
 
         $lockAcquired = false;
@@ -124,7 +130,11 @@ class PostgreSqlStore implements BlockingSharedLockStoreInterface, BlockingStore
             }
         } finally {
             if (!$lockAcquired) {
-                $this->getInternalStore()->delete($key);
+                if ($isDemotion) {
+                    $this->getInternalStore()->save($key);
+                } else {
+                    $this->getInternalStore()->delete($key);
+                }
             }
         }
 
@@ -182,6 +192,7 @@ class PostgreSqlStore implements BlockingSharedLockStoreInterface, BlockingStore
     {
         // prevent concurrency within the same connection
         // Internal store does not allow blocking mode, because there is no way to acquire one in a single process
+        $isPromotion = $this->getInternalStore()->exists($key);
         $this->getInternalStore()->save($key);
 
         $lockAcquired = false;
@@ -193,7 +204,11 @@ class PostgreSqlStore implements BlockingSharedLockStoreInterface, BlockingStore
             $lockAcquired = true;
         } finally {
             if (!$lockAcquired) {
-                $this->getInternalStore()->delete($key);
+                if ($isPromotion) {
+                    $this->getInternalStore()->saveRead($key);
+                } else {
+                    $this->getInternalStore()->delete($key);
+                }
             }
         }
 
@@ -223,6 +238,16 @@ class PostgreSqlStore implements BlockingSharedLockStoreInterface, BlockingStore
 
         // release lock in case of demotion
         $this->unlock($key);
+    }
+
+    /**
+     * Closes the connection created from a DSN, unless a lock is acquired on it.
+     */
+    public function close(): void
+    {
+        if (isset($this->dsn, $this->conn) && !$this->hasAcquiredLocks()) {
+            unset($this->conn);
+        }
     }
 
     /**
@@ -285,5 +310,11 @@ class PostgreSqlStore implements BlockingSharedLockStoreInterface, BlockingStore
         static $storeRegistry = new \WeakMap();
 
         return $storeRegistry[$this->getConnection()] ??= new InMemoryStore();
+    }
+
+    private function hasAcquiredLocks(): bool
+    {
+        // the in-memory store tracks the locks acquired on the connection, and it equals a new instance when it holds none
+        return $this->getInternalStore() != new InMemoryStore();
     }
 }

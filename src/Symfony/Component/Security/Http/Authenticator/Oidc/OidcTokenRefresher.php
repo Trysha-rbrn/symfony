@@ -12,7 +12,6 @@
 namespace Symfony\Component\Security\Http\Authenticator\Oidc;
 
 use Psr\Clock\ClockInterface;
-use Symfony\Component\Clock\Clock;
 use Symfony\Component\Security\Core\Authentication\Token\TokenInterface;
 use Symfony\Component\Security\Core\Exception\AuthenticationException;
 use Symfony\Component\Security\Http\Exception\OidcInvalidGrantException;
@@ -34,8 +33,6 @@ use Symfony\Component\Security\Http\Oidc\OidcDiscovery;
  */
 final class OidcTokenRefresher
 {
-    private readonly ClockInterface $clock;
-
     /**
      * @param string                     $clientId          The client the tokens were issued to, checked as the audience of a refreshed ID token
      * @param OidcSignatureVerifier|null $signatureVerifier Verifies the signature of a refreshed ID token against the
@@ -43,7 +40,7 @@ final class OidcTokenRefresher
      * @param int                        $leeway            How many seconds before its expiry the access token is renewed,
      *                                                      so that one handed to a downstream call does not expire in flight
      * @param ClockInterface|null        $clock             The clock the expiry is read and written against, or null to use
-     *                                                      the clock of the "symfony/clock" component
+     *                                                      the system time
      */
     public function __construct(
         private readonly OidcClientInterface $client,
@@ -52,13 +49,8 @@ final class OidcTokenRefresher
         private readonly string $clientId,
         private readonly ?OidcSignatureVerifier $signatureVerifier = null,
         private readonly int $leeway = 30,
-        ?ClockInterface $clock = null,
+        private readonly ?ClockInterface $clock = null,
     ) {
-        if (null === $clock && !class_exists(Clock::class)) {
-            throw new \LogicException(\sprintf('The "symfony/clock" component is required to build "%s" without a clock. Try running "composer require symfony/clock", or pass any PSR-20 clock to the constructor.', self::class));
-        }
-
-        $this->clock = $clock ?? new Clock();
     }
 
     /**
@@ -80,7 +72,7 @@ final class OidcTokenRefresher
             return false;
         }
 
-        if ($this->clock->now()->getTimestamp() + $this->leeway < (int) $expiresAt) {
+        if (($this->clock?->now()->getTimestamp() ?? time()) + $this->leeway < (int) $expiresAt) {
             return false;
         }
 
@@ -93,7 +85,7 @@ final class OidcTokenRefresher
      * Renews the access token, whatever its expiry, and stores the new tokens.
      *
      * The security token receives the access token and its expiry, the refresh token when the
-     * provider rotated it, and the ID token when it issued a new one.
+     * provider rotated it, and the ID token and its "sid" when it issued a new one.
      *
      * @throws OidcInvalidGrantException If the provider no longer honors the refresh token
      * @throws AuthenticationException   If the renewal fails for any other reason
@@ -114,12 +106,16 @@ final class OidcTokenRefresher
         // the whole response is validated before anything is stored, so that a rejected
         // ID token leaves the security token exactly as it was
         if (isset($tokenData['id_token'])) {
-            $this->verifyRefreshedIdToken($token, $tokenData['id_token']);
+            $sid = $this->verifyRefreshedIdToken($token, $tokenData['id_token'])['sid'] ?? null;
             $token->setAttribute('oidc_id_token', $tokenData['id_token']);
+
+            if (\is_string($sid) && '' !== $sid) {
+                $token->setAttribute('oidc_sid', $sid);
+            }
         }
 
         $token->setAttribute('oidc_access_token', $tokenData['access_token']);
-        $token->setAttribute('oidc_access_token_expires_at', is_numeric($tokenData['expires_in'] ?? null) ? $this->clock->now()->getTimestamp() + (int) $tokenData['expires_in'] : null);
+        $token->setAttribute('oidc_access_token_expires_at', is_numeric($tokenData['expires_in'] ?? null) ? ($this->clock?->now()->getTimestamp() ?? time()) + (int) $tokenData['expires_in'] : null);
 
         // RFC 6749, Section 6: issuing a new refresh token is a MAY, and the one just
         // used stays valid until the provider replaces it
@@ -136,9 +132,11 @@ final class OidcTokenRefresher
      * Neither a "nonce" nor a "max_age" is checked here: no authorization request was
      * made, and the "auth_time" claim still reports the original authentication.
      *
+     * @return array<string, mixed> The claims of the refreshed ID token
+     *
      * @throws AuthenticationException If the refreshed ID token does not describe the same authentication
      */
-    private function verifyRefreshedIdToken(TokenInterface $token, mixed $idToken): void
+    private function verifyRefreshedIdToken(TokenInterface $token, mixed $idToken): array
     {
         if (!\is_string($idToken) || '' === $idToken) {
             throw new AuthenticationException('The token endpoint response does not contain a valid "id_token".');
@@ -157,5 +155,7 @@ final class OidcTokenRefresher
         if (!\is_string($previousSubject) || !\is_string($claims['sub'] ?? null) || !hash_equals($previousSubject, $claims['sub'])) {
             throw new AuthenticationException('The "sub" claim of the refreshed ID token does not match the one of the ID token issued at authentication.');
         }
+
+        return $claims;
     }
 }

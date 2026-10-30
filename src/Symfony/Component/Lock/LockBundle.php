@@ -39,22 +39,8 @@ class LockBundle extends AbstractBundle
     public function configure(DefinitionConfigurator $definition): void
     {
         $definition->rootNode()
-            ->acceptAndWrap(['string'], 'resources')
+            ->acceptAndWrap(['string', 'array'], 'resources')
             ->canBeDisabled()
-            ->beforeNormalization()
-                ->ifArray()
-                ->then(static function ($v) {
-                    if ($v && !isset($v['resources']) && !isset($v['resource'])) {
-                        $v = ['resources' => $v];
-                        if (\array_key_exists('enabled', $v['resources'])) {
-                            $v['enabled'] = $v['resources']['enabled'];
-                            unset($v['resources']['enabled']);
-                        }
-                    }
-
-                    return $v;
-                })
-            ->end()
             ->children()
                 ->arrayNode('resources', 'resource')
                     ->normalizeKeys(false)
@@ -131,7 +117,7 @@ class LockBundle extends AbstractBundle
             // Generate stores
             $storeDefinitions = [];
             foreach ($resourceStores as $resourceStore) {
-                if (\in_array($resourceStore, ['flock', 'semaphore'], true)) {
+                if (\in_array($resourceStore, ['flock', 'flock+remove', 'semaphore'], true)) {
                     $storeDefinitionId = \sprintf('.lock.%s.store', $resourceStore);
                     $storeDefinitions[] = new Reference($storeDefinitionId);
                     $container->getDefinition($storeDefinitionId)->addTag('lock.store');
@@ -150,7 +136,8 @@ class LockBundle extends AbstractBundle
                 $storeDefinition
                     ->setFactory([StoreFactory::class, 'createStore'])
                     ->setArguments($advisory ? [$resourceStore, true] : [$resourceStore])
-                    ->addTag('lock.store');
+                    ->addTag('lock.store')
+                    ->addTag('kernel.reset', ['method' => 'close', 'on_invalid' => 'ignore', 'on_shutdown' => 'only']);
 
                 $container->setDefinition($storeDefinitionId = '.lock.'.$resourceName.'.store.'.$container->hash($storeDsn), $storeDefinition);
 
@@ -167,6 +154,7 @@ class LockBundle extends AbstractBundle
             // Generate factories for each resource
             $factoryDefinition = new ChildDefinition('lock.factory.abstract');
             $factoryDefinition->replaceArgument(0, new Reference($storeDefinitionId));
+            $factoryDefinition->addTag('lock.factory', ['name' => $resourceName]);
             $container->setDefinition('lock.'.$resourceName.'.factory', $factoryDefinition);
 
             // provide alias for default resource

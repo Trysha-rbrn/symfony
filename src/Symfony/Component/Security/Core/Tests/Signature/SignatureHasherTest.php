@@ -11,10 +11,12 @@
 
 namespace Symfony\Component\Security\Core\Tests\Signature;
 
+use PHPUnit\Framework\Attributes\TestWith;
 use PHPUnit\Framework\TestCase;
 use Psr\Cache\CacheItemInterface;
 use Psr\Cache\CacheItemPoolInterface;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
+use Symfony\Component\Clock\MockClock;
 use Symfony\Component\PropertyAccess\PropertyAccess;
 use Symfony\Component\Security\Core\Signature\Exception\ExpiredSignatureException;
 use Symfony\Component\Security\Core\Signature\Exception\InvalidSignatureException;
@@ -233,12 +235,110 @@ class SignatureHasherTest extends TestCase
         $hasher->acceptSignatureHash('john', $expires, 'invalid-hash');
     }
 
+    public function testAcceptSignatureHashExpiresWithTheClock()
+    {
+        $clock = new MockClock('2020-01-01 00:00:00 UTC');
+        $user = new TestSignatureUser('john', 'my-password');
+        $hasher = new SignatureHasher(PropertyAccess::createPropertyAccessor(), ['password'], 'secret', null, null, $clock);
+
+        $expires = $clock->now()->getTimestamp() + 3600;
+        $hash = $hasher->computeSignatureHash($user, $expires);
+
+        $hasher->acceptSignatureHash('john', $expires, $hash);
+
+        $clock->sleep(3601);
+
+        $this->expectException(ExpiredSignatureException::class);
+        $hasher->acceptSignatureHash('john', $expires, $hash);
+    }
+
+    public function testVerifySignatureHashExpiresWithTheClock()
+    {
+        $clock = new MockClock('2020-01-01 00:00:00 UTC');
+        $user = new TestSignatureUser('john', 'my-password');
+        $hasher = new SignatureHasher(PropertyAccess::createPropertyAccessor(), ['password'], 'secret', null, null, $clock);
+
+        $expires = $clock->now()->getTimestamp() + 3600;
+        $hash = $hasher->computeSignatureHash($user, $expires);
+
+        $hasher->verifySignatureHash($user, $expires, $hash);
+
+        $clock->sleep(3601);
+
+        $this->expectException(ExpiredSignatureException::class);
+        $hasher->verifySignatureHash($user, $expires, $hash);
+    }
+
     public function testConstructorThrowsOnEmptySecret()
     {
         $this->expectException(\Symfony\Component\Security\Core\Exception\InvalidArgumentException::class);
         $this->expectExceptionMessage('A non-empty secret is required.');
 
         new SignatureHasher(PropertyAccess::createPropertyAccessor(), [], '');
+    }
+
+    #[TestWith([[]])]
+    #[TestWith([['secret', '']])]
+    public function testConstructorThrowsOnEmptySecretInAList(array $secrets)
+    {
+        $this->expectException(\Symfony\Component\Security\Core\Exception\InvalidArgumentException::class);
+        $this->expectExceptionMessage('A non-empty secret is required.');
+
+        new SignatureHasher(PropertyAccess::createPropertyAccessor(), [], $secrets);
+    }
+
+    public function testComputeSignatureHashWithTheFirstOfSeveralSecrets()
+    {
+        $user = new TestSignatureUser('john', 'my-password');
+        $expires = time() + 3600;
+        $hasher = new SignatureHasher(PropertyAccess::createPropertyAccessor(), ['password'], ['new-secret', 'old-secret']);
+
+        $this->assertSame((new SignatureHasher(PropertyAccess::createPropertyAccessor(), ['password'], 'new-secret'))->computeSignatureHash($user, $expires), $hasher->computeSignatureHash($user, $expires));
+    }
+
+    public function testVerifySignatureHashWithAnyOfSeveralSecrets()
+    {
+        $user = new TestSignatureUser('john', 'my-password');
+        $expires = time() + 3600;
+        $hash = (new SignatureHasher(PropertyAccess::createPropertyAccessor(), ['password'], 'old-secret'))->computeSignatureHash($user, $expires, ['foo' => 'bar']);
+        $hasher = new SignatureHasher(PropertyAccess::createPropertyAccessor(), ['password'], ['new-secret', 'old-secret']);
+
+        $hasher->verifySignatureHash($user, $expires, $hash, ['foo' => 'bar']);
+        $hasher->acceptSignatureHash('john', $expires, $hash, ['foo' => 'bar']);
+
+        $this->addToAssertionCount(2);
+    }
+
+    public function testVerifySignatureHashRejectsAHashFromAnotherSecret()
+    {
+        $user = new TestSignatureUser('john', 'my-password');
+        $expires = time() + 3600;
+        $hash = (new SignatureHasher(PropertyAccess::createPropertyAccessor(), ['password'], 'other-secret'))->computeSignatureHash($user, $expires);
+        $hasher = new SignatureHasher(PropertyAccess::createPropertyAccessor(), ['password'], ['new-secret', 'old-secret']);
+
+        $this->expectException(InvalidSignatureException::class);
+        $hasher->verifySignatureHash($user, $expires, $hash);
+    }
+
+    public function testAcceptSignatureHashRejectsAHashFromAnotherSecret()
+    {
+        $user = new TestSignatureUser('john', 'my-password');
+        $expires = time() + 3600;
+        $hash = (new SignatureHasher(PropertyAccess::createPropertyAccessor(), ['password'], 'other-secret'))->computeSignatureHash($user, $expires);
+        $hasher = new SignatureHasher(PropertyAccess::createPropertyAccessor(), ['password'], ['new-secret', 'old-secret']);
+
+        $this->expectException(InvalidSignatureException::class);
+        $hasher->acceptSignatureHash('john', $expires, $hash);
+    }
+
+    public function testVerifySignatureHashFromAPreviousSecretRejectsAChangedProperty()
+    {
+        $expires = time() + 3600;
+        $hash = (new SignatureHasher(PropertyAccess::createPropertyAccessor(), ['password'], 'old-secret'))->computeSignatureHash(new TestSignatureUser('john', 'my-password'), $expires);
+        $hasher = new SignatureHasher(PropertyAccess::createPropertyAccessor(), ['password'], ['new-secret', 'old-secret']);
+
+        $this->expectException(InvalidSignatureException::class);
+        $hasher->verifySignatureHash(new TestSignatureUser('john', 'new-password'), $expires, $hash);
     }
 
     public function testVerifySignatureHashRejectsAConcurrentUsageBeyondMaxUses()

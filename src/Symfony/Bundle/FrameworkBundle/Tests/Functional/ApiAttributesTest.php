@@ -17,6 +17,7 @@ use Symfony\Component\DomCrawler\Crawler;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\HttpFoundation\StreamedResponse;
 use Symfony\Component\HttpKernel\Attribute\MapQueryString;
 use Symfony\Component\HttpKernel\Attribute\MapRequestPayload;
 use Symfony\Component\HttpKernel\Attribute\Serialize;
@@ -26,6 +27,19 @@ use Symfony\Component\Validator\Constraints as Assert;
 
 class ApiAttributesTest extends AbstractWebTestCase
 {
+    public function testVoidReturnTypeController()
+    {
+        $client = self::createClient(['test_case' => 'ApiAttributesTest']);
+        $client->catchExceptions(false);
+
+        $client->request('GET', '/void-return-type-controller.json');
+
+        $response = $client->getResponse();
+
+        self::assertSame(204, $response->getStatusCode());
+        self::assertSame('', $response->getContent());
+    }
+
     #[DataProvider('mapQueryStringProvider')]
     public function testMapQueryString(string $uri, array $query, string $expectedResponse, int $expectedStatusCode)
     {
@@ -981,6 +995,72 @@ class ApiAttributesTest extends AbstractWebTestCase
             'expectedResponse' => '',
             'expectedStatusCode' => 415,
         ];
+
+        yield 'map controller result before serializing it' => [
+            'uri' => '/serialize-mapped-controller-result',
+            'format' => 'json',
+            'expectedResponse' => <<<'JSON'
+                {
+                    "id": 101,
+                    "name": "Laptop"
+                }
+                JSON,
+            'expectedStatusCode' => 200,
+        ];
+
+        yield 'map each item of controller result before serializing it' => [
+            'uri' => '/serialize-mapped-controller-results',
+            'format' => 'json',
+            'expectedResponse' => <<<'JSON'
+                [
+                    {
+                        "id": 101,
+                        "name": "Laptop"
+                    },
+                    {
+                        "id": 102,
+                        "name": "Phone"
+                    }
+                ]
+                JSON,
+            'expectedStatusCode' => 200,
+        ];
+    }
+
+    #[RequiresMethod(ControllerAttributesListener::class, 'beforeController')]
+    #[DataProvider('serializeStreamProvider')]
+    public function testSerializeStream(string $uri, string $expectedResponse, int $expectedStatusCode)
+    {
+        $client = self::createClient(['test_case' => 'ApiAttributesTest']);
+
+        $client->request('GET', $uri);
+
+        $response = $client->getResponse();
+        self::assertInstanceOf(StreamedResponse::class, $response);
+        self::assertSame($expectedStatusCode, $response->getStatusCode());
+        self::assertSame('application/json', $response->headers->get('Content-Type'));
+        self::assertSame($expectedResponse, $client->getInternalResponse()->getContent());
+    }
+
+    public static function serializeStreamProvider(): iterable
+    {
+        yield 'stream controller result' => [
+            'uri' => '/serialize-streamed-controller-result',
+            'expectedResponse' => '{"id":101,"name":"Laptop","createdAt":"2021-12-31T12:34:56+00:00"}',
+            'expectedStatusCode' => 201,
+        ];
+
+        yield 'stream controller result of the type returned by the controller' => [
+            'uri' => '/serialize-streamed-controller-results',
+            'expectedResponse' => '[{"id":101,"name":"Laptop","createdAt":"2021-12-31T12:34:56+00:00"},{"id":102,"name":"Phone","createdAt":"2022-01-31T12:34:56+00:00"}]',
+            'expectedStatusCode' => 200,
+        ];
+
+        yield 'stream controller result mapped to a class' => [
+            'uri' => '/serialize-streamed-mapped-controller-results',
+            'expectedResponse' => '[{"id":101,"name":"Laptop"},{"id":102,"name":"Phone"}]',
+            'expectedStatusCode' => 200,
+        ];
     }
 
     #[RequiresMethod(ControllerAttributesListener::class, 'beforeController')]
@@ -1014,6 +1094,13 @@ class WithMapQueryStringToNullableAttributeController
         return new JsonResponse(
             ['filter' => ['status' => $query->filter->status, 'quantity' => $query->filter->quantity]],
         );
+    }
+}
+
+class WithVoidReturnTypeController
+{
+    public function __invoke(): void
+    {
     }
 }
 
@@ -1107,6 +1194,51 @@ class WithSerializeAttributeController
     }
 }
 
+class WithSerializeAndMapAttributeController
+{
+    #[Serialize(map: ProductSummary::class)]
+    public function __invoke(): Product
+    {
+        return new Product(101, 'Laptop', new \DateTimeImmutable('2021-12-31T12:34:56+00:00'));
+    }
+}
+
+class WithSerializeAndMapAttributeOnGeneratorController
+{
+    #[Serialize(map: ProductSummary::class)]
+    public function __invoke(): iterable
+    {
+        yield new Product(101, 'Laptop', new \DateTimeImmutable('2021-12-31T12:34:56+00:00'));
+        yield new Product(102, 'Phone', new \DateTimeImmutable('2022-01-31T12:34:56+00:00'));
+    }
+}
+
+class WithSerializeAndStreamAttributesController
+{
+    #[Serialize(201, stream: true)]
+    public function show(): Product
+    {
+        return new Product(101, 'Laptop', new \DateTimeImmutable('2021-12-31T12:34:56+00:00'));
+    }
+
+    /**
+     * @return list<Product>
+     */
+    #[Serialize(stream: true)]
+    public function list(): iterable
+    {
+        yield new Product(101, 'Laptop', new \DateTimeImmutable('2021-12-31T12:34:56+00:00'));
+        yield new Product(102, 'Phone', new \DateTimeImmutable('2022-01-31T12:34:56+00:00'));
+    }
+
+    #[Serialize(map: ProductSummary::class, stream: true)]
+    public function mapped(): iterable
+    {
+        yield new Product(101, 'Laptop', new \DateTimeImmutable('2021-12-31T12:34:56+00:00'));
+        yield new Product(102, 'Phone', new \DateTimeImmutable('2022-01-31T12:34:56+00:00'));
+    }
+}
+
 class WithMapRequestPayloadAndSerializeAttributesController
 {
     #[Serialize]
@@ -1152,6 +1284,15 @@ class Product
         public readonly int $id,
         public readonly string $name,
         public readonly \DateTimeImmutable $createdAt,
+    ) {
+    }
+}
+
+class ProductSummary
+{
+    public function __construct(
+        public readonly int $id,
+        public readonly string $name,
     ) {
     }
 }

@@ -14,10 +14,13 @@ namespace Symfony\Component\Messenger\Failure;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Exception\InvalidArgumentException;
 use Symfony\Component\Messenger\Exception\LogicException;
+use Symfony\Component\Messenger\Exception\MessageDecodingFailedException;
 use Symfony\Component\Messenger\MessageBusInterface;
 use Symfony\Component\Messenger\Stamp\NonSendableStampInterface;
 use Symfony\Component\Messenger\Stamp\SentToFailureTransportStamp;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
+use Symfony\Component\Messenger\Stamp\TrustStamp;
+use Symfony\Component\Messenger\Stamp\UnverifiedDecodingFailureStamp;
 use Symfony\Component\Messenger\Transport\Receiver\ListableReceiverInterface;
 use Symfony\Component\Messenger\Transport\Receiver\MessageCountAwareInterface;
 use Symfony\Component\Messenger\Transport\Receiver\ReceiverInterface;
@@ -56,10 +59,16 @@ final class FailedMessageRepository
      */
     public static function prepareForRedispatch(Envelope $envelope): Envelope
     {
-        return $envelope
+        // DecodeFailedMessageMiddleware needs these non-sendable stamps to keep the stamps of an unverified decoding failure away from a signed message,
+        // and a signing transport needs the second one: without its ReceivedStamp, the message would look dispatched in this process
+        $envelope = $envelope
             ->withoutStampsOfType(NonSendableStampInterface::class)
-            ->withoutAll(SentToFailureTransportStamp::class)
-            ->withoutAll(TransportMessageIdStamp::class);
+            ->withoutAll(TransportMessageIdStamp::class)
+            ->with(...$envelope->all(UnverifiedDecodingFailureStamp::class))
+            ->with($envelope->last(TrustStamp::class) ?? TrustStamp::untrusted());
+
+        // DecodeFailedMessageMiddleware needs it to find the serializer of a decoding failure, and removes it once decoded
+        return $envelope->getMessage() instanceof MessageDecodingFailedException ? $envelope : $envelope->withoutAll(SentToFailureTransportStamp::class);
     }
 
     /**
@@ -103,7 +112,7 @@ final class FailedMessageRepository
     }
 
     /**
-     * The limit bounds what is read from the transport, before the filter is applied.
+     * The limit bounds the number of messages that match the filter.
      *
      * @return iterable<Envelope>
      */
@@ -165,9 +174,26 @@ final class FailedMessageRepository
     {
         $this->phpSerializer?->acceptPhpIncompleteClass();
         try {
-            foreach ($receiver->all($limit) as $envelope) {
-                if (!$filter || $filter->matches($envelope)) {
+            if (!$filter || $filter->isEmpty()) {
+                foreach ($receiver->all($limit) as $envelope) {
                     yield $envelope;
+                }
+
+                return;
+            }
+
+            if (null !== $limit && 1 > $limit) {
+                return;
+            }
+
+            $count = 0;
+            foreach ($receiver->all() as $envelope) {
+                if ($filter->matches($envelope)) {
+                    yield $envelope;
+
+                    if (null !== $limit && ++$count >= $limit) {
+                        return;
+                    }
                 }
             }
         } finally {

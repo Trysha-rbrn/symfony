@@ -12,9 +12,13 @@
 namespace Symfony\Component\Messenger\Bridge\Doctrine\Tests\Transport;
 
 use Doctrine\DBAL\Driver\PDO\Exception;
+use Doctrine\DBAL\Exception\ConnectionException;
+use Doctrine\DBAL\Exception\ConnectionLost;
 use Doctrine\DBAL\Exception\DeadlockException;
+use PHPUnit\Framework\Attributes\Group;
 use PHPUnit\Framework\Attributes\RequiresPhpExtension;
 use PHPUnit\Framework\TestCase;
+use Symfony\Bridge\PhpUnit\ClockMock;
 use Symfony\Component\Messenger\Bridge\Doctrine\Tests\Fixtures\DummyMessage;
 use Symfony\Component\Messenger\Bridge\Doctrine\Transport\Connection;
 use Symfony\Component\Messenger\Bridge\Doctrine\Transport\DoctrineReceivedStamp;
@@ -148,7 +152,7 @@ class DoctrineReceiverTest extends TestCase
         $doctrineEnvelope1 = $this->createRetriedDoctrineEnvelope();
         $doctrineEnvelope2 = $this->createRetriedDoctrineEnvelope();
         $connection = $this->createMock(Connection::class);
-        $connection->expects($this->once())->method('findAll')->willReturn([$doctrineEnvelope1, $doctrineEnvelope2]);
+        $connection->expects($this->once())->method('findAllInBatches')->willReturnCallback(static fn () => yield from [$doctrineEnvelope1, $doctrineEnvelope2]);
 
         $receiver = new DoctrineReceiver($connection, $serializer);
         $actualEnvelopes = $receiver->all();
@@ -157,6 +161,53 @@ class DoctrineReceiverTest extends TestCase
 
             $this->assertCount(1, $messageIdStamps);
         }
+    }
+
+    public function testAllWithoutLimitReadsTheMessagesInBatches()
+    {
+        $read = 0;
+        $doctrineEnvelope = $this->createDoctrineEnvelope();
+        $connection = $this->createMock(Connection::class);
+        $connection->expects($this->never())->method('findAll');
+        $connection->expects($this->once())->method('findAllInBatches')->willReturnCallback(static function () use (&$read, $doctrineEnvelope) {
+            foreach ([1, 2, 3] as $id) {
+                ++$read;
+
+                yield ['id' => $id] + $doctrineEnvelope;
+            }
+        });
+
+        $receiver = new DoctrineReceiver($connection, $this->createSerializer());
+        foreach ($receiver->all() as $envelope) {
+            break;
+        }
+
+        $this->assertSame(1, $envelope->last(TransportMessageIdStamp::class)->getId());
+        $this->assertSame(1, $read);
+    }
+
+    public function testAllThrowsATransportExceptionWhenABatchCannotBeRead()
+    {
+        $doctrineEnvelope = $this->createDoctrineEnvelope();
+        $exception = $this->createAccessDenied();
+        $connection = $this->createStub(Connection::class);
+        $connection->method('findAllInBatches')->willReturnCallback(static function () use ($doctrineEnvelope, $exception) {
+            yield $doctrineEnvelope;
+
+            throw $exception;
+        });
+
+        $envelopes = [];
+        try {
+            foreach ((new DoctrineReceiver($connection, $this->createSerializer()))->all() as $envelope) {
+                $envelopes[] = $envelope;
+            }
+            $this->fail('A TransportException should have been thrown.');
+        } catch (TransportException $e) {
+            $this->assertSame($exception, $e->getPrevious());
+        }
+
+        $this->assertCount(1, $envelopes);
     }
 
     public function testFind()
@@ -365,6 +416,162 @@ class DoctrineReceiverTest extends TestCase
         $receiver->keepalive($envelope);
     }
 
+    public function testAckRetriesADeadlockReportedByTheConnection()
+    {
+        $driverConnection = $this->createMock(\Doctrine\DBAL\Connection::class);
+        $driverConnection->expects($this->exactly(2))->method('delete')->with('messenger_messages', ['id' => '1'])->willReturnOnConsecutiveCalls(
+            $this->throwException($this->createDeadlockException()),
+            1,
+        );
+
+        $receiver = new DoctrineReceiver(new Connection([], $driverConnection), $this->createSerializer());
+        $receiver->ack(new Envelope(new \stdClass(), [new DoctrineReceivedStamp('1')]));
+    }
+
+    public function testRejectRetriesADeadlockReportedByTheConnection()
+    {
+        $driverConnection = $this->createMock(\Doctrine\DBAL\Connection::class);
+        $driverConnection->expects($this->exactly(2))->method('delete')->with('messenger_messages', ['id' => '1'])->willReturnOnConsecutiveCalls(
+            $this->throwException($this->createDeadlockException()),
+            1,
+        );
+
+        $receiver = new DoctrineReceiver(new Connection([], $driverConnection), $this->createSerializer());
+        $receiver->reject(new Envelope(new \stdClass(), [new DoctrineReceivedStamp('1')]));
+    }
+
+    public function testAckThrowsWhenTheConnectionKeepsDeadlocking()
+    {
+        $deadlockException = $this->createDeadlockException();
+        $driverConnection = $this->createMock(\Doctrine\DBAL\Connection::class);
+        $driverConnection->expects($this->exactly(4))->method('delete')->willThrowException($deadlockException);
+
+        $receiver = new DoctrineReceiver(new Connection([], $driverConnection), $this->createSerializer());
+
+        try {
+            $receiver->ack(new Envelope(new \stdClass(), [new DoctrineReceivedStamp('1')]));
+            $this->fail('A TransportException should have been thrown.');
+        } catch (TransportException $e) {
+            $this->assertSame($deadlockException, $e->getPrevious());
+        }
+    }
+
+    public function testGetClosesALostConnectionBeforeThrowing()
+    {
+        $exception = $this->createConnectionLoss();
+        $connection = $this->createMock(Connection::class);
+        $connection->method('get')->willThrowException($exception);
+        $connection->expects($this->once())->method('closeIfDisconnected')->willReturn(true);
+
+        $receiver = new DoctrineReceiver($connection, $this->createSerializer());
+
+        try {
+            $receiver->get();
+            $this->fail('The lost connection must be reported.');
+        } catch (TransportException $e) {
+            $this->assertSame($exception, $e->getPrevious());
+        }
+    }
+
+    #[Group('time-sensitive')]
+    public function testAckIsReplayedOnceTheDatabaseIsBack()
+    {
+        ClockMock::withClockMock(1000000000.0);
+        $connection = $this->createMock(Connection::class);
+        $connection->expects($this->exactly(2))->method('ack')->with('1')->willReturnOnConsecutiveCalls(
+            $this->throwException(new TransportException('Connection lost', 0, $this->createConnectionLoss())),
+            true,
+        );
+        // Lost, still down after one second, back after two.
+        $connection->expects($this->exactly(3))->method('closeIfDisconnected')->willReturn(true, true, false);
+
+        $receiver = new DoctrineReceiver($connection, $this->createSerializer());
+        $receiver->ack(new Envelope(new \stdClass(), [new DoctrineReceivedStamp('1')]));
+
+        $this->assertSame(1000000002.0, microtime(true));
+    }
+
+    public function testAckIsReplayedWhenDbalAlreadyReopenedTheLostConnection()
+    {
+        $connection = $this->createMock(Connection::class);
+        $connection->expects($this->exactly(2))->method('ack')->with('1')->willReturnOnConsecutiveCalls(
+            $this->throwException(new TransportException('Connection lost', 0, $this->createDbalClosedConnectionLoss())),
+            true,
+        );
+        $connection->expects($this->once())->method('closeIfDisconnected')->willReturn(false);
+
+        $receiver = new DoctrineReceiver($connection, $this->createSerializer());
+        $receiver->ack(new Envelope(new \stdClass(), [new DoctrineReceivedStamp('1')]));
+    }
+
+    public function testAckIsNotReplayedOnAConnectionErrorWhenTheDatabaseStillAnswers()
+    {
+        $exception = new TransportException('Access denied', 0, $this->createAccessDenied());
+        $connection = $this->createMock(Connection::class);
+        $connection->expects($this->once())->method('ack')->willThrowException($exception);
+        $connection->method('closeIfDisconnected')->willReturn(false);
+
+        $receiver = new DoctrineReceiver($connection, $this->createSerializer());
+
+        try {
+            $receiver->ack(new Envelope(new \stdClass(), [new DoctrineReceivedStamp('1')]));
+            $this->fail('The acknowledgement failure must be surfaced.');
+        } catch (TransportException $e) {
+            $this->assertSame($exception, $e);
+        }
+    }
+
+    #[Group('time-sensitive')]
+    public function testAckThrowsWhenTheDatabaseDoesNotComeBack()
+    {
+        ClockMock::withClockMock(1000000000.0);
+        $exception = new TransportException('Connection lost', 0, $this->createConnectionLoss());
+        $connection = $this->createMock(Connection::class);
+        $connection->expects($this->once())->method('ack')->willThrowException($exception);
+        $connection->method('closeIfDisconnected')->willReturn(true);
+
+        $receiver = new DoctrineReceiver($connection, $this->createSerializer());
+
+        try {
+            $receiver->ack(new Envelope(new \stdClass(), [new DoctrineReceivedStamp('1')]));
+            $this->fail('The acknowledgement failure must be surfaced.');
+        } catch (TransportException $e) {
+            $this->assertSame($exception, $e);
+        }
+
+        $this->assertSame(1000000005.0, microtime(true));
+    }
+
+    #[Group('time-sensitive')]
+    public function testRejectIsReplayedOnceTheDatabaseIsBack()
+    {
+        ClockMock::withClockMock(1000000000.0);
+        $connection = $this->createMock(Connection::class);
+        $connection->expects($this->exactly(2))->method('reject')->with('1')->willReturnOnConsecutiveCalls(
+            $this->throwException(new TransportException('Connection lost', 0, $this->createConnectionLoss())),
+            true,
+        );
+        $connection->expects($this->exactly(2))->method('closeIfDisconnected')->willReturn(true, false);
+
+        $receiver = new DoctrineReceiver($connection, $this->createSerializer());
+        $receiver->reject(new Envelope(new \stdClass(), [new DoctrineReceivedStamp('1')]));
+    }
+
+    private function createConnectionLoss(): ConnectionException
+    {
+        return new ConnectionException(Exception::new(new \PDOException('SQLSTATE[08006] [7] connection to server failed: Connection refused')), null);
+    }
+
+    private function createDbalClosedConnectionLoss(): ConnectionLost
+    {
+        return new ConnectionLost(Exception::new(new \PDOException('SQLSTATE[HY000]: General error: 7 FATAL:  terminating connection due to administrator command')), null);
+    }
+
+    private function createAccessDenied(): ConnectionException
+    {
+        return new ConnectionException(Exception::new(new \PDOException("SQLSTATE[42000]: Syntax error or access violation: 1142 SELECT command denied to user 'app'@'localhost' for table 'messenger_messages'")), null);
+    }
+
     private function createDoctrineEnvelope(): array
     {
         return [
@@ -456,5 +663,17 @@ class DoctrineReceiverTest extends TestCase
         return new Serializer(
             new SerializerComponent\Serializer([new DateTimeNormalizer(), new ArrayDenormalizer(), new ObjectNormalizer()], ['json' => new JsonEncoder()])
         );
+    }
+
+    private function createDeadlockException(): DeadlockException
+    {
+        $driverException = class_exists(Exception::class) ? Exception::new(new \PDOException('Deadlock', 40001)) : new PDOException(new \PDOException('Deadlock', 40001));
+
+        if (!class_exists(Version::class)) {
+            // This is doctrine/dbal 3.x
+            return new DeadlockException($driverException, null);
+        }
+
+        return new DeadlockException('Deadlock', $driverException);
     }
 }

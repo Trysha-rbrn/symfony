@@ -40,7 +40,7 @@ class DataKeyStoreSchemaListenerTest extends TestCase
         $table = $event->getSchema()->getTable('key_management_data_keys');
 
         $this->assertSame(
-            ['id', 'scope', 'key_material', 'master_key_id', 'client'],
+            ['id', 'scope', 'key_material', 'master_key_id', 'client', 'binding'],
             array_map(static fn ($column) => $column->getObjectName()->toString(), $table->getColumns()),
         );
     }
@@ -84,7 +84,7 @@ class DataKeyStoreSchemaListenerTest extends TestCase
 
     private static function store(Connection $connection, string $table = DataKeyStore::DEFAULT_TABLE): DataKeyStore
     {
-        return new DataKeyStore($connection, new ServiceLocator([]), 'app', 'app-key', $table);
+        return new DataKeyStore($connection, new ServiceLocator([]), 'app', 'app-key', 'secret', $table);
     }
 
     private function event(Connection $connection, Schema $schema): GenerateSchemaEventArgs

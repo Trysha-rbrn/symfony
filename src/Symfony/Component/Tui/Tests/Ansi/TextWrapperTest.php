@@ -36,6 +36,10 @@ class TextWrapperTest extends TestCase
         yield 'empty string' => ['', 20, ['']];
         yield 'long line wraps at word boundary' => ['Hello World', 5, ['Hello', 'World']];
         yield 'newlines preserved' => ["Hello\nWorld", 20, ['Hello', 'World']];
+        yield 'CRLF line endings' => ["Hello\r\nWorld", 20, ['Hello', 'World']];
+        yield 'CR line endings' => ["Hello\rWorld\r", 20, ['Hello', 'World', '']];
+        yield 'mixed line endings' => ["a\r\nb\rc\nd", 20, ['a', 'b', 'c', 'd']];
+        yield 'CR line endings with invalid width' => ["Hello\r\nWorld", 0, ['Hello', 'World']];
         yield 'multiple spaces preserved' => ['Hello   World', 20, ['Hello   World']];
     }
 
@@ -228,6 +232,67 @@ class TextWrapperTest extends TestCase
         // "café " is 6 bytes (c=1, a=1, f=1, é=2, space=1)
         $this->assertSame(6, $chunks[1]['start_index']);
         $this->assertSame('world', $chunks[1]['text']);
+    }
+
+    /**
+     * @param list<array{text: string, start_index: int, end_index: int}> $expected
+     */
+    #[DataProvider('chunksWrapAtASpaceBeforeAWideCharacterProvider')]
+    public function testChunksWrapAtASpaceBeforeAWideCharacter(string $input, int $width, array $expected)
+    {
+        $this->assertSame($expected, TextWrapper::wrapLineIntoChunks($input, $width));
+    }
+
+    /**
+     * @return iterable<string, array{string, int, list<array{text: string, start_index: int, end_index: int}>}>
+     */
+    public static function chunksWrapAtASpaceBeforeAWideCharacterProvider(): iterable
+    {
+        yield 'word after a leading space' => [' aＡ', 2, [
+            ['text' => ' ', 'start_index' => 0, 'end_index' => 1],
+            ['text' => 'a', 'start_index' => 1, 'end_index' => 2],
+            ['text' => 'Ａ', 'start_index' => 2, 'end_index' => 5],
+        ]];
+        yield 'word after a word that fills the width' => ['abcd efgＡ', 4, [
+            ['text' => 'abcd', 'start_index' => 0, 'end_index' => 4],
+            ['text' => ' ', 'start_index' => 4, 'end_index' => 5],
+            ['text' => 'efg', 'start_index' => 5, 'end_index' => 8],
+            ['text' => 'Ａ', 'start_index' => 8, 'end_index' => 11],
+        ]];
+        yield 'word that fits the width once wrapped' => ['a bcＡ', 4, [
+            ['text' => 'a ', 'start_index' => 0, 'end_index' => 2],
+            ['text' => 'bcＡ', 'start_index' => 2, 'end_index' => 7],
+        ]];
+        yield 'character wider than the width' => [' Ａ', 1, [
+            ['text' => ' ', 'start_index' => 0, 'end_index' => 1],
+            ['text' => 'Ａ', 'start_index' => 1, 'end_index' => 4],
+        ]];
+    }
+
+    /**
+     * @param list<string> $expected
+     */
+    #[DataProvider('cjkProvider')]
+    public function testCjkTextBreaksBetweenCharacters(string $input, int $width, array $expected)
+    {
+        $this->assertSame($expected, TextWrapper::wrapTextWithAnsi($input, $width));
+        $this->assertSame($expected, array_map(static fn (array $chunk): string => rtrim($chunk['text']), TextWrapper::wrapLineIntoChunks($input, $width)));
+    }
+
+    /**
+     * @return iterable<string, array{string, int, list<string>}>
+     */
+    public static function cjkProvider(): iterable
+    {
+        yield 'CJK after a word' => ['This is 中文汉字测试', 12, ['This is 中文', '汉字测试']];
+        yield 'word after CJK' => ['中文汉字ab', 9, ['中文汉字', 'ab']];
+        yield 'kana' => ['ひらがなカタカナ', 10, ['ひらがなカ', 'タカナ']];
+        yield 'CJK punctuation' => ['中文、汉字。测试', 8, ['中文、汉', '字。测试']];
+    }
+
+    public function testCjkTextKeepsItsStyleAcrossBreaks()
+    {
+        $this->assertSame(["This is \x1b[31m中文", "\x1b[31m汉字\x1b[39m"], TextWrapper::wrapTextWithAnsi("This is \x1b[31m中文汉字\x1b[39m", 12));
     }
 
     // --- Tab as word-wrap boundary tests ---

@@ -110,10 +110,20 @@ class AuthenticatedVoterTest extends TestCase
     public function testUnsupportedOfflineToken(string $attribute)
     {
         $voter = new AuthenticatedVoter(new AuthenticationTrustResolver());
+        $token = $this->getToken('offline');
+        $token->setUser(new InMemoryUser('wouter', '', ['ROLE_USER']));
 
         $this->expectException(InvalidArgumentException::class);
 
-        $voter->vote($this->getToken('offline'), null, [$attribute]);
+        $voter->vote($token, null, [$attribute]);
+    }
+
+    #[DataProvider('provideUnsupportedOfflineAttributes')]
+    public function testAGuestIsNotAuthenticated(string $attribute)
+    {
+        $voter = new AuthenticatedVoter(new AuthenticationTrustResolver());
+
+        $this->assertSame(VoterInterface::ACCESS_DENIED, $voter->vote($this->getToken('offline'), null, [$attribute]));
     }
 
     public static function provideUnsupportedOfflineAttributes()
@@ -229,6 +239,35 @@ class AuthenticatedVoterTest extends TestCase
         $voter = new AuthenticatedVoter(new AuthenticationTrustResolver(900, 60));
 
         $this->assertSame(VoterInterface::ACCESS_DENIED, $voter->vote($token, null, ['IS_AUTHENTICATED_VERY_RECENTLY']));
+    }
+
+    #[DataProvider('provideDenialsAReAuthenticationCanCure')]
+    public function testADenialSaysWhetherAReAuthenticationCanCureIt(string $authenticated, string $attribute, ?string $curedAttribute)
+    {
+        $voter = new AuthenticatedVoter(new AuthenticationTrustResolver(900, 60));
+
+        $this->assertSame(VoterInterface::ACCESS_DENIED, $voter->vote($this->getToken($authenticated), null, [$attribute], $vote = new Vote()));
+        $this->assertSame($curedAttribute, $vote->reAuthenticationAttribute);
+    }
+
+    public static function provideDenialsAReAuthenticationCanCure()
+    {
+        yield 'recently' => ['fully', AuthenticatedVoter::IS_AUTHENTICATED_RECENTLY, AuthenticatedVoter::IS_AUTHENTICATED_RECENTLY];
+        yield 'very recently' => ['fully', AuthenticatedVoter::IS_AUTHENTICATED_VERY_RECENTLY, AuthenticatedVoter::IS_AUTHENTICATED_VERY_RECENTLY];
+        yield 'fully when remembered' => ['remembered', AuthenticatedVoter::IS_AUTHENTICATED_FULLY, AuthenticatedVoter::IS_AUTHENTICATED_FULLY];
+        yield 'fully when anonymous' => ['none', AuthenticatedVoter::IS_AUTHENTICATED_FULLY, null];
+        yield 'fully when a guest' => ['offline', AuthenticatedVoter::IS_AUTHENTICATED_FULLY, null];
+        yield 'remembered when anonymous' => ['none', AuthenticatedVoter::IS_AUTHENTICATED_REMEMBERED, null];
+        yield 'impersonator' => ['fully', AuthenticatedVoter::IS_IMPERSONATOR, null];
+    }
+
+    public function testAGrantSaysNothingAboutReAuthentication()
+    {
+        $token = $this->getToken('fully');
+        $token->setAuthenticationProofs([AuthenticationMethod::UNSPECIFIED => time()]);
+
+        $this->assertSame(VoterInterface::ACCESS_GRANTED, (new AuthenticatedVoter(new AuthenticationTrustResolver(900)))->vote($token, null, [AuthenticatedVoter::IS_AUTHENTICATED_RECENTLY], $vote = new Vote()));
+        $this->assertNull($vote->reAuthenticationAttribute);
     }
 
     public function testVeryRecentlyAuthenticatedVoteReasons()

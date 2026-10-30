@@ -68,6 +68,43 @@ class TokenBucketLimiterTest extends TestCase
         $this->assertFalse($limiter2->consume()->isAccepted());
     }
 
+    public function testChangedRateIsAppliedToStoredBucket()
+    {
+        $this->createLimiter(100, Rate::perMinute(20))->consume(100);
+        sleep(60);
+
+        $this->assertSame(1, $this->createLimiter(100, Rate::perMinute(1))->consume(0)->getRemainingTokens());
+    }
+
+    public function testIncreasedBurstSizeIsAppliedToStoredBucket()
+    {
+        $this->createLimiter(10, Rate::perSecond(1))->consume();
+        sleep(5);
+
+        $this->assertSame(14, $this->createLimiter(20, Rate::perSecond(1))->consume(0)->getRemainingTokens());
+    }
+
+    public function testChangedConfigurationPreservesReservationDebt()
+    {
+        $limiter = $this->createLimiter(10, Rate::perMinute(10));
+        $limiter->consume(10);
+        $limiter->reserve(10);
+
+        $limiter = $this->createLimiter(10, Rate::perMinute(1));
+
+        $this->assertEquals(660, $limiter->reserve()->getWaitDuration());
+    }
+
+    public function testRaisingBurstSizeBackDoesNotRefillStoredBucket()
+    {
+        $this->createLimiter(100, Rate::perMinute(10))->consume(100);
+        sleep(60);
+        $this->createLimiter(10, Rate::perMinute(10))->consume(10);
+        sleep(61);
+
+        $this->assertSame(10, $this->createLimiter(100, Rate::perMinute(10))->consume(0)->getRemainingTokens());
+    }
+
     public function testReserveMaxWaitingTime()
     {
         $limiter = $this->createLimiter(10, Rate::perMinute());
@@ -100,7 +137,8 @@ class TokenBucketLimiterTest extends TestCase
 
         $rateLimit = $limiter->consume(5);
         $this->assertEquals(0, $rateLimit->getRemainingTokens());
-        $this->assertEqualsWithDelta(time(), $rateLimit->getRetryAfter()->getTimestamp(), 1);
+        $this->assertGreaterThanOrEqual(microtime(true) + 1, $rateLimit->getRetryAfter()->getTimestamp());
+        $this->assertLessThan(microtime(true) + 2, $rateLimit->getRetryAfter()->getTimestamp());
         $this->assertSame(10, $rateLimit->getLimit());
     }
 
@@ -128,6 +166,18 @@ class TokenBucketLimiterTest extends TestCase
         $this->assertSame(3, $rateLimit->getRemainingTokens());
         // 7 of 10 tokens are missing, so the bucket is full again in 7s -- not 10
         $this->assertEqualsWithDelta(time() + 7, $rateLimit->getResetAt()->getTimestamp(), 1);
+    }
+
+    public function testResetTimeIsNotBeforeTheBucketIsFull()
+    {
+        ClockMock::withClockMock(1729990780.75);
+        $limiter = $this->createLimiter(10, Rate::perSecond(1));
+        $limiter->consume(5);
+
+        $resetAt = $limiter->consume(0)->getResetAt();
+
+        ClockMock::withClockMock((float) $resetAt->getTimestamp());
+        $this->assertSame(10, $limiter->consume(0)->getRemainingTokens());
     }
 
     public function testConsumeLastToken()
@@ -208,7 +258,7 @@ class TokenBucketLimiterTest extends TestCase
             $this->assertTrue($rateLimit->isAccepted());
             $this->assertSame(10, $rateLimit->getLimit());
             $this->assertEquals(
-                \DateTimeImmutable::createFromFormat('U', (string) floor(microtime(true))),
+                \DateTimeImmutable::createFromTimestamp(floor(microtime(true))),
                 $rateLimit->getRetryAfter()
             );
         }
@@ -218,10 +268,8 @@ class TokenBucketLimiterTest extends TestCase
         $rateLimit = $limiter->consume(0);
         $this->assertEquals(0, $rateLimit->getRemainingTokens());
         $this->assertTrue($rateLimit->isAccepted());
-        $this->assertEquals(
-            \DateTimeImmutable::createFromFormat('U', (string) floor(microtime(true) + 1)),
-            $rateLimit->getRetryAfter()
-        );
+        $this->assertGreaterThanOrEqual(microtime(true) + 1, $rateLimit->getRetryAfter()->getTimestamp());
+        $this->assertLessThan(microtime(true) + 2, $rateLimit->getRetryAfter()->getTimestamp());
     }
 
     public function testNegativeConsume()
@@ -301,6 +349,33 @@ class TokenBucketLimiterTest extends TestCase
         $rateLimit = $limiter->consume(1);
 
         $this->assertSame(TokenBucket::MAX_BURST_SIZE - 2, $rateLimit->getRemainingTokens());
+    }
+
+    public function testRetryAfterIsNotBeforeTheNextTokenIsAvailable()
+    {
+        ClockMock::withClockMock(1729990780.75);
+        $limiter = $this->createLimiter(10, Rate::perSecond(1));
+        $limiter->consume(10);
+
+        $rateLimit = $limiter->consume();
+        $this->assertFalse($rateLimit->isAccepted());
+
+        $rateLimit->wait();
+        $this->assertTrue($limiter->consume()->isAccepted());
+    }
+
+    public function testPeekConsumeWhenReservationsExceedTheLimit()
+    {
+        ClockMock::withClockMock(1729990780.75);
+        $limiter = $this->createLimiter(10, Rate::perMinute(1));
+        $limiter->consume(10);
+        $limiter->reserve(2);
+
+        $rateLimit = $limiter->consume(0);
+        $this->assertSame(-2, $rateLimit->getRemainingTokens());
+
+        $rateLimit->wait();
+        $this->assertTrue($limiter->consume()->isAccepted());
     }
 
     private function createLimiter($initialTokens = 10, ?Rate $rate = null)

@@ -12,6 +12,7 @@
 namespace Symfony\Component\Form\Tests\DependencyInjection;
 
 use PHPUnit\Framework\TestCase;
+use Symfony\Component\Clock\DatePoint;
 use Symfony\Component\DependencyInjection\Argument\IteratorArgument;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Reference;
@@ -21,14 +22,19 @@ use Symfony\Component\Form\Attribute\FormField;
 use Symfony\Component\Form\DependencyInjection\FormPass;
 use Symfony\Component\Form\Exception\InvalidArgumentException;
 use Symfony\Component\Form\Extension\Core\Type\ChoiceType;
+use Symfony\Component\Form\Extension\Core\Type\DateTimeType;
+use Symfony\Component\Form\Extension\Core\Type\IntegerType;
 use Symfony\Component\Form\Extension\DependencyInjection\DependencyInjectionExtension;
 use Symfony\Component\Form\FormBuilderInterface;
 use Symfony\Component\Form\FormFactoryInterface;
 use Symfony\Component\Form\Forms;
 use Symfony\Component\Form\Tests\Fixtures\AsFormType\AdminData;
 use Symfony\Component\Form\Tests\Fixtures\AsFormType\CarData;
+use Symfony\Component\Form\Tests\Fixtures\AsFormType\KeynoteSpeakerData;
+use Symfony\Component\Form\Tests\Fixtures\AsFormType\SpeakerData;
 use Symfony\Component\Form\Tests\Fixtures\AsFormType\UserData;
 use Symfony\Component\Form\Tests\Fixtures\AsFormType\VehicleData;
+use Symfony\Component\Form\TypeInfoFormTypeGuesser;
 
 class DataClassFormIntegrationTest extends TestCase
 {
@@ -85,6 +91,38 @@ class DataClassFormIntegrationTest extends TestCase
         $blockPrefixes = $form->createView()->vars['block_prefixes'];
         $this->assertContains('car_data', $blockPrefixes);
         $this->assertContains('vehicle_data', $blockPrefixes);
+    }
+
+    public function testFieldsAreReadFromParentClassesWithoutAsFormType()
+    {
+        $factory = $this->createFormFactory(static function (ContainerBuilder $container) {
+            $container->register(SpeakerData::class, SpeakerData::class)->addResourceTag('form.data_class');
+            $container->register(KeynoteSpeakerData::class, KeynoteSpeakerData::class)->addResourceTag('form.data_class');
+        });
+
+        $speaker = new KeynoteSpeakerData();
+        $form = $factory->create(KeynoteSpeakerData::class, $speaker);
+
+        $this->assertSame(['email', 'phoneNumber', 'city', 'name', 'company', 'bio', 'talk'], array_keys($form->all()));
+        $this->assertSame('Organization', $form->get('company')->getConfig()->getOption('label'));
+
+        $form->submit([
+            'email' => 'ada@example.com',
+            'phoneNumber' => '555',
+            'city' => 'London',
+            'name' => 'Ada',
+            'company' => 'Analytical',
+            'bio' => 'Hi',
+            'talk' => 'Engines',
+        ]);
+
+        $this->assertTrue($form->isSynchronized());
+        $this->assertSame('ada@example.com', $speaker->email);
+        $this->assertSame('555', $speaker->getPhone());
+        $this->assertSame('London', $speaker->city);
+        $this->assertSame('Ada', $speaker->name);
+        $this->assertSame('Analytical', $speaker->company);
+        $this->assertSame('Engines', $speaker->talk);
     }
 
     public function testTypeExtensionsApplyToDataClassTypes()
@@ -154,6 +192,31 @@ class DataClassFormIntegrationTest extends TestCase
         $this->assertTrue($form->isSynchronized());
         $this->assertSame('', $data->internalName);
         $this->assertNull($data->internalNickname);
+    }
+
+    public function testFieldTypesAreGuessedFromTheDeclaredTypesOfTheProperties()
+    {
+        $factory = $this->createFormFactory(static function (ContainerBuilder $container) {
+            $container->register('form.type_guesser.type_info', TypeInfoFormTypeGuesser::class)->addTag('form.type_guesser');
+            $container->register(TypedFieldsData::class, TypedFieldsData::class)->addResourceTag('form.data_class');
+        });
+
+        $data = new TypedFieldsData();
+        $form = $factory->create(TypedFieldsData::class, $data);
+
+        $this->assertInstanceOf(IntegerType::class, $form->get('minutes')->getConfig()->getType()->getInnerType());
+        $this->assertFalse($form->get('minutes')->isRequired());
+        $this->assertInstanceOf(IntegerType::class, $form->get('publicAge')->getConfig()->getType()->getInnerType());
+        $this->assertFalse($form->get('publicAge')->isRequired());
+        $this->assertInstanceOf(DateTimeType::class, $form->get('startsAt')->getConfig()->getType()->getInnerType());
+
+        $form->submit(['minutes' => '90', 'publicAge' => '42', 'startsAt' => '2026-10-10T18:30']);
+
+        $this->assertTrue($form->isSynchronized());
+        $this->assertSame(90, $data->minutes);
+        $this->assertSame(42, $data->internalAge);
+        $this->assertInstanceOf(DatePoint::class, $data->startsAt);
+        $this->assertSame('2026-10-10 18:30', $data->startsAt->format('Y-m-d H:i'));
     }
 
     public function testUndiscoveredDataClassGetsADedicatedError()
@@ -257,4 +320,17 @@ class RenamedFieldData
 
     #[FormField(name: 'publicNickname')]
     public ?string $internalNickname = 'bar';
+}
+
+#[AsFormType]
+class TypedFieldsData
+{
+    #[FormField]
+    public ?int $minutes = null;
+
+    #[FormField(name: 'publicAge')]
+    public ?int $internalAge = null;
+
+    #[FormField]
+    public ?DatePoint $startsAt = null;
 }

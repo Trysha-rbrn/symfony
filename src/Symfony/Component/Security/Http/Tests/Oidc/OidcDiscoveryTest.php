@@ -51,6 +51,82 @@ class OidcDiscoveryTest extends TestCase
         $this->assertSame(1, $requests);
     }
 
+    public function testGetIssuerReturnsTheAnnouncedIssuer()
+    {
+        $discovery = new OidcDiscovery(new MockHttpClient(new JsonMockResponse(self::CONFIGURATION)), new ArrayAdapter(), self::URL, self::ISSUER);
+
+        $issuer = $discovery->getIssuer();
+
+        $this->assertSame(self::ISSUER, $issuer);
+    }
+
+    /**
+     * The announced spelling and not the configured one.
+     *
+     * A trailing slash is ignored when the two are compared, so an assertion naming the
+     * configured issuer would not be the audience a provider announcing the other spelling
+     * verifies against.
+     */
+    public function testGetIssuerKeepsTheTrailingSlashTheProviderAnnounces()
+    {
+        $discovery = new OidcDiscovery(new MockHttpClient(new JsonMockResponse(['issuer' => self::ISSUER.'/'])), new ArrayAdapter(), self::URL, self::ISSUER);
+
+        $issuer = $discovery->getIssuer();
+
+        $this->assertSame(self::ISSUER.'/', $issuer);
+    }
+
+    public function testAnEmptyConfigurationUrlFallsBackToTheWellKnownPath()
+    {
+        $requested = null;
+        $httpClient = new MockHttpClient(static function (string $method, string $url) use (&$requested): MockResponse {
+            $requested = $url;
+
+            return new JsonMockResponse(self::CONFIGURATION);
+        });
+
+        (new OidcDiscovery($httpClient, new ArrayAdapter(), '', self::ISSUER))->getConfiguration();
+
+        $this->assertSame(self::URL, $requested);
+    }
+
+    public function testAZeroConfigurationUrlRemainsRelativeToTheIssuer()
+    {
+        $requested = null;
+        $httpClient = new MockHttpClient(static function (string $method, string $url) use (&$requested): MockResponse {
+            $requested = $url;
+
+            return new JsonMockResponse(self::CONFIGURATION);
+        });
+
+        (new OidcDiscovery($httpClient, new ArrayAdapter(), '0', self::ISSUER))->getConfiguration();
+
+        $this->assertSame(self::ISSUER.'/0', $requested);
+    }
+
+    public function testGetIssuerRequiresAnExpectedIssuer()
+    {
+        $discovery = new OidcDiscovery(new MockHttpClient(new JsonMockResponse(self::CONFIGURATION)), new ArrayAdapter(), self::URL);
+
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage('The issuer announced at "https://provider.example.com/.well-known/openid-configuration" cannot be trusted since no expected issuer was given to check it against: pass one to the constructor of "Symfony\Component\Security\Http\Oidc\OidcDiscovery".');
+
+        $discovery->getIssuer();
+    }
+
+    public function testGetIssuerRejectsACachedDocumentAnnouncingNone()
+    {
+        $cache = $this->createStub(CacheInterface::class);
+        $cache->method('get')->willReturn(['url' => self::URL, 'payload' => '{"token_endpoint":"https://provider.example.com/token"}']);
+
+        $discovery = new OidcDiscovery($this->createStub(HttpClientInterface::class), $cache, self::URL, self::ISSUER);
+
+        $this->expectException(AuthenticationException::class);
+        $this->expectExceptionMessage('does not match the configured issuer');
+
+        $discovery->getIssuer();
+    }
+
     public function testGetConfigurationRejectsIssuerMismatch()
     {
         $httpClient = new MockHttpClient(new JsonMockResponse(['issuer' => 'https://attacker.example.com']));
@@ -61,6 +137,126 @@ class OidcDiscoveryTest extends TestCase
         $this->expectExceptionMessage('does not match the configured issuer');
 
         $discovery->getConfiguration();
+    }
+
+    public function testGetConfigurationRejectsAnIssuerThatIsNotAString()
+    {
+        $httpClient = new MockHttpClient(new JsonMockResponse(['issuer' => [self::ISSUER]] + self::CONFIGURATION));
+
+        $discovery = new OidcDiscovery($httpClient, new ArrayAdapter(), self::URL, self::ISSUER);
+
+        $this->expectException(AuthenticationException::class);
+        $this->expectExceptionMessage('The OIDC provider announced the issuer "", which does not match the configured issuer "https://provider.example.com".');
+
+        $discovery->getConfiguration();
+    }
+
+    #[DataProvider('provideSharedCacheKeys')]
+    public function testGetConfigurationRejectsACachedDocumentForAnotherIssuer(?string $cacheKey)
+    {
+        $cache = new ArrayAdapter();
+        $httpClient = new MockHttpClient(new JsonMockResponse(self::CONFIGURATION));
+        $discovery = new OidcDiscovery($httpClient, $cache, self::URL, self::ISSUER, 3600, $cacheKey);
+        $this->assertSame(self::ISSUER, $discovery->getIssuer());
+
+        $discovery = new OidcDiscovery($httpClient, $cache, self::URL, 'https://other.example.com', 3600, $cacheKey);
+
+        $this->expectException(AuthenticationException::class);
+        $this->expectExceptionMessage('does not match the configured issuer');
+
+        try {
+            $discovery->getIssuer();
+        } finally {
+            $this->assertSame(1, $httpClient->getRequestsCount());
+        }
+    }
+
+    public static function provideSharedCacheKeys(): iterable
+    {
+        yield 'URL-derived key' => [null];
+        yield 'explicit key' => ['shared.discovery'];
+    }
+
+    public function testGetConfigurationDoesNotCacheADocumentForAnotherIssuer()
+    {
+        $cache = new ArrayAdapter();
+        $httpClient = new MockHttpClient([
+            new JsonMockResponse(['issuer' => 'https://other.example.com']),
+            new JsonMockResponse(self::CONFIGURATION),
+        ]);
+        $discovery = new OidcDiscovery($httpClient, $cache, self::URL, self::ISSUER);
+
+        try {
+            $discovery->getConfiguration();
+            $this->fail('The issuer mismatch must be rejected.');
+        } catch (AuthenticationException $e) {
+            $this->assertStringContainsString('does not match the configured issuer', $e->getMessage());
+        }
+
+        $this->assertSame(self::CONFIGURATION, $discovery->getConfiguration());
+        $this->assertSame(2, $httpClient->getRequestsCount());
+    }
+
+    #[DataProvider('provideDiscoveryOperations')]
+    public function testDiscoveryRejectsAnInsecureConfigurationUrlBeforeSendingARequest(string $operation)
+    {
+        $httpClient = new MockHttpClient(new JsonMockResponse(self::CONFIGURATION));
+        $discovery = new OidcDiscovery($httpClient, new ArrayAdapter(), 'http://provider.internal/config', self::ISSUER);
+
+        $this->expectException(AuthenticationException::class);
+        $this->expectExceptionMessage('The OIDC discovery URL "http://provider.internal/config" must use HTTPS');
+
+        try {
+            $discovery->$operation();
+        } finally {
+            $this->assertSame(0, $httpClient->getRequestsCount());
+        }
+    }
+
+    public static function provideDiscoveryOperations(): iterable
+    {
+        yield 'configuration' => ['getConfiguration'];
+        yield 'prefetch' => ['prefetch'];
+    }
+
+    public function testGetConfigurationRejectsAnInsecureConfigurationUrlEvenWhenCached()
+    {
+        $cache = new ArrayAdapter();
+        $httpClient = new MockHttpClient(new JsonMockResponse(self::CONFIGURATION));
+        $url = 'http://provider.internal/config';
+        (new OidcDiscovery($httpClient, $cache, $url))->getConfiguration();
+        $discovery = new OidcDiscovery($httpClient, $cache, $url, self::ISSUER);
+
+        $this->expectException(AuthenticationException::class);
+        $this->expectExceptionMessage('must use HTTPS');
+
+        try {
+            $discovery->getConfiguration();
+        } finally {
+            $this->assertSame(1, $httpClient->getRequestsCount());
+        }
+    }
+
+    #[DataProvider('provideStandaloneBaseUris')]
+    public function testGetConfigurationKeepsRelativeUrlsForAStandaloneHttpClient(string $baseUri)
+    {
+        $requested = null;
+        $httpClient = new MockHttpClient(static function (string $method, string $url) use (&$requested): JsonMockResponse {
+            $requested = $url;
+
+            return new JsonMockResponse(self::CONFIGURATION);
+        }, $baseUri);
+        $discovery = new OidcDiscovery($httpClient, new ArrayAdapter(), 'config');
+
+        $this->assertSame(self::CONFIGURATION, $discovery->getConfiguration());
+        $this->assertSame($baseUri.'config', $requested);
+        $this->assertSame(1, $httpClient->getRequestsCount());
+    }
+
+    public static function provideStandaloneBaseUris(): iterable
+    {
+        yield 'HTTPS' => ['https://metadata.example.com/'];
+        yield 'HTTP' => ['http://metadata.example.com/'];
     }
 
     public function testGetConfigurationAcceptsAnAnnouncedIssuerWithATrailingSlash()
@@ -252,6 +448,84 @@ class OidcDiscoveryTest extends TestCase
         $this->expectExceptionMessage('must use HTTPS');
 
         $discovery->getSecureEndpoint('token_endpoint');
+    }
+
+    public function testGetSecureEndpointNeverReturnsTheMtlsAlias()
+    {
+        $httpClient = new MockHttpClient(new JsonMockResponse(self::CONFIGURATION + ['mtls_endpoint_aliases' => ['token_endpoint' => 'https://mtls.provider.example.com/token']]));
+
+        $discovery = new OidcDiscovery($httpClient, new ArrayAdapter(), self::URL, self::ISSUER);
+
+        $this->assertSame('https://provider.example.com/token', $discovery->getSecureEndpoint('token_endpoint'));
+    }
+
+    #[DataProvider('provideUnusableAliases')]
+    public function testAnUnusableAliasOfARequestedEndpointIsRefusedBeforeTheDocumentIsCached(mixed $alias, string $expectedMessage)
+    {
+        $httpClient = new MockHttpClient([
+            new JsonMockResponse(self::CONFIGURATION + ['mtls_endpoint_aliases' => ['token_endpoint' => $alias]]),
+            new JsonMockResponse(self::CONFIGURATION + ['mtls_endpoint_aliases' => ['token_endpoint' => 'https://mtls.provider.example.com/token']]),
+        ]);
+
+        $discovery = new OidcDiscovery($httpClient, new ArrayAdapter(), self::URL, self::ISSUER, 3600, null, ['token_endpoint'], ['token_endpoint']);
+
+        try {
+            $discovery->getConfiguration();
+            $this->fail('The discovery document should have been refused.');
+        } catch (AuthenticationException $e) {
+            $this->assertSame($expectedMessage, $e->getMessage());
+        }
+
+        $this->assertSame('https://mtls.provider.example.com/token', $discovery->getConfiguration()['mtls_endpoint_aliases']['token_endpoint']);
+        $this->assertSame(2, $httpClient->getRequestsCount());
+    }
+
+    public static function provideUnusableAliases(): iterable
+    {
+        yield 'plain HTTP' => ['http://127.0.0.1:8443/token', 'The "mtls_endpoint_aliases.token_endpoint" found in the OIDC discovery document must use the "https" scheme, "http" given.'];
+        yield 'empty' => ['', 'The "mtls_endpoint_aliases.token_endpoint" is missing from the OIDC discovery document.'];
+        yield 'not a URL' => [null, 'The "mtls_endpoint_aliases.token_endpoint" is missing from the OIDC discovery document.'];
+    }
+
+    public function testAnUnusableAliasOfAnEndpointThisClientDoesNotRequestIsIgnored()
+    {
+        $httpClient = new MockHttpClient(new JsonMockResponse(self::CONFIGURATION + [
+            'mtls_endpoint_aliases' => [
+                'authorization_endpoint' => 'http://mtls.provider.example.com/authorize',
+                'token_endpoint' => 'https://mtls.provider.example.com/token',
+            ],
+        ]));
+
+        $discovery = new OidcDiscovery($httpClient, new ArrayAdapter(), self::URL, self::ISSUER, 3600, null, ['authorization_endpoint', 'token_endpoint'], ['token_endpoint']);
+
+        $this->assertSame('https://provider.example.com/authorize', $discovery->getSecureEndpoint('authorization_endpoint'));
+    }
+
+    public function testNoAliasIsCheckedWhenNoneIsRequested()
+    {
+        $httpClient = new MockHttpClient(new JsonMockResponse(self::CONFIGURATION + ['mtls_endpoint_aliases' => ['token_endpoint' => 'http://mtls.provider.example.com/token']]));
+
+        $discovery = new OidcDiscovery($httpClient, new ArrayAdapter(), self::URL, self::ISSUER, 3600, null, ['authorization_endpoint', 'token_endpoint']);
+
+        $this->assertSame('https://provider.example.com/token', $discovery->getSecureEndpoint('token_endpoint'));
+    }
+
+    public function testADocumentAnnouncingNoAliasIsAcceptedWhenAliasesAreChecked()
+    {
+        $httpClient = new MockHttpClient(new JsonMockResponse(self::CONFIGURATION));
+
+        $discovery = new OidcDiscovery($httpClient, new ArrayAdapter(), self::URL, self::ISSUER, 3600, null, ['token_endpoint'], ['token_endpoint']);
+
+        $this->assertSame('https://provider.example.com/token', $discovery->getSecureEndpoint('token_endpoint'));
+    }
+
+    public function testMtlsEndpointAliasesThatAreNotAnObjectAreIgnored()
+    {
+        $httpClient = new MockHttpClient(new JsonMockResponse(self::CONFIGURATION + ['mtls_endpoint_aliases' => 'https://mtls.provider.example.com']));
+
+        $discovery = new OidcDiscovery($httpClient, new ArrayAdapter(), self::URL, self::ISSUER, 3600, null, ['token_endpoint'], ['token_endpoint']);
+
+        $this->assertSame('https://provider.example.com/token', $discovery->getSecureEndpoint('token_endpoint'));
     }
 
     public function testGetSecureEndpointAllowsALoopbackAuthorizationEndpoint()

@@ -13,7 +13,6 @@ namespace Symfony\Component\Webhook;
 
 use Symfony\Component\Config\Definition\Configurator\DefinitionConfigurator;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
-use Symfony\Component\DependencyInjection\Exception\LogicException;
 use Symfony\Component\DependencyInjection\Kernel\AbstractBundle;
 use Symfony\Component\DependencyInjection\Kernel\RequiredBundle;
 use Symfony\Component\DependencyInjection\Kernel\ServicesBundle;
@@ -22,6 +21,7 @@ use Symfony\Component\DependencyInjection\Reference;
 use Symfony\Component\HttpClient\NoPrivateNetworkHttpClient;
 use Symfony\Component\Messenger\MessengerBundle;
 use Symfony\Component\RemoteEvent\RemoteEventBundle;
+use Symfony\Component\Webhook\Client\RequestParserInterface;
 use Symfony\Component\Webhook\DependencyInjection\RemoveMissingDependenciesPass;
 use Symfony\Component\Webhook\Server\SignatureFormat;
 
@@ -88,7 +88,8 @@ class WebhookBundle extends AbstractBundle
                     ->prototype('array')
                         ->children()
                         ->scalarNode('service')
-                            ->isRequired()
+                            ->info('The id of the request parser service for this type of webhook; defaults to the generic parser of the component, which checks the signature scheme set in "signature_format".')
+                            ->defaultValue('webhook.request_parser')
                             ->cannotBeEmpty()
                         ->end()
                         ->scalarNode('secret')
@@ -108,13 +109,19 @@ class WebhookBundle extends AbstractBundle
         }
 
         $configurator->import('Resources/config/webhook.php');
+        $container->registerAliasForArgument('webhook.request_parser', RequestParserInterface::class, 'webhook.request_parser', 'webhook');
 
         $parsers = [];
+        $secrets = [];
         foreach ($config['routing'] as $type => $cfg) {
             $parsers[$type] = [
                 'parser' => new Reference($cfg['service']),
                 'secret' => $cfg['secret'],
             ];
+
+            if ('webhook.request_parser' === $cfg['service']) {
+                $secrets[$type] = $cfg['secret'];
+            }
         }
 
         $controller = $container->getDefinition('webhook.controller');
@@ -148,20 +155,32 @@ class WebhookBundle extends AbstractBundle
             ->replaceArgument(5, $signatureFormat)
             ->replaceArgument(6, $config['timestamp_tolerance']);
 
+        $container->getDefinition('webhook.test.request_factory')
+            ->replaceArgument(0, $secrets)
+            ->replaceArgument(1, $config['signing_algorithm'])
+            ->replaceArgument(2, $config['signature_header_name'])
+            ->replaceArgument(3, $config['event_header_name'])
+            ->replaceArgument(4, $config['id_header_name'])
+            ->replaceArgument(5, $config['timestamp_header_name'])
+            ->replaceArgument(6, $signatureFormat);
+
         $clientId = $config['http_client'];
 
         if ($config['no_private_network']['enabled']) {
-            if (!class_exists(NoPrivateNetworkHttpClient::class)) {
-                throw new LogicException('Configuring "webhook.no_private_network" requires the HttpClient component. Try running "composer require symfony/http-client".');
-            }
-
-            $container->register('webhook.http_client', NoPrivateNetworkHttpClient::class)
+            $httpClient = $container->register('webhook.http_client', NoPrivateNetworkHttpClient::class)
                 ->setArguments([
                     new Reference($clientId),
                     $config['no_private_network']['subnets'],
                     $config['no_private_network']['allow_list'],
                 ])
                 ->addTag('kernel.reset', ['method' => 'reset']);
+
+            // Fail when sending only, so that apps that only receive webhooks don't need the HttpClient component
+            if (!class_exists(NoPrivateNetworkHttpClient::class)) {
+                $httpClient
+                    ->addError('Configuring "webhook.no_private_network" requires the HttpClient component. Try running "composer require symfony/http-client".')
+                    ->addTag('container.error');
+            }
 
             $clientId = 'webhook.http_client';
         }

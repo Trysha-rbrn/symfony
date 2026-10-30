@@ -51,6 +51,9 @@ class KeyParserTest extends TestCase
         yield 'digit 1' => ['1', '1'];
         yield 'digit 9' => ['9', '9'];
         yield 'alt+1 legacy' => ["\x1b1", 'alt+1'];
+        yield 'alt+. legacy' => ["\x1b.", 'alt+.'];
+        yield 'alt+, legacy' => ["\x1b,", 'alt+,'];
+        yield 'alt++ legacy' => ["\x1b+", 'alt++'];
     }
 
     #[DataProvider('matchesKeyProvider')]
@@ -101,6 +104,10 @@ class KeyParserTest extends TestCase
         yield 'digit 9' => ['9', '9'];
         yield 'alt+1 legacy' => ["\x1b1", 'alt+1'];
         yield 'alt+9 legacy' => ["\x1b9", 'alt+9'];
+        yield 'alt+. legacy' => ["\x1b.", 'alt+.'];
+        yield 'alt+, legacy' => ["\x1b,", 'alt+,'];
+        yield 'alt+/ legacy' => ["\x1b/", 'alt+/'];
+        yield 'alt+= legacy' => ["\x1b=", 'alt+='];
         // ModifyOtherKeys
         yield 'shift+enter' => ["\x1b[27;2;13~", 'shift+enter'];
     }
@@ -124,6 +131,67 @@ class KeyParserTest extends TestCase
         yield 'digit 1' => ["\x1b[49u", '1'];
         yield 'ctrl+1' => ["\x1b[49;5u", 'ctrl+1'];
         yield 'newline as shift+enter' => ["\n", 'shift+enter'];
+        yield 'keypad 0' => ["\x1b[57399u", '0'];
+        yield 'keypad 9' => ["\x1b[57408u", '9'];
+        yield 'keypad decimal' => ["\x1b[57409u", '.'];
+        yield 'keypad add' => ["\x1b[57413u", '+'];
+        yield 'keypad separator' => ["\x1b[57416u", ','];
+        yield 'keypad left' => ["\x1b[57417u", 'left'];
+        yield 'keypad page down' => ["\x1b[57422u", 'page_down'];
+        yield 'keypad delete' => ["\x1b[57426u", 'delete'];
+        yield 'ctrl+keypad home' => ["\x1b[57423;5u", 'ctrl+home'];
+    }
+
+    public function testMatchesKittyKeypadKeysAsTheKeysTheyStandFor()
+    {
+        $this->parser->setKittyProtocolActive(true);
+
+        $this->assertTrue($this->parser->matches("\x1b[57400u", '1'));
+        $this->assertTrue($this->parser->matches("\x1b[57410u", '/'));
+        $this->assertTrue($this->parser->matches("\x1b[57417u", 'left'));
+        $this->assertTrue($this->parser->matches("\x1b[57419;5u", 'ctrl+up'));
+        $this->assertTrue($this->parser->matches("\x1b[57426u", 'delete'));
+        $this->assertFalse($this->parser->matches("\x1b[57417u", 'right'));
+    }
+
+    #[DataProvider('printableProvider')]
+    public function testDecodePrintable(string $input, ?string $expected)
+    {
+        $this->assertSame($expected, $this->parser->decodePrintable($input));
+    }
+
+    /**
+     * @return iterable<string, array{string, string|null}>
+     */
+    public static function printableProvider(): iterable
+    {
+        yield 'keypad 1' => ["\x1b[57400u", '1'];
+        yield 'keypad 0 with num lock' => ["\x1b[57399;129u", '0'];
+        yield 'keypad multiply' => ["\x1b[57411u", '*'];
+        yield 'keypad equal' => ["\x1b[57415u", '='];
+        yield 'keypad 5 repeat' => ["\x1b[57404;1:2u", '5'];
+        yield 'keypad 5 release' => ["\x1b[57404;1:3u", null];
+        yield 'ctrl+keypad 1' => ["\x1b[57400;5u", null];
+        yield 'alt+keypad 1' => ["\x1b[57400;3u", null];
+        yield 'keypad left' => ["\x1b[57417u", null];
+        yield 'keypad enter' => ["\x1b[57414u", null];
+        yield 'shifted letter' => ["\x1b[97:65;2u", 'A'];
+        yield 'escape' => ["\x1b[27u", null];
+        yield 'C1 control' => ["\x1b[155u", null];
+        yield 'not a kitty sequence' => ['1', null];
+    }
+
+    public function testMatchesLegacyAltSymbols()
+    {
+        $this->assertTrue($this->parser->matches("\x1b.", 'alt+.'));
+        $this->assertTrue($this->parser->matches("\x1b,", 'alt+,'));
+        $this->assertTrue($this->parser->matches("\x1b/", 'alt+/'));
+        $this->assertFalse($this->parser->matches("\x1b.", 'alt+,'));
+
+        // With the Kitty protocol, Alt+. is a CSI u sequence
+        $this->parser->setKittyProtocolActive(true);
+        $this->assertFalse($this->parser->matches("\x1b.", 'alt+.'));
+        $this->assertTrue($this->parser->matches("\x1b[46;3u", 'alt+.'));
     }
 
     public function testMatchesNormalizesModifierOrder()
@@ -246,9 +314,88 @@ class KeyParserTest extends TestCase
     {
         $this->parser->setKittyProtocolActive(true);
 
-        // Modifier value 9 means the super bit is set, which has no key id.
-        $this->assertNull($this->parser->parse("\x1b[97;9u"));
-        $this->assertFalse($this->parser->matches("\x1b[97;9u", 'a'));
+        // Modifier value 257 sets bit 256, which the protocol does not define.
+        $this->assertNull($this->parser->parse("\x1b[97;257u"));
+        $this->assertFalse($this->parser->matches("\x1b[97;257u", 'a'));
+    }
+
+    #[DataProvider('csiOnlyModifierProvider')]
+    public function testSuperHyperAndMetaAreParsed(string $input, string $expectedKey, array $expectedModifiers)
+    {
+        $this->parser->setKittyProtocolActive(true);
+
+        $result = $this->parser->parse($input);
+        $this->assertSame($expectedKey, $result['key']);
+        $this->assertSame($expectedModifiers, $result['modifiers']);
+        $this->assertTrue($this->parser->matches($input, $expectedKey));
+    }
+
+    public static function csiOnlyModifierProvider(): iterable
+    {
+        yield 'super+c' => ["\x1b[99;9u", 'super+c', ['super']];
+        yield 'super+c with caps lock' => ["\x1b[99;73u", 'super+c', ['super']];
+        yield 'shift+super+z' => ["\x1b[122;10u", 'shift+super+z', ['shift', 'super']];
+        yield 'ctrl+alt+super+a' => ["\x1b[97;15u", 'ctrl+alt+super+a', ['ctrl', 'alt', 'super']];
+        yield 'hyper+a' => ["\x1b[97;17u", 'hyper+a', ['hyper']];
+        yield 'meta+a' => ["\x1b[97;33u", 'meta+a', ['meta']];
+        yield 'super+left' => ["\x1b[1;9D", 'super+left', ['super']];
+        yield 'super+enter' => ["\x1b[13;9u", 'super+enter', ['super']];
+        yield 'super+backspace' => ["\x1b[127;9u", 'super+backspace', ['super']];
+        yield 'super+delete' => ["\x1b[3;9~", 'super+delete', ['super']];
+        yield 'super+/' => ["\x1b[47;9u", 'super+/', ['super']];
+        yield 'super++' => ["\x1b[43;9u", 'super++', ['super']];
+        // As Ghostty sends them on an AZERTY layout, with the base layout key
+        yield 'super+z with a base layout key' => ["\x1b[122::119;9u", 'super+z', ['super']];
+        yield 'shift+super+z with shifted and base layout keys' => ["\x1b[122:90:119;10u", 'shift+super+z', ['shift', 'super']];
+    }
+
+    public function testSuperKeyIdDoesNotMatchTheBareKey()
+    {
+        $this->parser->setKittyProtocolActive(true);
+
+        $this->assertFalse($this->parser->matches('c', 'super+c'));
+        $this->assertFalse($this->parser->matches("\x1b[99u", 'super+c'));
+        $this->assertFalse($this->parser->matches("\x03", 'super+c'));
+        $this->assertFalse($this->parser->matches("\x1b[99;5u", 'super+c'));
+        $this->assertFalse($this->parser->matches("\x1b[99;9u", 'c'));
+        $this->assertFalse($this->parser->matches("\x1b[99;9u", 'ctrl+c'));
+        $this->assertFalse($this->parser->matches("\x1b[1;3D", 'alt+super+left'));
+    }
+
+    public function testSuperMatchesTheKeypadEnterAndModifiedFunctionKeys()
+    {
+        $this->assertTrue($this->parser->matches("\x1b[57414;9u", 'super+enter'));
+        $this->assertTrue($this->parser->matches("\x1b[1;9P", 'super+f1'));
+        $this->assertTrue($this->parser->matches("\x1b[15;9~", 'super+f5'));
+        $this->assertFalse($this->parser->matches("\x1b[15~", 'super+f5'));
+    }
+
+    public function testSuperFunctionKeyIsParsedAndMatchesRepeatsAndLockModifiers()
+    {
+        $this->assertSame('super+f1', $this->parser->parse("\x1b[1;9P")['key'] ?? null);
+        $this->assertSame('super+f5', $this->parser->parse("\x1b[15;9~")['key'] ?? null);
+        // Repeat event
+        $this->assertTrue($this->parser->matches("\x1b[1;9:2P", 'super+f1'));
+        $this->assertTrue($this->parser->matches("\x1b[15;9:2~", 'super+f5'));
+        // Caps Lock (64) and Num Lock (128) are ignored
+        $this->assertTrue($this->parser->matches("\x1b[1;73P", 'super+f1'));
+        $this->assertTrue($this->parser->matches("\x1b[15;137~", 'super+f5'));
+    }
+
+    public function testUnknownModifierInAKeyIdMatchesNothing()
+    {
+        $this->assertFalse($this->parser->matches('c', 'cmd+c'));
+        $this->assertFalse($this->parser->matches("\x1b[99;9u", 'cmd+c'));
+        $this->assertFalse($this->parser->matches('c', 'foo+c'));
+    }
+
+    public function testSuperKeyIdNamingAKeyTheParserDoesNotNameMatchesNothing()
+    {
+        $this->parser->setKittyProtocolActive(true);
+
+        $this->assertFalse($this->parser->matches("\x1b[57414;9u", 'super+kp_enter'));
+        $this->assertFalse($this->parser->matches("\x1b[32;9u", 'super+ '));
+        $this->assertFalse($this->parser->matches("\x1b[34;9u", 'super+"'));
     }
 
     public function testLockModifiersAreStillIgnored()
@@ -303,6 +450,25 @@ class KeyParserTest extends TestCase
         $this->assertFalse($this->parser->matches("\x1b[97;5u", 'ctrl+alt+a'));
     }
 
+    public function testModifiedEscapeMatchesWhatParseNames()
+    {
+        $this->assertSame('ctrl+escape', $this->parser->parse("\x1b[27;5u")['key']);
+        $this->assertTrue($this->parser->matches("\x1b[27;5u", 'ctrl+escape'));
+        $this->assertTrue($this->parser->matches("\x1b[27;5u", 'ctrl+esc'));
+        $this->assertTrue($this->parser->matches("\x1b[27;2u", 'shift+escape'));
+        $this->assertTrue($this->parser->matches("\x1b[27;7u", 'ctrl+alt+escape'));
+        // Repeat event and Caps Lock
+        $this->assertTrue($this->parser->matches("\x1b[27;3:2u", 'alt+escape'));
+        $this->assertTrue($this->parser->matches("\x1b[27;69u", 'ctrl+escape'));
+
+        $this->assertFalse($this->parser->matches("\x1b[27;5:3u", 'ctrl+escape'));
+        $this->assertFalse($this->parser->matches("\x1b[27;5u", 'escape'));
+        $this->assertFalse($this->parser->matches("\x1b[27;5u", 'alt+escape'));
+        $this->assertFalse($this->parser->matches("\x1b", 'ctrl+escape'));
+        // Also two escape presses, so it stays unnamed as a modified escape
+        $this->assertFalse($this->parser->matches("\x1b\x1b", 'alt+escape'));
+    }
+
     /**
      * xterm's modifyOtherKeys form reports every modifier through the same
      * `CSI 27 ; mods ; keycode ~` shape, not just shift and alt.
@@ -330,5 +496,75 @@ class KeyParserTest extends TestCase
     {
         $this->assertFalse($this->parser->matches("\x1b[27;5;13~", 'shift+enter'));
         $this->assertFalse($this->parser->matches("\x1b[27;5;9~", 'ctrl+enter'));
+    }
+
+    #[DataProvider('modifiedFunctionKeyProvider')]
+    public function testParseModifiedFunctionKey(string $sequence, string $keyId)
+    {
+        $this->assertSame($keyId, $this->parser->parse($sequence)['key']);
+        $this->assertTrue($this->parser->matches($sequence, $keyId));
+
+        $this->parser->setKittyProtocolActive(true);
+
+        $this->assertSame($keyId, $this->parser->parse($sequence)['key']);
+        $this->assertTrue($this->parser->matches($sequence, $keyId));
+    }
+
+    /**
+     * @return iterable<string, array{string, string}>
+     */
+    public static function modifiedFunctionKeyProvider(): iterable
+    {
+        yield 'ctrl+f1' => ["\x1b[1;5P", 'ctrl+f1'];
+        yield 'shift+f2' => ["\x1b[1;2Q", 'shift+f2'];
+        yield 'alt+f3' => ["\x1b[1;3R", 'alt+f3'];
+        yield 'shift+ctrl+f4' => ["\x1b[1;6S", 'shift+ctrl+f4'];
+        yield 'ctrl+f3 (CSI ~)' => ["\x1b[13;5~", 'ctrl+f3'];
+        yield 'ctrl+f5' => ["\x1b[15;5~", 'ctrl+f5'];
+        yield 'shift+f6' => ["\x1b[17;2~", 'shift+f6'];
+        yield 'alt+f12' => ["\x1b[24;3~", 'alt+f12'];
+        yield 'ctrl+left' => ["\x1b[1;5D", 'ctrl+left'];
+        yield 'shift+home' => ["\x1b[1;2H", 'shift+home'];
+        yield 'ctrl+delete' => ["\x1b[3;5~", 'ctrl+delete'];
+        yield 'ctrl+f1 repeat' => ["\x1b[1;5:2P", 'ctrl+f1'];
+        yield 'f5 repeat' => ["\x1b[15;1:2~", 'f5'];
+        yield 'ctrl+f1 with caps lock' => ["\x1b[1;69P", 'ctrl+f1'];
+        yield 'f5 with num lock' => ["\x1b[15;129~", 'f5'];
+    }
+
+    public function testParseUnmodifiedFunctionKey()
+    {
+        $this->assertSame('f1', $this->parser->parse("\x1b[11~")['key']);
+        $this->assertSame('f12', $this->parser->parse("\x1b[24~")['key']);
+
+        $this->parser->setKittyProtocolActive(true);
+
+        $this->assertSame('f1', $this->parser->parse("\x1b[11~")['key']);
+        $this->assertSame('f12', $this->parser->parse("\x1b[24~")['key']);
+    }
+
+    public function testModifiedFunctionKeyRelease()
+    {
+        $this->parser->setKittyProtocolActive(true);
+
+        $this->assertTrue($this->parser->isKeyRelease("\x1b[1;5:3P"));
+        $this->assertTrue($this->parser->isKeyRepeat("\x1b[1;5:2P"));
+        $this->assertSame(3, $this->parser->parse("\x1b[1;5:3P")['event_type']);
+        $this->assertSame(3, $this->parser->parse("\x1b[15;5:3~")['event_type']);
+        $this->assertFalse($this->parser->matches("\x1b[1;5:3P", 'ctrl+f1'));
+        $this->assertFalse($this->parser->isKeyRelease('foo:3P'));
+        $this->assertFalse($this->parser->isKeyRepeat('foo:2S'));
+    }
+
+    public function testFunctionKeyWithUnnameableModifierIsNotReported()
+    {
+        // Modifier value 257 means bit 256 is set, which has no key id.
+        $this->assertNull($this->parser->parse("\x1b[1;257P"));
+        $this->assertNull($this->parser->parse("\x1b[15;257~"));
+    }
+
+    public function testModifyOtherKeysIsNotParsedAsAFunctionKey()
+    {
+        $this->assertNull($this->parser->parse("\x1b[27;5;13~"));
     }
 }

@@ -30,6 +30,7 @@ return static function (ContainerConfigurator $container) {
         ->set('cache.http_client.pool')
             ->parent('cache.app')
             ->tag('cache.pool')
+            ->tag('kernel.test_state', ['method' => 'clear'])
             ->tag('container.remove_if_missing', ['service' => 'cache.app'])
 
         ->set('cache.http_client', TagAwareAdapter::class)
@@ -45,7 +46,7 @@ return static function (ContainerConfigurator $container) {
             ])
             ->call('setLogger', [service('logger')->ignoreOnInvalid()])
             ->tag('monolog.logger', ['channel' => 'http_client'])
-            ->tag('kernel.reset', ['method' => 'reset', 'on_invalid' => 'ignore'])
+            ->tag('kernel.reset', ['method' => 'reset', 'on_invalid' => 'ignore', 'on_shutdown' => 'flag'])
 
         ->set('http_client.mock_transport', MockHttpClient::class)
             ->tag('kernel.reset', ['method' => 'reset'])
@@ -54,7 +55,7 @@ return static function (ContainerConfigurator $container) {
             ->factory('current')
             ->args([[service('http_client.transport')]])
             ->tag('http_client.client')
-            ->tag('kernel.reset', ['method' => 'reset', 'on_invalid' => 'ignore'])
+            ->tag('kernel.reset', ['method' => 'reset', 'on_invalid' => 'ignore', 'on_shutdown' => 'flag'])
 
         ->alias(HttpClientInterface::class, 'http_client')
 
@@ -87,7 +88,8 @@ return static function (ContainerConfigurator $container) {
             ])
 
         ->set('http_client.uri_template', UriTemplateHttpClient::class)
-            ->decorate('http_client', null, 7) // Between TraceableHttpClient (5) and RetryableHttpClient (10)
+            ->decorate('http_client', null, 7)
+            ->tag('container.decoration_order', ['around' => 'http_client.retryable'])
             ->args([
                 service('.inner'),
                 service('http_client.uri_template_expander')->nullOnInvalid(),

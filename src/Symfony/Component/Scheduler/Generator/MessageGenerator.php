@@ -32,7 +32,7 @@ final class MessageGenerator implements MessageGeneratorInterface
         private readonly ClockInterface $clock = new Clock(),
         private ?CheckpointInterface $checkpoint = null,
     ) {
-        $this->waitUntil = new \DateTimeImmutable('@0');
+        $this->waitUntil = \DateTimeImmutable::createFromTimestamp(0);
     }
 
     /**
@@ -44,7 +44,7 @@ final class MessageGenerator implements MessageGeneratorInterface
 
         if ($this->schedule?->shouldRestart()) {
             unset($this->triggerHeap);
-            $this->waitUntil = new \DateTimeImmutable('@0');
+            $this->waitUntil = \DateTimeImmutable::createFromTimestamp(0);
             $this->schedule->setRestart(false);
         }
 
@@ -76,22 +76,16 @@ final class MessageGenerator implements MessageGeneratorInterface
                 $yield = false;
             }
 
-            $previousTime = $time;
-            $nextTime = $trigger->getNextRunDate($time);
-
-            if ($this->schedule->shouldProcessOnlyLastMissedRun()) {
-                while ($nextTime && $nextTime > $previousTime && $nextTime < $this->clock->now()) {
-                    $previousTime = $nextTime;
-                    $nextTime = $trigger->getNextRunDate($nextTime);
-                }
-            }
-
-            if ($nextTime) {
-                if ($nextTime <= $previousTime) {
+            if ($nextTime = $trigger->getNextRunDate($time)) {
+                if ($nextTime <= $time) {
                     throw new LogicException(\sprintf('The "%s" trigger does not move the run date forward. Its "getNextRunDate()" method must return a date strictly after the given one.', $trigger));
                 }
 
                 $heap->insert([$nextTime, $index, $recurringMessage]);
+
+                if ($nextTime <= $now && $this->schedule->shouldProcessOnlyLastMissedRun()) {
+                    $yield = false;
+                }
             }
 
             if ($yield) {
